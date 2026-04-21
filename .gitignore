@@ -1,0 +1,37 @@
+# Xcode
+build/
+DerivedData/
+*.xcworkspace
+!default.xcworkspace
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+
+# xcodegen output
+ClaudeTogether.xcodeproj/
+macos/ClaudeTogether.xcodeproj/
+
+# Zig
+core/zig-out/
+core/zig-cache/
+.zig-cache/
+
+# Build artifacts copied from core
+macos/Vendor/
+
+# Bundled bore binary (produced by build-bore.sh)
+macos/Resources/bore
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+Packages/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

@@ -5,6 +5,11 @@ options:
     macOS: "14.0"
   createIntermediateGroups: true
 
+packages:
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm
+    from: "1.2.0"
+
 settings:
   base:
     PRODUCT_NAME: ClaudeTogether
@@ -12,7 +17,7 @@ settings:
     MARKETING_VERSION: "0.0.1"
     CURRENT_PROJECT_VERSION: "1"
     SWIFT_VERSION: "5.9"
-    ENABLE_HARDENED_RUNTIME: YES
+    ENABLE_HARDENED_RUNTIME: NO
     CODE_SIGN_STYLE: Automatic
     CODE_SIGN_IDENTITY: "-"
 
@@ -37,7 +42,9 @@ targets:
           - $(SRCROOT)/Vendor
         OTHER_LDFLAGS:
           - -lcollabterm
-    dependencies: []
+    dependencies:
+      - package: SwiftTerm
+        product: SwiftTerm
     postBuildScripts:
       - name: Bundle bore binary into Resources
         # xcodegen `resources:` won't route a no-extension Mach-O into
