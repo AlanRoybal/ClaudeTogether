@@ -10,7 +10,7 @@ struct ContentView: View {
                 .frame(minWidth: 220, idealWidth: 260, maxWidth: 360)
 
             if let session = model.session {
-                TerminalHost(session: session)
+                MetalTerminalView(session: session)
                     .frame(minWidth: 500, minHeight: 300)
             } else {
                 VStack(spacing: 16) {

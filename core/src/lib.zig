@@ -1,6 +1,11 @@
 const std = @import("std");
 const pty = @import("pty.zig");
 
+// Pull in term module so its `export fn`s are included in the static lib.
+comptime {
+    _ = @import("term.zig");
+}
+
 export fn ct_hello(buf: [*]u8, len: usize) c_int {
     const msg = "core says: ok";
     if (len < msg.len) return -1;
