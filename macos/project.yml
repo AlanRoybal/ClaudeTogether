@@ -1,0 +1,57 @@
+name: ClaudeTogether
+options:
+  bundleIdPrefix: com.alanroybal
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    PRODUCT_NAME: ClaudeTogether
+    PRODUCT_MODULE_NAME: ClaudeTogether
+    MARKETING_VERSION: "0.0.1"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.9"
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+
+targets:
+  ClaudeTogether:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.alanroybal.claudetogether
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        INFOPLIST_KEY_NSPrincipalClass: NSApplication
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        # Link the Zig static lib and expose its C header as a Swift module
+        LIBRARY_SEARCH_PATHS:
+          - $(SRCROOT)/Vendor
+        SWIFT_INCLUDE_PATHS:
+          - $(SRCROOT)/Vendor
+        OTHER_LDFLAGS:
+          - -lcollabterm
+    dependencies: []
+    postBuildScripts:
+      - name: Bundle bore binary into Resources
+        # xcodegen `resources:` won't route a no-extension Mach-O into
+        # PBXResourcesBuildPhase, so copy it manually into the .app bundle.
+        script: |
+          set -euo pipefail
+          SRC="$SRCROOT/Resources/bore"
+          DST="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/bore"
+          if [[ ! -f "$SRC" ]]; then
+            echo "error: bore binary missing at $SRC — run scripts/build-bore.sh first" >&2
+            exit 1
+          fi
+          mkdir -p "$(dirname "$DST")"
+          cp -f "$SRC" "$DST"
+          chmod +x "$DST"
+          echo "bundled bore -> $DST"
+        shell: /bin/bash
