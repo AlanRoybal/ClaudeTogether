@@ -10,21 +10,21 @@ import Carbon.HIToolbox
 final class MetalTerminalNSView: NSView {
     let mtkView: MTKView
     let renderer: TerminalRenderer
-    let term: TermCore
+    let grid: GridModel
     let session: PTYSession
 
     init?(session: PTYSession) {
         let view = MTKView(frame: .zero)
         self.mtkView = view
-        // TermCore size is recomputed on first layout.
-        guard let term = TermCore(cols: 80, rows: 24) else { return nil }
-        self.term = term
+        // GridModel size is recomputed on first layout.
+        guard let grid = GridModel(cols: 80, rows: 24) else { return nil }
+        self.grid = grid
         guard let renderer = TerminalRenderer(view: view) else { return nil }
         self.renderer = renderer
         self.session = session
         super.init(frame: .zero)
 
-        renderer.term = term
+        renderer.grid = grid
 
         addSubview(view)
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -37,16 +37,16 @@ final class MetalTerminalNSView: NSView {
 
         renderer.onResize = { [weak self] cols, rows in
             guard let self = self else { return }
-            self.term.resize(cols: cols, rows: rows)
+            self.grid.resize(cols: cols, rows: rows)
             self.session.resize(cols: cols, rows: rows)
         }
 
         session.onOutput = { [weak self] bytes in
-            self?.term.feed(bytes)
+            self?.grid.feed(bytes)
         }
         session.onExit = { [weak self] in
             let msg: [UInt8] = Array("\r\n[process exited]\r\n".utf8)
-            self?.term.feed(msg)
+            self?.grid.feed(msg)
         }
     }
 

@@ -97,3 +97,40 @@ fragment float4 text_fragment(TextVertexOut in [[stage_in]],
     // Unpremultiplied fragment; pipeline does sourceAlpha/oneMinusSourceAlpha.
     return float4(in.fg.rgb, coverage * in.fg.a);
 }
+
+//------------------------------------------------------------------ CURSOR
+// Sub-cell-positioned filled rect. Used to draw peer cursor borders as four
+// thin strips around a cell (top, bottom, left, right). Blends over the text
+// pass so borders read clearly without occluding the glyph.
+
+struct CursorInstance {
+    ushort2 gridPos;
+    float2  originFrac;  // (0..1) cell-space origin
+    float2  sizeFrac;    // (0..1) cell-space size
+    uchar4  color;
+};
+
+struct CursorVertexOut {
+    float4 position [[position]];
+    float4 color [[flat]];
+};
+
+vertex CursorVertexOut cursor_vertex(uint vid [[vertex_id]],
+                                      uint iid [[instance_id]],
+                                      constant CursorInstance *cs [[buffer(0)]],
+                                      constant Uniforms &u [[buffer(1)]])
+{
+    CursorInstance i = cs[iid];
+    float2 corner = kCorner[vid];
+    float2 cellOrigin = float2(i.gridPos) * u.cellSize;
+    float2 px = cellOrigin + i.originFrac * u.cellSize + corner * i.sizeFrac * u.cellSize;
+
+    CursorVertexOut o;
+    o.position = float4(toNDC(px, u.viewportSize), 0, 1);
+    o.color = float4(i.color) / 255.0;
+    return o;
+}
+
+fragment float4 cursor_fragment(CursorVertexOut in [[stage_in]]) {
+    return in.color;
+}

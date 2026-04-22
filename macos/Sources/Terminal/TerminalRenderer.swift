@@ -10,6 +10,16 @@ struct BgInstance {
     var _pad: (UInt16, UInt16, UInt16, UInt16, UInt16) = (0, 0, 0, 0, 0)
 }
 
+/// Matches `CursorInstance` in Shaders.metal.
+struct CursorInstance {
+    var gridPos: SIMD2<UInt16> = .zero
+    var _pad0: (UInt16, UInt16) = (0, 0)
+    var originFrac: SIMD2<Float> = .zero
+    var sizeFrac: SIMD2<Float> = .zero
+    var color: SIMD4<UInt8> = .zero
+    var _pad1: (UInt32) = (0)
+}
+
 /// Matches `TextInstance` in Shaders.metal.
 struct TextInstance {
     var gridPos: SIMD2<UInt16> = .zero
@@ -34,15 +44,18 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     private let commandQueue: MTLCommandQueue
     private let bgPipeline: MTLRenderPipelineState
     private let textPipeline: MTLRenderPipelineState
+    private let cursorPipeline: MTLRenderPipelineState
     private let sampler: MTLSamplerState
 
     private var bgBuffer: MTLBuffer?
     private var bgCapacity: Int = 0
     private var textBuffer: MTLBuffer?
     private var textCapacity: Int = 0
+    private var cursorBuffer: MTLBuffer?
+    private var cursorCapacity: Int = 0
 
     weak var view: MTKView?
-    var term: TermCore?
+    var grid: GridModel?
 
     private(set) var cols: UInt16 = 80
     private(set) var rows: UInt16 = 24
@@ -51,7 +64,6 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
 
     var cursorVisible = true
     private var blinkStart = CACurrentMediaTime()
-    private let blinkPeriod = 1.0
 
     init?(view: MTKView) {
         guard let device = view.device ?? MTLCreateSystemDefaultDevice() else {
@@ -77,7 +89,9 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
               let bgV = library.makeFunction(name: "bg_vertex"),
               let bgF = library.makeFunction(name: "bg_fragment"),
               let tV  = library.makeFunction(name: "text_vertex"),
-              let tF  = library.makeFunction(name: "text_fragment")
+              let tF  = library.makeFunction(name: "text_fragment"),
+              let cV  = library.makeFunction(name: "cursor_vertex"),
+              let cF  = library.makeFunction(name: "cursor_fragment")
         else { return nil }
 
         let fmt = view.colorPixelFormat
@@ -101,6 +115,20 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             att.sourceAlphaBlendFactor = .sourceAlpha
             att.destinationAlphaBlendFactor = .oneMinusSourceAlpha
             self.textPipeline = try device.makeRenderPipelineState(descriptor: tDesc)
+
+            let cDesc = MTLRenderPipelineDescriptor()
+            cDesc.vertexFunction = cV
+            cDesc.fragmentFunction = cF
+            cDesc.colorAttachments[0].pixelFormat = fmt
+            let cAtt = cDesc.colorAttachments[0]!
+            cAtt.isBlendingEnabled = true
+            cAtt.rgbBlendOperation = .add
+            cAtt.alphaBlendOperation = .add
+            cAtt.sourceRGBBlendFactor = .sourceAlpha
+            cAtt.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            cAtt.sourceAlphaBlendFactor = .sourceAlpha
+            cAtt.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            self.cursorPipeline = try device.makeRenderPipelineState(descriptor: cDesc)
         } catch {
             NSLog("pipeline failed: \(error)")
             return nil
@@ -143,17 +171,19 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
-        guard let term = term,
+        guard let grid = grid,
               let drawable = view.currentDrawable,
               let rpd = view.currentRenderPassDescriptor,
               let cmd = commandQueue.makeCommandBuffer()
         else { return }
 
-        let snap = term.snapshot()
-        let (cx, cy) = term.cursor()
+        let snap = grid.snapshot()
         let now = CACurrentMediaTime()
-        let blinkOn = fmod(now - blinkStart, blinkPeriod) < blinkPeriod * 0.5
-        let drawCursor = cursorVisible && blinkOn
+        let overlay = CursorOverlay.build(
+            cursors: grid.cursors,
+            time: now,
+            blinkStart: blinkStart,
+            cursorVisible: cursorVisible)
 
         let cellW = Float(atlas.cellWidthPx)
         let cellH = Float(atlas.cellHeightPx)
@@ -173,7 +203,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                 for x in 0..<cols {
                     let c = snap[y * cols + x]
                     if c.width == 0 { continue } // trailing half of wide glyph
-                    let isCursor = drawCursor && x == Int(cx) && y == Int(cy)
+                    let isCursor = overlay.isLocalBlockCell(x: x, y: y)
                     let fg = unpack(c.fg)
                     let bg = unpack(c.bg)
 
@@ -211,8 +241,21 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             }
         }
 
+        // Peer cursor borders (Phase 3+ populates peers; empty otherwise).
+        var cursorInstances: [CursorInstance] = []
+        cursorInstances.reserveCapacity(overlay.peerBorders.count)
+        for r in overlay.peerBorders {
+            var ci = CursorInstance()
+            ci.gridPos = SIMD2<UInt16>(r.col, r.row)
+            ci.originFrac = r.originFrac
+            ci.sizeFrac = r.sizeFrac
+            ci.color = r.color
+            cursorInstances.append(ci)
+        }
+
         ensureBgCapacity(bgInstances.count)
         ensureTextCapacity(textInstances.count)
+        ensureCursorCapacity(cursorInstances.count)
         if !bgInstances.isEmpty, let bgBuf = bgBuffer {
             bgInstances.withUnsafeBytes { raw in
                 _ = memcpy(bgBuf.contents(), raw.baseAddress!, raw.count)
@@ -221,6 +264,11 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         if !textInstances.isEmpty, let tBuf = textBuffer {
             textInstances.withUnsafeBytes { raw in
                 _ = memcpy(tBuf.contents(), raw.baseAddress!, raw.count)
+            }
+        }
+        if !cursorInstances.isEmpty, let cBuf = cursorBuffer {
+            cursorInstances.withUnsafeBytes { raw in
+                _ = memcpy(cBuf.contents(), raw.baseAddress!, raw.count)
             }
         }
 
@@ -250,6 +298,15 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             enc.setFragmentSamplerState(sampler, index: 0)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6,
                                instanceCount: textInstances.count)
+        }
+
+        // Pass 3: CURSOR (peer borders)
+        if !cursorInstances.isEmpty, let cBuf = cursorBuffer {
+            enc.setRenderPipelineState(cursorPipeline)
+            enc.setVertexBuffer(cBuf, offset: 0, index: 0)
+            enc.setVertexBytes(&uniforms, length: MemoryLayout<RendererUniforms>.stride, index: 1)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6,
+                               instanceCount: cursorInstances.count)
         }
 
         enc.endEncoding()
@@ -289,6 +346,15 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             length: cap * MemoryLayout<TextInstance>.stride,
             options: [.storageModeShared])
         textCapacity = cap
+    }
+
+    private func ensureCursorCapacity(_ n: Int) {
+        if n <= cursorCapacity { return }
+        let cap = max(n, 16)
+        cursorBuffer = device.makeBuffer(
+            length: cap * MemoryLayout<CursorInstance>.stride,
+            options: [.storageModeShared])
+        cursorCapacity = cap
     }
 
     /// 0xRRGGBB (u32) → RGBA uchar4 (alpha = 255).
