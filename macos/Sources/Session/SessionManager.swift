@@ -4,12 +4,13 @@ import CollabTermC
 
 /// Thin Swift wrapper around the C ABI session (`ct_session_*`). Owns the
 /// handle, runs a timer-driven poll loop, decodes inbound frames with
-/// `FrameCodec`, and exposes role-specific state (`peers`, public URL) for
-/// the UI.
+/// `FrameCodec`, and exposes role-specific state (`participants`, public URL)
+/// for the UI.
 ///
-/// Scope: this is the Phase 3 plumbing layer — it moves frames in and out
-/// and tracks connected peers. CRDT input-line semantics and PTY-output
-/// replication live in future work that hooks onto the `onFrame` callback.
+/// Topology: star. Peers connect to the host; the host is authoritative for
+/// the roster and re-broadcasts it whenever someone joins or leaves. Peers
+/// read `participants` from the last Roster frame; the host maintains it
+/// from Hello frames + lifecycle events.
 @MainActor
 final class SessionManager: ObservableObject {
     enum Role: Equatable {
@@ -21,27 +22,38 @@ final class SessionManager: ObservableObject {
         case idle
         case starting
         case running
+        case disconnected  // peer-only: host went away
         case failed(String)
     }
 
-    struct Peer: Identifiable, Equatable {
-        let id: UInt32       // transport-level peer id from core
-        var identity: UserIdentity?
+    /// Who's in the session (host + peers), by user identity. Name, color,
+    /// and role come from Hello frames. On peers, this list arrives via
+    /// Roster broadcasts from the host.
+    struct Participant: Identifiable, Equatable {
+        var id: UserIdentity { identity }
+        var identity: UserIdentity
+        var role: SessionRole
         var name: String
         var color: UInt32
     }
 
-    /// Set by `startHost` / `joinPeer`; `.host` while idle so the sidebar
-    /// defaults its UI toward "Start shared session".
     @Published private(set) var role: Role = .host
     @Published private(set) var state: State = .idle
-    @Published private(set) var peers: [Peer] = []
+    @Published private(set) var participants: [Participant] = []
     @Published private(set) var localPort: UInt16 = 0
     @Published private(set) var publicURL: String?
     @Published var lastError: String?
 
     let localIdentity: UserIdentity
-    var localName: String
+    @Published var localName: String {
+        didSet {
+            guard oldValue != localName, handle != nil else { return }
+            // Local entry mirrors localName; re-announce ourselves.
+            updateLocalParticipantField { $0.name = localName }
+            sendHello()
+            if role == .host { broadcastRoster() }
+        }
+    }
     var localColor: UInt32
 
     private var handle: OpaquePointer?
@@ -49,15 +61,18 @@ final class SessionManager: ObservableObject {
     private var pollTimer: Timer?
     private var borePumpTimer: Timer?
 
+    /// Host-only: transport peer id → user identity (filled on Hello).
+    private var transportToIdentity: [UInt32: UserIdentity] = [:]
+
     /// Decoded inbound frame + the transport peer id that sent it.
     var onFrame: ((Frame, UInt32) -> Void)?
 
     init(identity: UserIdentity = .random(),
-         name: String = NSUserName(),
+         name: String? = nil,
          color: UInt32 = 0xFFFFFF)
     {
         self.localIdentity = identity
-        self.localName = name
+        self.localName = name ?? SessionManager.savedOrDefaultName()
         self.localColor = color
     }
 
@@ -75,14 +90,17 @@ final class SessionManager: ObservableObject {
         role = .host
         state = .starting
         guard let h = ct_session_new_host(port) else {
-            state = .failed("ct_session_new_host failed")
+            state = .failed(Self.readLastError()
+                ?? "ct_session_new_host failed")
             return
         }
         handle = h
         localPort = ct_session_port(h)
+        participants = [Participant(
+            identity: localIdentity, role: .host,
+            name: localName, color: localColor)]
         state = .running
         startPolling()
-        sendHello()
     }
 
     /// Connect to `host:port`. `host` can be an IP literal or DNS name
@@ -96,13 +114,17 @@ final class SessionManager: ObservableObject {
             ct_session_new_peer(cstr, port)
         }
         guard let h = h else {
-            state = .failed("ct_session_new_peer failed (\(host):\(port))")
+            let detail = Self.readLastError() ?? "unknown error"
+            state = .failed("\(detail) — host=\(host) port=\(port)")
             return
         }
         handle = h
+        participants = [Participant(
+            identity: localIdentity, role: .peer,
+            name: localName, color: localColor)]
         state = .running
         startPolling()
-        sendHello()
+        sendHello()  // tell the host who we are; host broadcasts Roster back
     }
 
     func stop() {
@@ -116,7 +138,8 @@ final class SessionManager: ObservableObject {
             ct_bore_free(b)
             boreHandle = nil
         }
-        peers.removeAll()
+        participants.removeAll()
+        transportToIdentity.removeAll()
         localPort = 0
         publicURL = nil
         state = .idle
@@ -124,8 +147,6 @@ final class SessionManager: ObservableObject {
 
     // MARK: bore tunnel (host only)
 
-    /// Start the bundled bore binary forwarding `localPort` to `bore.pub`.
-    /// Once bore prints the public URL we surface it on `publicURL`.
     func startBoreTunnel(borePath: String) {
         guard role == .host, boreHandle == nil, localPort != 0 else { return }
         guard let b = ct_bore_new() else {
@@ -147,6 +168,7 @@ final class SessionManager: ObservableObject {
 
     // MARK: send helpers
 
+    /// Broadcast to every transport peer (no filtering).
     func broadcast(_ frame: Frame) {
         guard let h = handle else { return }
         let data = FrameCodec.encode(frame)
@@ -174,9 +196,8 @@ final class SessionManager: ObservableObject {
     // MARK: polling
 
     private func startPolling() {
-        // 16ms ~= 60Hz; session work is cheap (memcpy out of a queue).
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.pumpInbound() }
+            MainActor.assumeIsolated { self?.pump() }
         }
     }
 
@@ -200,18 +221,38 @@ final class SessionManager: ObservableObject {
         }
     }
 
-    private func pumpInbound() {
-        guard let h = handle else { return }
-        // Cap per-tick drain so a flood can't stall the main thread.
+    private func pump() {
+        drainEvents()
+        drainFrames()
+    }
+
+    private func drainEvents() {
+        for _ in 0..<32 {
+            // Re-check every iteration: an event handler may have called
+            // stop() (e.g. peer-side on host disconnect), freeing the handle.
+            guard let h = handle else { return }
+            var kind: UInt8 = 0
+            var peerID: UInt32 = 0
+            let r = ct_session_poll_event(h, &kind, &peerID)
+            if r == 0 { return }
+            switch kind {
+            case 0: handleConnected(peerID)
+            case 1: handleDisconnected(peerID)
+            default: break
+            }
+        }
+    }
+
+    private func drainFrames() {
         var buf = [UInt8](repeating: 0, count: 64 * 1024)
         for _ in 0..<64 {
+            guard let h = handle else { return }
             var peerID: UInt32 = 0
             let n = buf.withUnsafeMutableBufferPointer { p -> Int in
                 Int(ct_session_poll(h, p.baseAddress, p.count, &peerID))
             }
-            if n == 0 { break }
+            if n == 0 { return }
             if n > buf.count {
-                // Oversized frame — extend buffer and retry next tick (rare).
                 buf = [UInt8](repeating: 0, count: n)
                 continue
             }
@@ -223,43 +264,123 @@ final class SessionManager: ObservableObject {
                 lastError = "decode: \(error)"
             }
         }
-        // Refresh reported peer count (session-level transport peers).
-        let count = ct_session_peer_count(h)
-        if UInt32(peers.count) != count {
-            // Cheap reconciliation: ensure a placeholder Peer exists per id.
-            // Hellos fill in name/color.
-            let knownIds = Set(peers.map(\.id))
-            // We don't have a way to enumerate ids without a dedicated call,
-            // so we rely on hello frames to add them. If transport-count
-            // drops, trim unknown peers whose id is beyond count.
-            _ = knownIds
-            _ = count
+    }
+
+    // MARK: event / frame handlers
+
+    private func handleConnected(_ peerID: UInt32) {
+        // Host: a peer's TCP just landed; roster updates on their Hello.
+        // On the peer side the one "connected" event is the host socket —
+        // no state change needed until the host's Roster arrives.
+        _ = peerID
+    }
+
+    private func handleDisconnected(_ peerID: UInt32) {
+        if role == .host {
+            if let gone = transportToIdentity.removeValue(forKey: peerID) {
+                participants.removeAll { $0.identity == gone }
+                broadcastRoster()
+            }
+        } else {
+            // Peer-side: the host dropped. Tear down.
+            // (`ct_session_peer_count` would be 0 here too.)
+            stop()
+            state = .disconnected
         }
     }
 
     private func handleFrame(_ frame: Frame, from peerID: UInt32) {
         switch frame {
-        case .hello(let id, _, let color, let name):
-            upsertPeer(transportID: peerID, identity: id,
-                       name: name, color: color)
+        case .hello(let id, let helloRole, let color, let name):
+            if role == .host {
+                transportToIdentity[peerID] = id
+                upsertParticipant(identity: id, role: helloRole,
+                                  name: name, color: color)
+                broadcastRoster()
+            }
+        case .roster(let entries):
+            if role == .peer {
+                // Peer: replace participants with authoritative list.
+                var next: [Participant] = entries.map {
+                    Participant(identity: $0.identity,
+                                role: $0.role,
+                                name: $0.name,
+                                color: $0.color)
+                }
+                // Make sure our own entry is present with our current name.
+                if !next.contains(where: { $0.identity == localIdentity }) {
+                    next.append(Participant(
+                        identity: localIdentity, role: .peer,
+                        name: localName, color: localColor))
+                }
+                participants = next
+            }
         default:
             break
         }
         onFrame?(frame, peerID)
     }
 
-    private func upsertPeer(transportID: UInt32, identity: UserIdentity,
-                            name: String, color: UInt32)
+    // MARK: participants / roster
+
+    private func upsertParticipant(identity: UserIdentity,
+                                   role helloRole: SessionRole,
+                                   name: String,
+                                   color: UInt32)
     {
-        if let i = peers.firstIndex(where: { $0.id == transportID }) {
-            peers[i].identity = identity
-            peers[i].name = name
-            peers[i].color = color
+        if let i = participants.firstIndex(where: { $0.identity == identity }) {
+            participants[i].role = helloRole
+            participants[i].name = name
+            participants[i].color = color
         } else {
-            peers.append(Peer(id: transportID,
-                              identity: identity,
-                              name: name,
-                              color: color))
+            participants.append(Participant(
+                identity: identity, role: helloRole,
+                name: name, color: color))
         }
+    }
+
+    private func updateLocalParticipantField(_ mutate: (inout Participant) -> Void) {
+        if let i = participants.firstIndex(where: { $0.identity == localIdentity }) {
+            mutate(&participants[i])
+        }
+    }
+
+    /// Host only: broadcast the current full roster to all peers.
+    private func broadcastRoster() {
+        guard role == .host else { return }
+        let entries = participants.map {
+            RosterEntry(identity: $0.identity, role: $0.role,
+                        color: $0.color, name: $0.name)
+        }
+        broadcast(.roster(entries))
+    }
+
+    // MARK: persisted name
+
+    static let nameDefaultsKey = "ClaudeTogether.displayName"
+
+    /// Read the last-error slot populated by the Zig C ABI. Returns nil
+    /// if empty.
+    nonisolated static func readLastError() -> String? {
+        var buf = [UInt8](repeating: 0, count: 512)
+        let n = buf.withUnsafeMutableBufferPointer { p -> Int in
+            Int(ct_last_error(p.baseAddress, p.count))
+        }
+        if n == 0 { return nil }
+        let len = min(n, buf.count)
+        return String(bytes: buf.prefix(len), encoding: .utf8)
+    }
+
+    nonisolated static func savedOrDefaultName() -> String {
+        if let s = UserDefaults.standard.string(forKey: nameDefaultsKey),
+           !s.isEmpty
+        {
+            return s
+        }
+        return NSUserName()
+    }
+
+    func persistName() {
+        UserDefaults.standard.set(localName, forKey: Self.nameDefaultsKey)
     }
 }

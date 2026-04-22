@@ -17,6 +17,16 @@ const InboundFrame = struct {
     payload: []u8, // heap-allocated, owned by Session
 };
 
+pub const EventKind = enum(u8) {
+    peer_connected = 0,
+    peer_disconnected = 1,
+};
+
+pub const Event = struct {
+    kind: EventKind,
+    peer_id: u32,
+};
+
 pub const Role = enum(u8) {
     host = 0,
     peer = 1,
@@ -47,6 +57,7 @@ pub const Session = struct {
     queue_cond: std.Thread.Condition = .{},
     peers: std.ArrayList(*Peer),
     inbound: std.ArrayList(InboundFrame),
+    events: std.ArrayList(Event),
     next_peer_id: u32 = 1,
     shutting_down: bool = false,
 
@@ -58,6 +69,7 @@ pub const Session = struct {
             .role = .host,
             .peers = std.ArrayList(*Peer).init(allocator),
             .inbound = std.ArrayList(InboundFrame).init(allocator),
+            .events = std.ArrayList(Event).init(allocator),
         };
 
         self.listener = try transport.Listener.listen(port);
@@ -79,6 +91,7 @@ pub const Session = struct {
             .role = .peer,
             .peers = std.ArrayList(*Peer).init(allocator),
             .inbound = std.ArrayList(InboundFrame).init(allocator),
+            .events = std.ArrayList(Event).init(allocator),
         };
 
         const conn = try transport.connect(allocator, host, port);
@@ -108,6 +121,7 @@ pub const Session = struct {
         // Drain leftover inbound buffers.
         for (self.inbound.items) |f| self.allocator.free(f.payload);
         self.inbound.deinit();
+        self.events.deinit();
 
         for (self.peers.items) |p| self.allocator.destroy(p);
         self.peers.deinit();
@@ -159,6 +173,15 @@ pub const Session = struct {
         self.allocator.free(f.payload);
     }
 
+    /// Pop the next lifecycle event (peer_connected / peer_disconnected).
+    /// Returns null if none pending.
+    pub fn pollEvent(self: *Session) ?Event {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.events.items.len == 0) return null;
+        return self.events.orderedRemove(0);
+    }
+
     // --- internals --------------------------------------------------------
 
     fn addPeer(self: *Session, conn: transport.Connection) !void {
@@ -170,6 +193,11 @@ pub const Session = struct {
         };
         self.next_peer_id += 1;
         try self.peers.append(p);
+        const peer_id = p.id;
+        self.events.append(.{
+            .kind = .peer_connected,
+            .peer_id = peer_id,
+        }) catch {};
         self.mutex.unlock();
 
         p.thread = try std.Thread.spawn(.{}, readerLoop, .{ self, p });
@@ -263,7 +291,14 @@ pub const Session = struct {
         _ = &err;
         self.mutex.lock();
         defer self.mutex.unlock();
+        if (p.dead) return;
         p.dead = true;
+        if (!self.shutting_down) {
+            self.events.append(.{
+                .kind = .peer_disconnected,
+                .peer_id = p.id,
+            }) catch {};
+        }
     }
 };
 

@@ -12,6 +12,7 @@ enum FrameTag: UInt8 {
     case cursorPos   = 0x06
     case hello       = 0x07
     case modeChange  = 0x08
+    case roster      = 0x09
 }
 
 enum SessionRole: UInt8 {
@@ -45,6 +46,13 @@ struct UserIdentity: Equatable, Hashable {
     func hash(into h: inout Hasher) { h.combine(bytes) }
 }
 
+struct RosterEntry: Equatable, Hashable {
+    var identity: UserIdentity
+    var role: SessionRole
+    var color: UInt32
+    var name: String
+}
+
 enum Frame {
     case ptyOutput(Data)
     case inputOp(Data)
@@ -52,6 +60,7 @@ enum Frame {
     case cursorPos(UserIdentity, col: UInt16, row: UInt16)
     case hello(UserIdentity, role: SessionRole, color: UInt32, name: String)
     case modeChange(TermMode)
+    case roster([RosterEntry])
 }
 
 enum FrameCodecError: Error {
@@ -94,6 +103,17 @@ enum FrameCodec {
         case .modeChange(let m):
             out.append(FrameTag.modeChange.rawValue)
             out.append(m.rawValue)
+        case .roster(let entries):
+            out.append(FrameTag.roster.rawValue)
+            appendU16(&out, UInt16(min(entries.count, Int(UInt16.max))))
+            for e in entries.prefix(Int(UInt16.max)) {
+                out.append(contentsOf: e.identity.bytes)
+                out.append(e.role.rawValue)
+                appendU32(&out, e.color)
+                let utf8 = Array(e.name.utf8)
+                appendU16(&out, UInt16(min(utf8.count, Int(UInt16.max))))
+                out.append(contentsOf: utf8.prefix(Int(UInt16.max)))
+            }
         }
         return out
     }
@@ -139,6 +159,25 @@ enum FrameCodec {
                 throw FrameCodecError.invalidEnum
             }
             return .modeChange(mode)
+        case .roster:
+            let count = try r.readU16()
+            var entries: [RosterEntry] = []
+            entries.reserveCapacity(Int(count))
+            for _ in 0..<Int(count) {
+                let id = try UserIdentity.from(exactly16:
+                    Array(try r.readBytes(16)))
+                let roleByte = try r.readU8()
+                guard let role = SessionRole(rawValue: roleByte) else {
+                    throw FrameCodecError.invalidEnum
+                }
+                let color = try r.readU32()
+                let nameLen = try r.readU16()
+                let nameBytes = try r.readBytes(Int(nameLen))
+                let name = String(data: nameBytes, encoding: .utf8) ?? ""
+                entries.append(RosterEntry(
+                    identity: id, role: role, color: color, name: name))
+            }
+            return .roster(entries)
         case .fsDelta, .fsSnapshot:
             throw FrameCodecError.unsupportedTag
         }

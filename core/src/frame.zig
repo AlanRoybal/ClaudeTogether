@@ -17,6 +17,8 @@ pub const Tag = enum(u8) {
     cursor_pos = 0x06,
     hello = 0x07,
     mode_change = 0x08,
+    /// Host broadcasts the full session roster whenever it changes.
+    roster = 0x09,
 };
 
 pub const Role = enum(u8) {
@@ -73,6 +75,9 @@ pub const Frame = union(Tag) {
     cursor_pos: CursorPos,
     hello: Hello,
     mode_change: ModeChange,
+    /// Encoded/decoded on the Swift side (FrameCodec); zig treats these as
+    /// opaque bytes passing through the transport layer.
+    roster: void,
 };
 
 pub const DecodeError = error{
@@ -182,7 +187,7 @@ pub fn decode(bytes: []const u8) DecodeError!Frame {
                 return error.InvalidEnum;
             break :blk Frame{ .mode_change = .{ .mode = mode } };
         },
-        .fs_delta, .fs_snapshot => error.NotImplemented,
+        .fs_delta, .fs_snapshot, .roster => error.NotImplemented,
     };
 }
 
@@ -248,7 +253,7 @@ pub fn encode(frame: Frame, out: []u8) EncodeError!usize {
             try w.writeBytes(p.name);
         },
         .mode_change => |p| try w.writeU8(@intFromEnum(p.mode)),
-        .fs_delta, .fs_snapshot => return error.BufferTooSmall, // NYI
+        .fs_delta, .fs_snapshot, .roster => return error.BufferTooSmall, // NYI
     }
     return w.pos;
 }
@@ -262,7 +267,7 @@ pub fn encodedLen(frame: Frame) usize {
         .cursor_pos => 1 + 16 + 2 + 2,
         .hello => |p| 1 + 16 + 1 + 4 + 2 + p.name.len,
         .mode_change => 1 + 1,
-        .fs_delta, .fs_snapshot => 1,
+        .fs_delta, .fs_snapshot, .roster => 1,
     };
 }
 

@@ -14,6 +14,11 @@ int ct_hello(unsigned char *buf, size_t len);
 /* ABI version of libcollabterm. Bump on breaking changes. */
 int ct_version(void);
 
+/* Copies the most recent error message into `out` (NOT NUL-terminated) and
+ * returns its length. Returns 0 if no error has been recorded. Populated by
+ * C-ABI entry points that return NULL or -1 on failure. */
+size_t ct_last_error(uint8_t *out, size_t cap);
+
 /* ---- PTY ------------------------------------------------------------- */
 
 /* Spawn argv[0] under a PTY. argv is NULL-terminated (execvp style).
@@ -87,6 +92,13 @@ int ct_session_broadcast(ct_session *s, const uint8_t *bytes, size_t len);
  * when the queue is empty. */
 ptrdiff_t ct_session_poll(ct_session *s,
                           uint8_t *out, size_t cap,
+                          uint32_t *out_peer_id);
+
+/* Pop the next lifecycle event. On success, writes kind (0 = connected,
+ * 1 = disconnected) to *out_kind and the peer id to *out_peer_id, and
+ * returns 1. Returns 0 if no events are pending. */
+int ct_session_poll_event(ct_session *s,
+                          uint8_t *out_kind,
                           uint32_t *out_peer_id);
 
 /* ---- Bore supervisor ------------------------------------------------- */

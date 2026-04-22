@@ -10,6 +10,32 @@ fn gpa() std.mem.Allocator {
     return gpa_instance.allocator();
 }
 
+// Last-error slot so callers can read a human-readable reason after a
+// NULL / -1 return from the C ABI. Thread-safe via a single mutex.
+var last_error_mutex: std.Thread.Mutex = .{};
+var last_error_buf: [256]u8 = undefined;
+var last_error_len: usize = 0;
+
+fn setLastError(comptime fmt: []const u8, args: anytype) void {
+    last_error_mutex.lock();
+    defer last_error_mutex.unlock();
+    const written = std.fmt.bufPrint(&last_error_buf, fmt, args) catch {
+        last_error_len = 0;
+        return;
+    };
+    last_error_len = written.len;
+}
+
+/// Copies the most recent error message into `out` (NOT NUL-terminated) and
+/// returns its length. Returns 0 if no error has been recorded.
+export fn ct_last_error(out: [*]u8, cap: usize) usize {
+    last_error_mutex.lock();
+    defer last_error_mutex.unlock();
+    const n = @min(cap, last_error_len);
+    if (n > 0) @memcpy(out[0..n], last_error_buf[0..n]);
+    return last_error_len;
+}
+
 // Pull in term module so its `export fn`s are included in the static lib.
 comptime {
     _ = @import("term.zig");
@@ -74,7 +100,10 @@ export fn ct_pty_kill(pid: c_int) void {
 /// Create a host session listening on `port` (0 = OS-assigned).
 /// Returns an opaque pointer or NULL on error.
 export fn ct_session_new_host(port: u16) ?*anyopaque {
-    const s = session_mod.Session.initHost(gpa(), port) catch return null;
+    const s = session_mod.Session.initHost(gpa(), port) catch |err| {
+        setLastError("host listen on port {d} failed: {s}", .{ port, @errorName(err) });
+        return null;
+    };
     return @ptrCast(s);
 }
 
@@ -82,8 +111,10 @@ export fn ct_session_new_host(port: u16) ?*anyopaque {
 /// null-terminated C string (IP literal or DNS name).
 export fn ct_session_new_peer(host: [*:0]const u8, port: u16) ?*anyopaque {
     const host_slice = std.mem.span(host);
-    const s = session_mod.Session.initPeer(gpa(), host_slice, port) catch
+    const s = session_mod.Session.initPeer(gpa(), host_slice, port) catch |err| {
+        setLastError("connect {s}:{d} failed: {s}", .{ host_slice, port, @errorName(err) });
         return null;
+    };
     return @ptrCast(s);
 }
 
@@ -101,6 +132,21 @@ export fn ct_session_port(handle: ?*anyopaque) u16 {
 export fn ct_session_peer_count(handle: ?*anyopaque) u32 {
     const s: *session_mod.Session = @ptrCast(@alignCast(handle orelse return 0));
     return @intCast(s.peerCount());
+}
+
+/// Pop the next lifecycle event. Writes kind (0 = connected, 1 = disconnected)
+/// to `*out_kind` and peer id to `*out_peer_id`, returns 1. Returns 0 if no
+/// events pending.
+export fn ct_session_poll_event(
+    handle: ?*anyopaque,
+    out_kind: *u8,
+    out_peer_id: *u32,
+) c_int {
+    const s: *session_mod.Session = @ptrCast(@alignCast(handle orelse return 0));
+    const ev = s.pollEvent() orelse return 0;
+    out_kind.* = @intFromEnum(ev.kind);
+    out_peer_id.* = ev.peer_id;
+    return 1;
 }
 
 /// Broadcast `len` bytes to all connected peers. Returns 0 on success, -1

@@ -30,12 +30,22 @@ struct SessionSidebar: View {
 
             Divider()
 
+            GroupBox("Your name") {
+                TextField(
+                    "Display name",
+                    text: Binding(
+                        get: { model.sessionManager.localName },
+                        set: { model.sessionManager.localName = $0 }),
+                    onCommit: { model.sessionManager.persistName() })
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption)
+            }
+
             GroupBox("Share") {
                 VStack(alignment: .leading, spacing: 6) {
-                    switch model.session == nil ? .idle : model.sessionManager.state {
+                    switch model.sessionManager.state {
                     case .idle:
                         Button("Start shared session") { model.startSharing() }
-                            .disabled(model.session == nil)
                         Button("Join shared session…") { model.promptJoin() }
                     case .starting:
                         Text("Starting…")
@@ -62,16 +72,26 @@ struct SessionSidebar: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
-                        if !model.sessionManager.peers.isEmpty {
-                            Text("Peers:")
+                        if !model.sessionManager.participants.isEmpty {
+                            Text("In session:")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            ForEach(model.sessionManager.peers) { p in
-                                Text("• \(p.name.isEmpty ? "peer #\(p.id)" : p.name)")
+                            ForEach(model.sessionManager.participants) { p in
+                                let isMe = p.identity == model.sessionManager.localIdentity
+                                let label = (p.name.isEmpty ? "(unnamed)" : p.name)
+                                    + (isMe ? " (you)" : "")
+                                    + (p.role == .host ? " — host" : "")
+                                Text("• \(label)")
                                     .font(.caption)
                             }
                         }
                         Button("Leave") { model.stopSharing() }
+                            .controlSize(.small)
+                    case .disconnected:
+                        Text("Host disconnected")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        Button("Dismiss") { model.stopSharing() }
                             .controlSize(.small)
                     case .failed(let msg):
                         Text("Failed: \(msg)")
