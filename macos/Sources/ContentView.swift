@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import CollabTermC
 
 struct ContentView: View {
@@ -36,12 +37,20 @@ final class TerminalModel: ObservableObject {
     @Published var boreBundlePath: String?
     @Published var coreVersion: Int32 = 0
 
+    let sessionManager = SessionManager()
+
     init() {
         coreVersion = ct_version()
         if let url = Bundle.main.url(forResource: "bore", withExtension: nil) {
             boreBundlePath = url.path
         }
+        // Re-publish child ObservableObject changes.
+        sessionManager.objectWillChange.sink { [weak self] _ in
+            self?.objectWillChange.send()
+        }.store(in: &cancellables)
     }
+
+    private var cancellables = Set<AnyCancellable>()
 
     func startSession() {
         guard let folder = FolderPicker.pick() else { return }
@@ -58,5 +67,44 @@ final class TerminalModel: ObservableObject {
         session?.terminate()
         session = nil
         rootPath = nil
+        stopSharing()
+    }
+
+    // MARK: sharing
+
+    func startSharing() {
+        sessionManager.startHost()
+        if let borePath = boreBundlePath {
+            sessionManager.startBoreTunnel(borePath: borePath)
+        }
+    }
+
+    func stopSharing() {
+        sessionManager.stop()
+    }
+
+    func promptJoin() {
+        let alert = NSAlert()
+        alert.messageText = "Join shared session"
+        alert.informativeText = "Enter host:port (e.g. bore.pub:12345 or 127.0.0.1:5555)"
+        alert.alertStyle = .informational
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        input.placeholderString = "host:port"
+        alert.accessoryView = input
+        alert.addButton(withTitle: "Join")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let raw = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let colon = raw.lastIndex(of: ":"),
+              let port = UInt16(raw[raw.index(after: colon)...]),
+              !raw[..<colon].isEmpty
+        else {
+            NSLog("join: malformed \(raw)")
+            return
+        }
+        let host = String(raw[..<colon])
+        sessionManager.stop()
+        sessionManager.joinPeer(host: host, port: port)
     }
 }

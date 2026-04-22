@@ -63,6 +63,50 @@ void     ct_term_cursor(ct_term *t, uint16_t *out_x, uint16_t *out_y);
 /* Monotonic counter bumped on any grid mutation. Swift redraws when this changes. */
 uint32_t ct_term_dirty_epoch(ct_term *t);
 
+/* ---- Session (Phase 3) ----------------------------------------------- */
+
+typedef struct ct_session ct_session;
+
+/* Create a host session listening on `port`. Pass 0 to let the OS assign
+ * (inspect via ct_session_port). Returns NULL on error. */
+ct_session *ct_session_new_host(uint16_t port);
+
+/* Connect to `host:port` as a peer. `host` is a NUL-terminated C string. */
+ct_session *ct_session_new_peer(const char *host, uint16_t port);
+
+void        ct_session_free(ct_session *s);
+uint16_t    ct_session_port(ct_session *s);
+uint32_t    ct_session_peer_count(ct_session *s);
+
+/* Broadcast `len` bytes to all connected peers. Returns 0 on success. */
+int ct_session_broadcast(ct_session *s, const uint8_t *bytes, size_t len);
+
+/* Pop the next inbound frame. Writes up to `cap` bytes into `out` and the
+ * sending peer id into `*out_peer_id`. Returns the full frame length (which
+ * may exceed `cap` — caller should grow its buffer and retry). Returns 0
+ * when the queue is empty. */
+ptrdiff_t ct_session_poll(ct_session *s,
+                          uint8_t *out, size_t cap,
+                          uint32_t *out_peer_id);
+
+/* ---- Bore supervisor ------------------------------------------------- */
+
+typedef struct ct_bore ct_bore;
+
+ct_bore *ct_bore_new(void);
+void     ct_bore_free(ct_bore *b);
+
+/* Spawn `bore local --to bore.pub <port>` using the binary at `bore_path`.
+ * Returns 0 on success, -1 on spawn failure. */
+int      ct_bore_start(ct_bore *b, const char *bore_path, uint16_t port);
+
+/* Poll once. If the public URL is now available, writes up to `cap` bytes
+ * (NOT NUL-terminated) into `out` and returns the URL length. Returns 0 if
+ * not ready, -1 on error. */
+ptrdiff_t ct_bore_pump(ct_bore *b, uint8_t *out, size_t cap);
+
+void      ct_bore_stop(ct_bore *b);
+
 #ifdef __cplusplus
 }
 #endif

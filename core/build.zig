@@ -15,4 +15,14 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(lib);
     b.installFile("include/collabterm.h", "include/collabterm.h");
+
+    const tests = b.addTest(.{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    tests.linkLibC();
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_tests.step);
 }
