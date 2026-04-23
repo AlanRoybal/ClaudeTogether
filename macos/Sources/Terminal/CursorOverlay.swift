@@ -67,7 +67,7 @@ struct CursorOverlay {
 
     // MARK: - Block geometry
 
-    private static let baseAlpha: UInt8 = 200
+    private static let baseAlpha: UInt8 = 235
     private static let laneInsetStep: Float = 0.12
     private static let maxInset: Float = 0.30
 

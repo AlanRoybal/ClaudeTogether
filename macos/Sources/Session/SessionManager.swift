@@ -402,6 +402,9 @@ final class SessionManager: ObservableObject {
                         identity: localIdentity, role: .peer,
                         name: localName, color: localColor))
                 }
+                if let localEntry = next.first(where: { $0.identity == localIdentity }) {
+                    localColor = localEntry.color
+                }
                 participants = next
             }
         case .modeChange(let m):
@@ -421,15 +424,42 @@ final class SessionManager: ObservableObject {
                                    name: String,
                                    color: UInt32)
     {
+        let resolvedColor = resolvedParticipantColor(
+            for: identity,
+            preferredColor: color)
         if let i = participants.firstIndex(where: { $0.identity == identity }) {
             participants[i].role = helloRole
             participants[i].name = name
-            participants[i].color = color
+            participants[i].color = resolvedColor
         } else {
             participants.append(Participant(
                 identity: identity, role: helloRole,
-                name: name, color: color))
+                name: name, color: resolvedColor))
         }
+    }
+
+    private func resolvedParticipantColor(for identity: UserIdentity,
+                                          preferredColor: UInt32) -> UInt32
+    {
+        let usedColors = Set(
+            participants
+                .filter { $0.identity != identity }
+                .map(\.color))
+        if !usedColors.contains(preferredColor) {
+            return preferredColor
+        }
+
+        let palette = Self.participantPalette
+        guard !palette.isEmpty else { return preferredColor }
+
+        let start = Int(Self.colorHash(for: identity) % UInt32(palette.count))
+        for offset in 0..<palette.count {
+            let candidate = palette[(start + offset) % palette.count]
+            if !usedColors.contains(candidate) {
+                return candidate
+            }
+        }
+        return preferredColor
     }
 
     private func updateLocalParticipantField(_ mutate: (inout Participant) -> Void) {
@@ -477,22 +507,32 @@ final class SessionManager: ObservableObject {
         UserDefaults.standard.set(localName, forKey: Self.nameDefaultsKey)
     }
 
-    nonisolated static func defaultColor(for identity: UserIdentity) -> UInt32 {
-        let palette: [UInt32] = [
-            0xFF6B6B,
-            0xFFD166,
-            0x06D6A0,
-            0x4CC9F0,
-            0xA78BFA,
-            0xF72585,
-            0x90BE6D,
-            0xF9844A,
+    nonisolated static var participantPalette: [UInt32] {
+        [
+            0xFF3B30, // red
+            0xFFD60A, // yellow
+            0x32D74B, // green
+            0x00C7BE, // teal
+            0x64D2FF, // cyan
+            0x0A84FF, // blue
+            0x5E5CE6, // indigo
+            0xBF5AF2, // purple
+            0xFF375F, // pink
+            0xFF9F0A, // orange
         ]
+    }
+
+    nonisolated static func defaultColor(for identity: UserIdentity) -> UInt32 {
+        let palette = participantPalette
+        return palette[Int(colorHash(for: identity) % UInt32(palette.count))]
+    }
+
+    nonisolated private static func colorHash(for identity: UserIdentity) -> UInt32 {
         var hash: UInt32 = 2166136261
         for byte in identity.bytes {
             hash ^= UInt32(byte)
             hash &*= 16777619
         }
-        return palette[Int(hash % UInt32(palette.count))]
+        return hash
     }
 }

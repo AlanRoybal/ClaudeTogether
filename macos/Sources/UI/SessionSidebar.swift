@@ -83,17 +83,12 @@ struct SessionSidebar: View {
                             }
                         }
                         if !model.sessionManager.participants.isEmpty {
-                            Text("In session:")
+                            Text("Users:")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
-                            ForEach(model.sessionManager.participants) { p in
-                                let isMe = p.identity == model.sessionManager.localIdentity
-                                let label = (p.name.isEmpty ? "(unnamed)" : p.name)
-                                    + (isMe ? " (you)" : "")
-                                    + (p.role == .host ? " — host" : "")
-                                Text("• \(label)")
-                                    .font(.caption)
-                            }
+                            ParticipantColorLegend(
+                                participants: model.sessionManager.participants,
+                                localIdentity: model.sessionManager.localIdentity)
                         }
                         Button("Leave") { model.stopSharing() }
                             .controlSize(.small)
