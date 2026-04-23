@@ -2,6 +2,7 @@ const std = @import("std");
 const pty = @import("pty.zig");
 const session_mod = @import("session.zig");
 const bore_mod = @import("bore.zig");
+const crdt = @import("crdt.zig");
 
 // Process-wide allocator for C-ABI objects. Using the general-purpose
 // allocator so leaks show up in Debug builds.
@@ -161,6 +162,20 @@ export fn ct_session_broadcast(
     return 0;
 }
 
+export fn ct_session_send_to(
+    handle: ?*anyopaque,
+    peer_id: u32,
+    bytes: [*]const u8,
+    len: usize,
+) c_int {
+    const s: *session_mod.Session = @ptrCast(@alignCast(handle orelse return -1));
+    s.sendTo(peer_id, bytes[0..len]) catch |err| {
+        setLastError("send to peer {d} failed: {s}", .{ peer_id, @errorName(err) });
+        return -1;
+    };
+    return 0;
+}
+
 /// Pop the next inbound frame. If one is available, copies up to `cap`
 /// bytes into `out`, writes the sending peer id into `*out_peer_id`, and
 /// returns the frame length (may exceed `cap` — caller should treat
@@ -244,4 +259,179 @@ export fn ct_bore_stop(handle: ?*anyopaque) void {
     const sup: *bore_mod.Supervisor =
         @ptrCast(@alignCast(handle orelse return));
     sup.stop();
+}
+
+// ---- Collaborative document (Phase 4) -----------------------------------
+
+const Doc = struct {
+    allocator: std.mem.Allocator,
+    seq: crdt.Sequence,
+};
+
+/// Create a new collaborative document handle for `client_id`. Returns
+/// null on allocation failure.
+export fn ct_doc_create(client_id: u32) ?*Doc {
+    const d = gpa().create(Doc) catch {
+        setLastError("ct_doc_create: alloc failed", .{});
+        return null;
+    };
+    d.* = .{
+        .allocator = gpa(),
+        .seq = crdt.Sequence.init(gpa(), client_id),
+    };
+    return d;
+}
+
+export fn ct_doc_destroy(doc: ?*Doc) void {
+    const d = doc orelse return;
+    d.seq.deinit();
+    d.allocator.destroy(d);
+}
+
+/// Bulk-load a UTF-8 snapshot into the doc. Returns 0 on success, -1 on
+/// error (e.g. invalid UTF-8).
+export fn ct_doc_load_snapshot(
+    doc: ?*Doc,
+    bytes: [*]const u8,
+    len: usize,
+) c_int {
+    const d = doc orelse return -1;
+    d.seq.loadFromString(bytes[0..len]) catch |err| {
+        setLastError("ct_doc_load_snapshot: {s}", .{@errorName(err)});
+        return -1;
+    };
+    return 0;
+}
+
+/// Perform a local insert of `codepoint` at visible offset `visible_pos`
+/// and encode the resulting op into `out_buf`. On entry `*in_out_len` is
+/// the capacity; on success it is set to bytes-written. On BufferTooSmall
+/// it is set to the required size and -2 is returned so the caller can
+/// retry with a larger buffer. 0 = success, -1 = other error.
+export fn ct_doc_local_insert(
+    doc: ?*Doc,
+    visible_pos: usize,
+    codepoint: u32,
+    out_buf: [*]u8,
+    in_out_len: *usize,
+) c_int {
+    const d = doc orelse return -1;
+    const op = d.seq.localInsert(visible_pos, codepoint) catch |err| {
+        setLastError("ct_doc_local_insert: {s}", .{@errorName(err)});
+        return -1;
+    };
+    return encodeOpToOut(op, out_buf, in_out_len);
+}
+
+/// Perform a local delete at visible offset `visible_pos`. Returns 0 on
+/// success (op written), 1 if the position was out of range (no-op, no op
+/// produced, `*in_out_len` set to 0), -2 if the buffer is too small
+/// (required size written into `*in_out_len`), -1 on other error.
+export fn ct_doc_local_delete(
+    doc: ?*Doc,
+    visible_pos: usize,
+    out_buf: [*]u8,
+    in_out_len: *usize,
+) c_int {
+    const d = doc orelse return -1;
+    const op_opt = d.seq.localDelete(visible_pos) catch |err| {
+        setLastError("ct_doc_local_delete: {s}", .{@errorName(err)});
+        return -1;
+    };
+    const op = op_opt orelse {
+        in_out_len.* = 0;
+        return 1;
+    };
+    return encodeOpToOut(op, out_buf, in_out_len);
+}
+
+/// Decode and apply an op. `*out_changed` is set to whether the doc
+/// actually mutated. 0 on success, -1 on decode/apply error.
+export fn ct_doc_apply_op(
+    doc: ?*Doc,
+    op_bytes: [*]const u8,
+    len: usize,
+    out_changed: *bool,
+) c_int {
+    const d = doc orelse return -1;
+    const op = crdt.decodeOp(op_bytes[0..len]) catch |err| {
+        setLastError("ct_doc_apply_op: decode: {s}", .{@errorName(err)});
+        return -1;
+    };
+    const changed = d.seq.apply(op) catch |err| {
+        setLastError("ct_doc_apply_op: apply: {s}", .{@errorName(err)});
+        return -1;
+    };
+    out_changed.* = changed;
+    return 0;
+}
+
+/// Materialize the document as UTF-8 bytes into `out_buf`. Same round-trip
+/// buffer protocol as the local-insert/delete calls: 0 success, -2 if
+/// `out_buf` is too small (required size in `*in_out_len`), -1 on error.
+export fn ct_doc_to_utf8(
+    doc: ?*Doc,
+    out_buf: [*]u8,
+    in_out_len: *usize,
+) c_int {
+    const d = doc orelse return -1;
+    const bytes = d.seq.toUtf8(d.allocator) catch |err| {
+        setLastError("ct_doc_to_utf8: {s}", .{@errorName(err)});
+        return -1;
+    };
+    defer d.allocator.free(bytes);
+    const cap = in_out_len.*;
+    if (bytes.len > cap) {
+        in_out_len.* = bytes.len;
+        return -2;
+    }
+    if (bytes.len > 0) @memcpy(out_buf[0..bytes.len], bytes);
+    in_out_len.* = bytes.len;
+    return 0;
+}
+
+/// Look up the CRDT id of the live item at visible offset `visible_pos`.
+/// Returns 0 and writes the id on success, 1 if the position is out of
+/// range (no id written).
+export fn ct_doc_id_at_pos(
+    doc: ?*Doc,
+    visible_pos: usize,
+    out_client: *u32,
+    out_clock: *u32,
+) c_int {
+    const d = doc orelse return -1;
+    const id = d.seq.idAtVisiblePos(visible_pos) orelse return 1;
+    out_client.* = id.client;
+    out_clock.* = id.clock;
+    return 0;
+}
+
+/// Resolve a CRDT id back to its current visible offset. Tombstones
+/// resolve to the offset of the next live item. Returns 0 on success,
+/// 1 if the id is not in the sequence at all.
+export fn ct_doc_pos_of_id(
+    doc: ?*Doc,
+    client: u32,
+    clock: u32,
+    out_pos: *usize,
+) c_int {
+    const d = doc orelse return -1;
+    const pos = d.seq.visiblePosOfId(.{ .client = client, .clock = clock }) orelse return 1;
+    out_pos.* = pos;
+    return 0;
+}
+
+fn encodeOpToOut(op: crdt.Op, out_buf: [*]u8, in_out_len: *usize) c_int {
+    const cap = in_out_len.*;
+    const n = crdt.encodeOp(op, out_buf[0..cap]) catch |err| {
+        if (err == error.BufferTooSmall) {
+            // Conservative upper bound on op size: 1 + 8 + 1 + 8 + 4 = 22.
+            in_out_len.* = 32;
+            return -2;
+        }
+        setLastError("encodeOp: {s}", .{@errorName(err)});
+        return -1;
+    };
+    in_out_len.* = n;
+    return 0;
 }

@@ -160,6 +160,27 @@ pub const Session = struct {
         }
     }
 
+    pub fn sendTo(self: *Session, peer_id: u32, payload: []const u8) !void {
+        var target: ?*Peer = null;
+        self.mutex.lock();
+        for (self.peers.items) |p| {
+            if (p.id == peer_id) {
+                target = p;
+                break;
+            }
+        }
+        self.mutex.unlock();
+
+        const p = target orelse return error.UnknownPeer;
+        p.write_mutex.lock();
+        defer p.write_mutex.unlock();
+        if (p.dead) return error.UnknownPeer;
+        p.conn.sendFrame(payload) catch |err| {
+            self.markDead(p, err);
+            return err;
+        };
+    }
+
     /// Pop the next inbound frame. Caller must `freeFrame` the payload.
     /// Returns null if none pending.
     pub fn pollFrame(self: *Session) ?InboundFrame {
@@ -345,4 +366,64 @@ test "host + peer exchange frames" {
         }
         std.time.sleep(5 * std.time.ns_per_ms);
     } else return error.TestUnexpectedResult;
+}
+
+test "host can send to one peer without broadcasting to another" {
+    var host = try Session.initHost(testing.allocator, 0);
+    defer host.deinit();
+
+    const port = host.boundPort();
+    var peer_one = try Session.initPeer(testing.allocator, "127.0.0.1", port);
+    defer peer_one.deinit();
+    var peer_two = try Session.initPeer(testing.allocator, "127.0.0.1", port);
+    defer peer_two.deinit();
+
+    var waited: usize = 0;
+    while (host.peerCount() < 2 and waited < 400) : (waited += 1) {
+        std.time.sleep(5 * std.time.ns_per_ms);
+    }
+    try testing.expectEqual(@as(usize, 2), host.peerCount());
+
+    var first_id: ?u32 = null;
+    var second_id: ?u32 = null;
+    waited = 0;
+    while ((first_id == null or second_id == null) and waited < 400) : (waited += 1) {
+        if (host.pollEvent()) |ev| {
+            if (ev.kind == .peer_connected) {
+                if (first_id == null) {
+                    first_id = ev.peer_id;
+                } else if (second_id == null and ev.peer_id != first_id.?) {
+                    second_id = ev.peer_id;
+                }
+            }
+            continue;
+        }
+        std.time.sleep(5 * std.time.ns_per_ms);
+    }
+
+    const target_id = first_id orelse return error.TestUnexpectedResult;
+    _ = second_id orelse return error.TestUnexpectedResult;
+
+    try host.sendTo(target_id, "private payload");
+
+    var saw_private_count: usize = 0;
+    var attempts: usize = 0;
+    while (attempts < 200) : (attempts += 1) {
+        if (peer_one.pollFrame()) |f| {
+            defer peer_one.freeFrame(f);
+            if (std.mem.eql(u8, f.payload, "private payload")) {
+                saw_private_count += 1;
+            }
+        }
+        if (peer_two.pollFrame()) |f| {
+            defer peer_two.freeFrame(f);
+            if (std.mem.eql(u8, f.payload, "private payload")) {
+                saw_private_count += 1;
+            }
+        }
+        if (saw_private_count > 0) break;
+        std.time.sleep(5 * std.time.ns_per_ms);
+    }
+
+    try testing.expectEqual(@as(usize, 1), saw_private_count);
 }

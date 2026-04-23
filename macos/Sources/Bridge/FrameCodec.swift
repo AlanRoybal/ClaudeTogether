@@ -14,6 +14,14 @@ enum FrameTag: UInt8 {
     case modeChange  = 0x08
     case roster      = 0x09
     case heartbeat   = 0x0A
+    // Collaborative editor frames (0x10..0x15). Tags start at 0x10 to leave
+    // room above the core session frames; must match `Tag` in frame.zig.
+    case editorOpen      = 0x10
+    case editorOp        = 0x11
+    case editorPresence  = 0x12
+    case editorSave      = 0x13
+    case editorSaved     = 0x14
+    case editorClose     = 0x15
 }
 
 enum SessionRole: UInt8 {
@@ -47,6 +55,13 @@ struct UserIdentity: Equatable, Hashable {
     func hash(into h: inout Hasher) { h.combine(bytes) }
 }
 
+/// Stable cursor anchor id. Mirrors `crdt.Id` in core/src/crdt.zig as a
+/// `client:u32 clock:u32` pair.
+struct CrdtId: Equatable, Hashable {
+    var client: UInt32
+    var clock: UInt32
+}
+
 struct RosterEntry: Equatable, Hashable {
     var identity: UserIdentity
     var role: SessionRole
@@ -54,15 +69,46 @@ struct RosterEntry: Equatable, Hashable {
     var name: String
 }
 
+enum FSSyncDeltaKind: UInt8 {
+    case upsertFile      = 0
+    case ensureDirectory = 1
+    case deletePath      = 2
+}
+
+enum FSSnapshotEntryKind: UInt8, Codable {
+    case file      = 0
+    case directory = 1
+}
+
+struct FSSyncDelta: Equatable {
+    var kind: FSSyncDeltaKind
+    var path: String
+    var data: Data = Data()
+}
+
+struct FSSnapshotEntry: Equatable, Hashable, Codable {
+    var kind: FSSnapshotEntryKind
+    var path: String
+}
+
 enum Frame {
     case ptyOutput(Data)
     case inputOp(Data)
     case inputCommit(UserIdentity)
+    case fsDelta(FSSyncDelta)
+    case fsSnapshot([FSSnapshotEntry])
     case cursorPos(UserIdentity, col: UInt16, row: UInt16)
     case hello(UserIdentity, role: SessionRole, color: UInt32, name: String)
     case modeChange(TermMode)
     case roster([RosterEntry])
     case heartbeat
+    case editorOpen(docId: UInt64, path: String, snapshot: Data)
+    case editorOp(docId: UInt64, opBytes: Data)
+    case editorPresence(docId: UInt64, userId: UInt32,
+                        anchor: CrdtId?, selectionAnchor: CrdtId?)
+    case editorSave(docId: UInt64)
+    case editorSaved(docId: UInt64, rev: UInt32)
+    case editorClose(docId: UInt64)
 }
 
 enum FrameCodecError: Error {
@@ -89,6 +135,23 @@ enum FrameCodec {
         case .inputCommit(let id):
             out.append(FrameTag.inputCommit.rawValue)
             out.append(contentsOf: id.bytes)
+        case .fsDelta(let payload):
+            out.append(FrameTag.fsDelta.rawValue)
+            out.append(payload.kind.rawValue)
+            let pathUtf8 = Array(payload.path.utf8)
+            appendU16(&out, UInt16(min(pathUtf8.count, Int(UInt16.max))))
+            out.append(contentsOf: pathUtf8.prefix(Int(UInt16.max)))
+            appendU32(&out, UInt32(payload.data.count))
+            out.append(payload.data)
+        case .fsSnapshot(let entries):
+            out.append(FrameTag.fsSnapshot.rawValue)
+            appendU32(&out, UInt32(min(entries.count, Int(UInt32.max))))
+            for entry in entries.prefix(Int(UInt32.max)) {
+                out.append(entry.kind.rawValue)
+                let pathUtf8 = Array(entry.path.utf8)
+                appendU16(&out, UInt16(min(pathUtf8.count, Int(UInt16.max))))
+                out.append(contentsOf: pathUtf8.prefix(Int(UInt16.max)))
+            }
         case .cursorPos(let id, let col, let row):
             out.append(FrameTag.cursorPos.rawValue)
             out.append(contentsOf: id.bytes)
@@ -118,6 +181,35 @@ enum FrameCodec {
             }
         case .heartbeat:
             out.append(FrameTag.heartbeat.rawValue)
+        case .editorOpen(let docId, let path, let snapshot):
+            out.append(FrameTag.editorOpen.rawValue)
+            appendU64(&out, docId)
+            let pathUtf8 = Array(path.utf8)
+            appendU16(&out, UInt16(min(pathUtf8.count, Int(UInt16.max))))
+            out.append(contentsOf: pathUtf8.prefix(Int(UInt16.max)))
+            appendU32(&out, UInt32(snapshot.count))
+            out.append(snapshot)
+        case .editorOp(let docId, let opBytes):
+            out.append(FrameTag.editorOp.rawValue)
+            appendU64(&out, docId)
+            appendU32(&out, UInt32(opBytes.count))
+            out.append(opBytes)
+        case .editorPresence(let docId, let userId, let anchor, let sel):
+            out.append(FrameTag.editorPresence.rawValue)
+            appendU64(&out, docId)
+            appendU32(&out, userId)
+            appendOptCrdtId(&out, anchor)
+            appendOptCrdtId(&out, sel)
+        case .editorSave(let docId):
+            out.append(FrameTag.editorSave.rawValue)
+            appendU64(&out, docId)
+        case .editorSaved(let docId, let rev):
+            out.append(FrameTag.editorSaved.rawValue)
+            appendU64(&out, docId)
+            appendU32(&out, rev)
+        case .editorClose(let docId):
+            out.append(FrameTag.editorClose.rawValue)
+            appendU64(&out, docId)
         }
         return out
     }
@@ -141,6 +233,32 @@ enum FrameCodec {
         case .inputCommit:
             let id = try UserIdentity.from(exactly16: Array(try r.readBytes(16)))
             return .inputCommit(id)
+        case .fsDelta:
+            let kindByte = try r.readU8()
+            guard let kind = FSSyncDeltaKind(rawValue: kindByte) else {
+                throw FrameCodecError.invalidEnum
+            }
+            let pathLen = try r.readU16()
+            let pathBytes = try r.readBytes(Int(pathLen))
+            let path = String(data: pathBytes, encoding: .utf8) ?? ""
+            let dataLen = try r.readU32()
+            let payload = try r.readBytes(Int(dataLen))
+            return .fsDelta(FSSyncDelta(kind: kind, path: path, data: payload))
+        case .fsSnapshot:
+            let count = try r.readU32()
+            var entries: [FSSnapshotEntry] = []
+            entries.reserveCapacity(Int(count))
+            for _ in 0..<Int(count) {
+                let kindByte = try r.readU8()
+                guard let kind = FSSnapshotEntryKind(rawValue: kindByte) else {
+                    throw FrameCodecError.invalidEnum
+                }
+                let pathLen = try r.readU16()
+                let pathBytes = try r.readBytes(Int(pathLen))
+                let path = String(data: pathBytes, encoding: .utf8) ?? ""
+                entries.append(FSSnapshotEntry(kind: kind, path: path))
+            }
+            return .fsSnapshot(entries)
         case .cursorPos:
             let id = try UserIdentity.from(exactly16: Array(try r.readBytes(16)))
             let col = try r.readU16()
@@ -184,8 +302,36 @@ enum FrameCodec {
             return .roster(entries)
         case .heartbeat:
             return .heartbeat
-        case .fsDelta, .fsSnapshot:
-            throw FrameCodecError.unsupportedTag
+        case .editorOpen:
+            let docId = try r.readU64()
+            let pathLen = try r.readU16()
+            let pathBytes = try r.readBytes(Int(pathLen))
+            let path = String(data: pathBytes, encoding: .utf8) ?? ""
+            let snapLen = try r.readU32()
+            let snapshot = try r.readBytes(Int(snapLen))
+            return .editorOpen(docId: docId, path: path, snapshot: snapshot)
+        case .editorOp:
+            let docId = try r.readU64()
+            let n = try r.readU32()
+            let opBytes = try r.readBytes(Int(n))
+            return .editorOp(docId: docId, opBytes: opBytes)
+        case .editorPresence:
+            let docId = try r.readU64()
+            let userId = try r.readU32()
+            let anchor = try r.readOptCrdtId()
+            let sel = try r.readOptCrdtId()
+            return .editorPresence(docId: docId, userId: userId,
+                                   anchor: anchor, selectionAnchor: sel)
+        case .editorSave:
+            let docId = try r.readU64()
+            return .editorSave(docId: docId)
+        case .editorSaved:
+            let docId = try r.readU64()
+            let rev = try r.readU32()
+            return .editorSaved(docId: docId, rev: rev)
+        case .editorClose:
+            let docId = try r.readU64()
+            return .editorClose(docId: docId)
         }
     }
 
@@ -201,6 +347,27 @@ enum FrameCodec {
         d.append(UInt8((v >> 16) & 0xFF))
         d.append(UInt8((v >>  8) & 0xFF))
         d.append(UInt8( v        & 0xFF))
+    }
+
+    private static func appendU64(_ d: inout Data, _ v: UInt64) {
+        d.append(UInt8((v >> 56) & 0xFF))
+        d.append(UInt8((v >> 48) & 0xFF))
+        d.append(UInt8((v >> 40) & 0xFF))
+        d.append(UInt8((v >> 32) & 0xFF))
+        d.append(UInt8((v >> 24) & 0xFF))
+        d.append(UInt8((v >> 16) & 0xFF))
+        d.append(UInt8((v >>  8) & 0xFF))
+        d.append(UInt8( v        & 0xFF))
+    }
+
+    private static func appendOptCrdtId(_ d: inout Data, _ v: CrdtId?) {
+        if let id = v {
+            d.append(UInt8(1))
+            appendU32(&d, id.client)
+            appendU32(&d, id.clock)
+        } else {
+            d.append(UInt8(0))
+        }
     }
 }
 
@@ -233,6 +400,32 @@ private struct Reader {
              UInt32(data[base + 3])
         pos += 4
         return v
+    }
+
+    mutating func readU64() throws -> UInt64 {
+        guard pos + 8 <= data.count else { throw FrameCodecError.truncated }
+        let base = data.startIndex + pos
+        let hi: UInt64 =
+            (UInt64(data[base])     << 24) |
+            (UInt64(data[base + 1]) << 16) |
+            (UInt64(data[base + 2]) <<  8) |
+             UInt64(data[base + 3])
+        let lo: UInt64 =
+            (UInt64(data[base + 4]) << 24) |
+            (UInt64(data[base + 5]) << 16) |
+            (UInt64(data[base + 6]) <<  8) |
+             UInt64(data[base + 7])
+        pos += 8
+        return (hi << 32) | lo
+    }
+
+    mutating func readOptCrdtId() throws -> CrdtId? {
+        let has = try readU8()
+        if has == 0 { return nil }
+        guard has == 1 else { throw FrameCodecError.invalidEnum }
+        let client = try readU32()
+        let clock = try readU32()
+        return CrdtId(client: client, clock: clock)
     }
 
     mutating func readBytes(_ n: Int) throws -> Data {

@@ -157,6 +157,61 @@ pub const Sequence = struct {
         self.items.clearRetainingCapacity();
     }
 
+    /// Bulk-insert the UTF-8-decoded codepoints of `s` at the end of the
+    /// sequence. Each codepoint becomes a full CRDT `Item` authored by
+    /// `self.client` with monotonically increasing clocks, so concurrent
+    /// edits during/after load behave correctly. Existing items are
+    /// preserved; insertions land after the current last live item.
+    pub fn loadFromString(self: *Sequence, s: []const u8) !void {
+        var view = try std.unicode.Utf8View.init(s);
+        var it = view.iterator();
+        while (it.nextCodepoint()) |cp| {
+            const after_id = self.idBeforeVisiblePos(self.len());
+            self.clock += 1;
+            const new_id = Id{ .client = self.client, .clock = self.clock };
+            try self.applyInsert(new_id, after_id, cp);
+        }
+    }
+
+    /// Return the `Id` of the live item at visible offset `visible_pos`
+    /// (0-based, live items only), or null if `visible_pos >= len()`.
+    /// Used as a cursor anchor ("my caret sits on this character").
+    pub fn idAtVisiblePos(self: *const Sequence, visible_pos: usize) ?Id {
+        var live: usize = 0;
+        for (self.items.items) |it| {
+            if (it.deleted) continue;
+            if (live == visible_pos) return it.id;
+            live += 1;
+        }
+        return null;
+    }
+
+    /// Find the item with `id` and return its visible offset among live
+    /// items. If the item is a tombstone, returns the visible offset of the
+    /// next live item after it (or `len()` if none follow). Returns null
+    /// only if the `id` is not in the sequence at all.
+    pub fn visiblePosOfId(self: *const Sequence, id: Id) ?usize {
+        var live: usize = 0;
+        var found_idx: ?usize = null;
+        for (self.items.items, 0..) |it, i| {
+            if (Id.eql(it.id, id)) {
+                found_idx = i;
+                break;
+            }
+            if (!it.deleted) live += 1;
+        }
+        if (found_idx == null) return null;
+        const idx = found_idx.?;
+        const item = self.items.items[idx];
+        if (!item.deleted) return live;
+        // Tombstone: walk forward to the next live item.
+        var j = idx + 1;
+        while (j < self.items.items.len) : (j += 1) {
+            if (!self.items.items[j].deleted) return live;
+        }
+        return live; // equals len() — no live item follows.
+    }
+
     // --- internals --------------------------------------------------------
 
     fn applyInsert(self: *Sequence, id: Id, after: ?Id, cp: u32) !void {
@@ -407,6 +462,75 @@ test "op roundtrip" {
     const n2 = try encodeOp(delop, &buf);
     const got2 = try decodeOp(buf[0..n2]);
     try testing.expectEqual(delop.delete.id, got2.delete.id);
+}
+
+test "loadFromString empty" {
+    var s = Sequence.init(testing.allocator, 1);
+    defer s.deinit();
+    try s.loadFromString("");
+    try testing.expectEqual(@as(usize, 0), s.len());
+    const got = try s.toUtf8(testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("", got);
+}
+
+test "loadFromString ascii roundtrip" {
+    var s = Sequence.init(testing.allocator, 1);
+    defer s.deinit();
+    try s.loadFromString("hello");
+    const got = try s.toUtf8(testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("hello", got);
+}
+
+test "loadFromString multibyte utf8 roundtrip" {
+    var s = Sequence.init(testing.allocator, 1);
+    defer s.deinit();
+    try s.loadFromString("héllo\nworld");
+    const got = try s.toUtf8(testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("héllo\nworld", got);
+    // 'é' is one codepoint, so len is 11 (not 12 bytes).
+    try testing.expectEqual(@as(usize, 11), s.len());
+}
+
+test "idAtVisiblePos basic" {
+    var s = Sequence.init(testing.allocator, 1);
+    defer s.deinit();
+    try s.loadFromString("abc");
+    const a = s.idAtVisiblePos(0).?;
+    const b = s.idAtVisiblePos(1).?;
+    const c = s.idAtVisiblePos(2).?;
+    try testing.expect(!Id.eql(a, b));
+    try testing.expect(!Id.eql(b, c));
+    try testing.expect(!Id.eql(a, c));
+    try testing.expect(s.idAtVisiblePos(3) == null);
+}
+
+test "visiblePosOfId after delete before" {
+    var s = Sequence.init(testing.allocator, 1);
+    defer s.deinit();
+    try s.loadFromString("abc");
+    const id_b = s.idAtVisiblePos(1).?;
+    _ = try s.localDelete(0); // delete 'a'
+    try testing.expectEqual(@as(?usize, 0), s.visiblePosOfId(id_b));
+}
+
+test "visiblePosOfId tombstone falls back to next live" {
+    var s = Sequence.init(testing.allocator, 1);
+    defer s.deinit();
+    try s.loadFromString("abc");
+    const id_b = s.idAtVisiblePos(1).?;
+    _ = try s.localDelete(1); // tombstone 'b'; 'c' now at visible pos 1
+    try testing.expectEqual(@as(?usize, 1), s.visiblePosOfId(id_b));
+}
+
+test "visiblePosOfId not in sequence returns null" {
+    var s = Sequence.init(testing.allocator, 1);
+    defer s.deinit();
+    try s.loadFromString("abc");
+    const bogus = Id{ .client = 999, .clock = 999 };
+    try testing.expect(s.visiblePosOfId(bogus) == null);
 }
 
 test "apply insert before its origin arrives falls back to end" {

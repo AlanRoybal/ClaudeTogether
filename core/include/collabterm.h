@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -87,6 +88,13 @@ uint32_t    ct_session_peer_count(ct_session *s);
 /* Broadcast `len` bytes to all connected peers. Returns 0 on success. */
 int ct_session_broadcast(ct_session *s, const uint8_t *bytes, size_t len);
 
+/* Send `len` bytes to exactly one peer by its transport id. Returns 0 on
+ * success, -1 if the peer id is unknown or the write failed — inspect
+ * ct_last_error() for a human-readable reason. */
+int ct_session_send_to(ct_session *s,
+                       uint32_t peer_id,
+                       const uint8_t *bytes, size_t len);
+
 /* Pop the next inbound frame. Writes up to `cap` bytes into `out` and the
  * sending peer id into `*out_peer_id`. Returns the full frame length (which
  * may exceed `cap` — caller should grow its buffer and retry). Returns 0
@@ -123,6 +131,25 @@ ptrdiff_t ct_bore_pump(ct_bore *b, uint8_t *out, size_t cap);
 ptrdiff_t ct_bore_debug(ct_bore *b, uint8_t *out, size_t cap);
 
 void      ct_bore_stop(ct_bore *b);
+
+/* ---- Collaborative document (Phase 4) -------------------------------- */
+
+typedef struct ct_doc ct_doc;
+
+ct_doc *ct_doc_create(uint32_t client_id);
+void    ct_doc_destroy(ct_doc *doc);
+int     ct_doc_load_snapshot(ct_doc *doc, const uint8_t *bytes, size_t len);
+int     ct_doc_local_insert(ct_doc *doc, size_t visible_pos, uint32_t codepoint,
+                            uint8_t *out_buf, size_t *in_out_len);
+int     ct_doc_local_delete(ct_doc *doc, size_t visible_pos,
+                            uint8_t *out_buf, size_t *in_out_len);
+int     ct_doc_apply_op(ct_doc *doc, const uint8_t *op_bytes, size_t len,
+                        bool *out_changed);
+int     ct_doc_to_utf8(ct_doc *doc, uint8_t *out_buf, size_t *in_out_len);
+int     ct_doc_id_at_pos(ct_doc *doc, size_t visible_pos,
+                         uint32_t *out_client, uint32_t *out_clock);
+int     ct_doc_pos_of_id(ct_doc *doc, uint32_t client, uint32_t clock,
+                         size_t *out_pos);
 
 #ifdef __cplusplus
 }

@@ -11,7 +11,10 @@ struct ContentView: View {
                 .frame(minWidth: 220, idealWidth: 260, maxWidth: 360)
 
             ZStack(alignment: .top) {
-                if let grid = model.grid {
+                if let controller = model.activeEditor {
+                    EditorHost(controller: controller)
+                        .frame(minWidth: 500, minHeight: 300)
+                } else if let grid = model.grid {
                     MetalTerminalView(
                         grid: grid,
                         onKey: { model.handleKey($0) },
@@ -34,8 +37,8 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
 
-                if model.showRawBanner {
-                    Text("Creator is running a full-screen app — input is disabled.")
+                if model.activeEditor == nil, model.showRawBanner {
+                    Text("Creator is running a full-screen app. Use /edit for shared file editing; terminal input is disabled here.")
                         .font(.callout)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 6)
@@ -58,6 +61,7 @@ final class TerminalModel: ObservableObject {
     @Published var rootPath: String?
     @Published var boreBundlePath: String?
     @Published var coreVersion: Int32 = 0
+    @Published var activeEditor: EditorController?
 
     let sessionManager = SessionManager()
 
@@ -68,6 +72,10 @@ final class TerminalModel: ObservableObject {
     private var modeTimer: Timer?
     private var sharedInput = SharedInputState()
     private var sharedInputPromptTimer: Timer?
+    private var editorSavedRevisions: [UInt64: UInt32] = [:]
+    private var fileSyncWatcher: FSSyncWatcher?
+    private var fileSyncTimer: Timer?
+    private let fileSyncApplier = FSSyncApplier()
 
     init() {
         coreVersion = ct_version()
@@ -82,11 +90,12 @@ final class TerminalModel: ObservableObject {
             self.syncSharedInputParticipants(
                 broadcast: self.sessionManager.role == .host)
             self.syncGridSharedInputOverlay()
+            self.syncEditorParticipants()
         }.store(in: &cancellables)
 
         // Route inbound frames.
-        sessionManager.onFrame = { [weak self] frame, _peerID in
-            self?.handleInbound(frame)
+        sessionManager.onFrame = { [weak self] frame, peerID in
+            self?.handleInbound(frame, from: peerID)
         }
 
         // DIAG: auto-share on launch when CT_AUTOSHARE=1 so we can test
@@ -106,6 +115,7 @@ final class TerminalModel: ObservableObject {
     deinit {
         modeTimer?.invalidate()
         sharedInputPromptTimer?.invalidate()
+        fileSyncTimer?.invalidate()
     }
 
     private static func findBoreBinaryPath() -> String? {
@@ -168,6 +178,8 @@ final class TerminalModel: ObservableObject {
         rootPath = folder
         pty = s
         grid = g
+        fileSyncWatcher = nil
+        fileSyncApplier.configure(rootPath: nil)
         startModeProbe()
         syncGridSharedInputOverlay()
     }
@@ -177,8 +189,12 @@ final class TerminalModel: ObservableObject {
         pty = nil
         grid = nil
         rootPath = nil
+        activeEditor = nil
+        editorSavedRevisions.removeAll()
         stopSharing()
         stopModeProbe()
+        stopFileSyncPolling()
+        fileSyncApplier.configure(rootPath: nil)
         resetSharedInputState()
     }
 
@@ -186,6 +202,8 @@ final class TerminalModel: ObservableObject {
 
     func startSharing() {
         sessionManager.startHost()
+        restartFileSyncWatcher()
+        startFileSyncPolling()
         if let borePath = boreBundlePath {
             sessionManager.startBoreTunnel(borePath: borePath)
         }
@@ -198,6 +216,7 @@ final class TerminalModel: ObservableObject {
     }
 
     func stopSharing() {
+        stopFileSyncPolling()
         sessionManager.stop()
         resetSharedInputState()
     }
@@ -223,6 +242,11 @@ final class TerminalModel: ObservableObject {
             return
         }
         let host = String(raw[..<colon])
+        guard let peerRoot = FolderPicker.pick(
+            prompt: "Choose the local folder this peer should use as the session root"
+        ) else {
+            return
+        }
         // Tear down any existing session (local PTY or stale peer) before
         // joining — peers have no PTY.
         endSession()
@@ -234,6 +258,8 @@ final class TerminalModel: ObservableObject {
             return
         }
         grid = g
+        rootPath = peerRoot
+        fileSyncApplier.configure(rootPath: peerRoot)
         resetSharedInputState()
         sessionManager.joinPeer(host: host, port: port)
     }
@@ -270,7 +296,7 @@ final class TerminalModel: ObservableObject {
 
     // MARK: inbound frames
 
-    private func handleInbound(_ frame: Frame) {
+    private func handleInbound(_ frame: Frame, from peerID: UInt32) {
         switch frame {
         case .ptyOutput(let data):
             NSLog("[ct] inbound ptyOutput bytes=%d role=%@ grid=%@",
@@ -301,16 +327,76 @@ final class TerminalModel: ObservableObject {
                 sessionManager.sendMode(lastLocalCreatorOnlyMode ? .raw : .line)
                 broadcastTerminalSnapshot()
                 broadcastSharedInputSnapshot()
+                if let editor = activeEditor {
+                    sessionManager.sendEditorOpen(
+                        docId: editor.state.docId,
+                        path: editor.state.path,
+                        snapshot: editor.snapshotData)
+                    editor.broadcastPresenceNow()
+                }
+                sendFullFileSync(toTransportPeerID: peerID)
             } else {
                 syncSharedInputParticipants(broadcast: false)
             }
+        case .fsDelta(let delta):
+            guard sessionManager.role == .peer else { return }
+            fileSyncApplier.apply(delta)
+        case .fsSnapshot(let entries):
+            guard sessionManager.role == .peer else { return }
+            fileSyncApplier.reconcile(snapshot: entries)
         case .roster:
             syncSharedInputParticipants(broadcast: false)
             syncGridSharedInputOverlay()
+            syncEditorParticipants()
         case .modeChange(let mode):
             if sessionManager.role == .peer, mode == .raw {
                 _ = sharedInput.deactivate(bumpRevision: false)
                 syncGridSharedInputOverlay()
+            }
+        case .editorOpen(let docId, let path, let snapshot):
+            if let editor = activeEditor, editor.state.docId == docId {
+                return
+            }
+            openEditor(docId: docId, path: path, snapshot: snapshot)
+        case .editorOp(let docId, let opBytes):
+            guard let editor = activeEditor, editor.state.docId == docId else { return }
+            if sessionManager.role == .host {
+                editor.onRemoteOp(opBytes)
+                sessionManager.sendEditorOp(docId: docId, opBytes: opBytes)
+            } else {
+                editor.onRemoteOp(opBytes)
+            }
+        case .editorPresence(let docId, let userId, let anchor, let selectionAnchor):
+            guard let editor = activeEditor, editor.state.docId == docId else { return }
+            guard let participant = sessionManager.participant(forEditorUserID: userId) else {
+                return
+            }
+            if participant.identity != sessionManager.localIdentity {
+                editor.onRemotePresence(
+                    userId: participant.identity,
+                    anchor: anchor,
+                    selectionAnchor: selectionAnchor,
+                    color: nsColor(for: participant.identity))
+            }
+            if sessionManager.role == .host {
+                sessionManager.sendEditorPresence(
+                    docId: docId,
+                    userId: userId,
+                    anchor: anchor,
+                    selectionAnchor: selectionAnchor)
+            }
+        case .editorSave(let docId):
+            guard sessionManager.role == .host else { return }
+            saveEditor(docId: docId)
+        case .editorSaved(let docId, let rev):
+            guard let editor = activeEditor, editor.state.docId == docId else { return }
+            editorSavedRevisions[docId] = rev
+            editor.markSaved(rev: rev)
+        case .editorClose(let docId):
+            if sessionManager.role == .host {
+                arbitrateCloseEditor(docId: docId)
+            } else {
+                closeEditor(docId: docId, broadcast: false)
             }
         default:
             break
@@ -485,6 +571,11 @@ final class TerminalModel: ObservableObject {
             return
         case .commit(let line):
             syncGridSharedInputOverlay()
+            if sessionManager.role == .host,
+               interceptEditorCommand(line)
+            {
+                return
+            }
             if sessionManager.role == .host, let pty = pty {
                 sharedInputPromptTimer?.invalidate()
                 let payload = Array(line.utf8) + [0x0D]
@@ -672,6 +763,272 @@ final class TerminalModel: ObservableObject {
         sharedInputPromptTimer = nil
         _ = sharedInput.deactivate(bumpRevision: false)
         syncGridSharedInputOverlay()
+    }
+
+    private func interceptEditorCommand(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("/edit ") else { return false }
+
+        let path = String(trimmed.dropFirst(6))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !path.isEmpty else {
+            postTerminalNotice("usage: /edit <path>")
+            return true
+        }
+        guard activeEditor == nil else {
+            postTerminalNotice("an editor is already open")
+            return true
+        }
+        guard let url = resolveEditorURL(sessionPath: path) else {
+            postTerminalNotice("invalid editor path: \(path)")
+            return true
+        }
+
+        let snapshot: Data
+        if FileManager.default.fileExists(atPath: url.path),
+           let data = try? Data(contentsOf: url)
+        {
+            snapshot = data
+        } else {
+            snapshot = Data()
+        }
+
+        sharedInputPromptTimer?.invalidate()
+        if sharedInput.isActive {
+            _ = sharedInput.deactivate(bumpRevision: true)
+            syncGridSharedInputOverlay()
+            if sessionManager.role == .host, sessionManager.state == .running {
+                broadcastSharedInputSnapshot()
+            }
+        }
+
+        let docId = UInt64.random(in: 1...UInt64.max)
+        editorSavedRevisions[docId] = 0
+        openEditor(docId: docId, path: path, snapshot: snapshot)
+        sessionManager.sendEditorOpen(docId: docId, path: path, snapshot: snapshot)
+        return true
+    }
+
+    private func openEditor(docId: UInt64, path: String, snapshot: Data) {
+        let clientId = SessionManager.editorUserID(for: sessionManager.localIdentity)
+        let controller = EditorController(
+            docId: docId,
+            path: path,
+            clientId: clientId,
+            snapshot: snapshot,
+            sendOp: { [weak self] opBytes in
+                self?.sessionManager.sendEditorOp(docId: docId, opBytes: opBytes)
+            },
+            sendPresence: { [weak self] anchor, selectionAnchor in
+                guard let self else { return }
+                self.sessionManager.sendEditorPresence(
+                    docId: docId,
+                    userId: clientId,
+                    anchor: anchor,
+                    selectionAnchor: selectionAnchor)
+            },
+            requestSave: { [weak self] in
+                guard let self else { return }
+                if self.sessionManager.role == .host {
+                    self.saveEditor(docId: docId)
+                } else {
+                    self.sessionManager.sendEditorSave(docId: docId)
+                }
+            },
+            requestClose: { [weak self] in
+                guard let self else { return }
+                if self.sessionManager.role == .host {
+                    self.arbitrateCloseEditor(docId: docId)
+                } else {
+                    self.sessionManager.sendEditorClose(docId: docId)
+                }
+            })
+
+        if let rev = editorSavedRevisions[docId] {
+            controller.markSaved(rev: rev)
+        }
+
+        activeEditor = controller
+        controller.broadcastPresenceNow()
+    }
+
+    private func saveEditor(docId: UInt64) {
+        guard sessionManager.role == .host,
+              let editor = activeEditor,
+              editor.state.docId == docId
+        else {
+            return
+        }
+        guard let url = resolveEditorURL(sessionPath: editor.state.path) else {
+            postTerminalNotice("save failed: invalid path")
+            return
+        }
+
+        do {
+            let parent = url.deletingLastPathComponent()
+            try FileManager.default.createDirectory(
+                at: parent,
+                withIntermediateDirectories: true,
+                attributes: nil)
+            try editor.snapshotData.write(to: url, options: .atomic)
+            let nextRev = (editorSavedRevisions[docId] ?? editor.state.lastSavedRev) &+ 1
+            editorSavedRevisions[docId] = nextRev
+            editor.markSaved(rev: nextRev)
+            sessionManager.sendEditorSaved(docId: docId, rev: nextRev)
+            broadcastFileSyncDeltas()
+        } catch {
+            postTerminalNotice("save failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func arbitrateCloseEditor(docId: UInt64) {
+        guard let editor = activeEditor, editor.state.docId == docId else { return }
+        guard editor.state.dirty else {
+            closeEditor(docId: docId, broadcast: true)
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Close collaborative editor?"
+        alert.informativeText = "\(editor.state.path) has unsaved changes."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Close Without Saving")
+        alert.addButton(withTitle: "Cancel")
+
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            saveEditor(docId: docId)
+            if activeEditor?.state.dirty == false {
+                closeEditor(docId: docId, broadcast: true)
+            }
+        case .alertSecondButtonReturn:
+            closeEditor(docId: docId, broadcast: true)
+        default:
+            break
+        }
+    }
+
+    private func closeEditor(docId: UInt64, broadcast: Bool) {
+        guard activeEditor?.state.docId == docId else { return }
+        if broadcast, sessionManager.role == .host {
+            sessionManager.sendEditorClose(docId: docId)
+        }
+        editorSavedRevisions.removeValue(forKey: docId)
+        activeEditor = nil
+        if sessionManager.role == .host,
+           sessionManager.state == .running,
+           !lastLocalCreatorOnlyMode
+        {
+            activateSharedInputAtCurrentCursor(broadcast: true)
+        }
+    }
+
+    private func syncEditorParticipants() {
+        guard let editor = activeEditor else { return }
+        let live = Set(sessionManager.participants.map(\.identity))
+            .union([sessionManager.localIdentity])
+        for identity in Array(editor.state.remoteCursors.keys) where !live.contains(identity) {
+            editor.removeRemoteUser(identity)
+        }
+    }
+
+    private func resolveEditorURL(sessionPath: String) -> URL? {
+        SessionPathResolver.resolve(rootPath: rootPath, sessionPath: sessionPath)
+    }
+
+    // MARK: file sync
+
+    private func restartFileSyncWatcher() {
+        guard sessionManager.role == .host,
+              let rootPath
+        else {
+            fileSyncWatcher = nil
+            return
+        }
+        fileSyncWatcher = FSSyncWatcher(
+            rootURL: URL(fileURLWithPath: rootPath, isDirectory: true))
+    }
+
+    private func startFileSyncPolling() {
+        stopFileSyncPolling()
+        guard sessionManager.role == .host,
+              sessionManager.state == .running,
+              rootPath != nil
+        else {
+            return
+        }
+
+        if fileSyncWatcher == nil {
+            restartFileSyncWatcher()
+        }
+
+        fileSyncTimer = Timer.scheduledTimer(
+            withTimeInterval: 0.75,
+            repeats: true
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.broadcastFileSyncDeltas()
+            }
+        }
+    }
+
+    private func stopFileSyncPolling() {
+        fileSyncTimer?.invalidate()
+        fileSyncTimer = nil
+        fileSyncWatcher = nil
+    }
+
+    private func sendFullFileSync(toTransportPeerID peerID: UInt32) {
+        guard sessionManager.role == .host,
+              sessionManager.state == .running
+        else {
+            return
+        }
+        if fileSyncWatcher == nil {
+            restartFileSyncWatcher()
+        }
+        guard let watcher = fileSyncWatcher else { return }
+        let update = watcher.fullSync()
+        for delta in update.deltas {
+            sessionManager.sendFileSyncDelta(delta, toTransportPeerID: peerID)
+        }
+        if let snapshot = update.snapshot {
+            sessionManager.sendFileSyncSnapshot(snapshot, toTransportPeerID: peerID)
+        }
+    }
+
+    private func broadcastFileSyncDeltas() {
+        guard sessionManager.role == .host,
+              sessionManager.state == .running
+        else {
+            return
+        }
+        if fileSyncWatcher == nil {
+            restartFileSyncWatcher()
+        }
+        guard let update = fileSyncWatcher?.incrementalSync() else { return }
+        for delta in update.deltas {
+            sessionManager.sendFileSyncDelta(delta)
+        }
+    }
+
+    private func postTerminalNotice(_ message: String) {
+        guard activeEditor == nil else { return }
+        let bytes = Array("\r\n[\(message)]\r\n".utf8)
+        grid?.feed(bytes)
+        if sessionManager.role == .host, sessionManager.state == .running {
+            sessionManager.sendPtyOutput(Data(bytes))
+        }
+    }
+
+    private func nsColor(for identity: UserIdentity) -> NSColor {
+        let packed = color(for: identity)
+        return NSColor(
+            srgbRed: CGFloat((packed >> 16) & 0xFF) / 255.0,
+            green: CGFloat((packed >> 8) & 0xFF) / 255.0,
+            blue: CGFloat(packed & 0xFF) / 255.0,
+            alpha: 1.0)
     }
 
     private func color(for identity: UserIdentity) -> UInt32 {

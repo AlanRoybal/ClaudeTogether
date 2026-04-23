@@ -209,6 +209,23 @@ final class SessionManager: ObservableObject {
         }
     }
 
+    func send(_ frame: Frame, toTransportPeerID peerID: UInt32) {
+        guard let h = handle else { return }
+        let data = FrameCodec.encode(frame)
+        let rc = data.withUnsafeBytes { raw -> Int32 in
+            guard let base = raw.baseAddress else { return -1 }
+            return ct_session_send_to(
+                h,
+                peerID,
+                base.assumingMemoryBound(to: UInt8.self),
+                data.count)
+        }
+        if rc != 0 {
+            NSLog("[ct] send_to failed peer=%u bytes=%d err=%@",
+                  peerID, data.count, Self.readLastError() ?? "<unknown>")
+        }
+    }
+
     func sendHello() {
         broadcast(.hello(
             localIdentity,
@@ -241,6 +258,66 @@ final class SessionManager: ObservableObject {
     func sendInputBytes(_ bytes: Data) {
         guard role == .peer, state == .running, !bytes.isEmpty else { return }
         broadcast(.inputOp(bytes))
+    }
+
+    func sendEditorOpen(docId: UInt64, path: String, snapshot: Data) {
+        guard role == .host, state == .running else { return }
+        broadcast(.editorOpen(docId: docId, path: path, snapshot: snapshot))
+    }
+
+    func sendEditorOp(docId: UInt64, opBytes: Data) {
+        guard state == .running, !opBytes.isEmpty else { return }
+        broadcast(.editorOp(docId: docId, opBytes: opBytes))
+    }
+
+    func sendEditorPresence(docId: UInt64,
+                            userId: UInt32,
+                            anchor: CrdtId?,
+                            selectionAnchor: CrdtId?)
+    {
+        guard state == .running else { return }
+        broadcast(.editorPresence(
+            docId: docId,
+            userId: userId,
+            anchor: anchor,
+            selectionAnchor: selectionAnchor))
+    }
+
+    func sendEditorSave(docId: UInt64) {
+        guard state == .running else { return }
+        broadcast(.editorSave(docId: docId))
+    }
+
+    func sendEditorSaved(docId: UInt64, rev: UInt32) {
+        guard role == .host, state == .running else { return }
+        broadcast(.editorSaved(docId: docId, rev: rev))
+    }
+
+    func sendEditorClose(docId: UInt64) {
+        guard state == .running else { return }
+        broadcast(.editorClose(docId: docId))
+    }
+
+    func sendFileSyncDelta(_ delta: FSSyncDelta, toTransportPeerID peerID: UInt32? = nil) {
+        guard role == .host, state == .running else { return }
+        let frame = Frame.fsDelta(delta)
+        if let peerID {
+            send(frame, toTransportPeerID: peerID)
+        } else {
+            broadcast(frame)
+        }
+    }
+
+    func sendFileSyncSnapshot(_ entries: [FSSnapshotEntry],
+                              toTransportPeerID peerID: UInt32? = nil)
+    {
+        guard role == .host, state == .running else { return }
+        let frame = Frame.fsSnapshot(entries)
+        if let peerID {
+            send(frame, toTransportPeerID: peerID)
+        } else {
+            broadcast(frame)
+        }
     }
 
     func sendHeartbeat() {
@@ -525,6 +602,14 @@ final class SessionManager: ObservableObject {
     nonisolated static func defaultColor(for identity: UserIdentity) -> UInt32 {
         let palette = participantPalette
         return palette[Int(colorHash(for: identity) % UInt32(palette.count))]
+    }
+
+    nonisolated static func editorUserID(for identity: UserIdentity) -> UInt32 {
+        colorHash(for: identity)
+    }
+
+    func participant(forEditorUserID editorUserID: UInt32) -> Participant? {
+        participants.first { Self.editorUserID(for: $0.identity) == editorUserID }
     }
 
     nonisolated private static func colorHash(for identity: UserIdentity) -> UInt32 {
