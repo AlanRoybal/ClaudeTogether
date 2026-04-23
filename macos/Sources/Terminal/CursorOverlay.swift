@@ -5,19 +5,18 @@ import simd
 /// Metal state; this module only decides *what* to draw.
 ///
 /// Rendering model:
-///   - The local block cursor is rendered by swapping the cell's fg/bg in the
-///     text/bg passes (crisp, readable, doesn't occlude the glyph).
-///   - Peer cursors are rendered as a 4-rect colored border around the cell,
-///     so multiple peers on the same cell remain visible without hiding text.
+///   - Every participant gets a colored block rendered in the cursor pass.
+///   - If multiple users land on the same cell, later blocks inset slightly so
+///     they remain distinct instead of collapsing into a single fill.
 ///
 /// All coordinates returned are grid cells; the renderer converts to pixels
 /// via the existing `BgInstance` pipeline.
 struct CursorOverlay {
     /// Blink period in seconds. Only the local block cursor blinks; peer
-    /// borders stay solid so remote activity is always visible.
+    /// blocks stay solid so remote activity is always visible.
     static let blinkPeriod: Double = 1.0
 
-    struct BorderRect {
+    struct BlockRect {
         var col: UInt16
         var row: UInt16
         /// Fractional cell offset and size, in (0..1) cell units. The renderer
@@ -27,14 +26,7 @@ struct CursorOverlay {
         var color: SIMD4<UInt8>
     }
 
-    /// (col, row) of the local cursor, only when it should render as an
-    /// inverted block this frame (i.e. blink-on and visible). `nil` otherwise.
-    let localBlockCell: (UInt16, UInt16)?
-
-    /// One entry per peer cursor. The renderer should emit 4 thin BgInstances
-    /// per border (top/bottom/left/right), or use the fractional coords via
-    /// a future dedicated pipeline.
-    let peerBorders: [BorderRect]
+    let blocks: [BlockRect]
 
     /// Build the overlay for the current frame.
     /// - Parameters:
@@ -47,57 +39,51 @@ struct CursorOverlay {
         blinkStart: Double,
         cursorVisible: Bool
     ) -> CursorOverlay {
-        var local: (UInt16, UInt16)? = nil
-        var peers: [BorderRect] = []
+        struct CellKey: Hashable {
+            var col: UInt16
+            var row: UInt16
+        }
 
         let phase = fmod(time - blinkStart, blinkPeriod)
         let blinkOn = phase < blinkPeriod * 0.5
+        var blocks: [BlockRect] = []
+        var lanes: [CellKey: Int] = [:]
 
         for c in cursors {
-            if c.isLocal {
-                if cursorVisible && blinkOn {
-                    local = (c.col, c.row)
-                }
-            } else {
-                let color = unpackRGBA(c.color)
-                peers.append(contentsOf: borderRects(
-                    col: c.col, row: c.row, color: color))
+            if c.isLocal && (!cursorVisible || !blinkOn) {
+                continue
             }
+            let key = CellKey(col: c.col, row: c.row)
+            let lane = lanes[key, default: 0]
+            lanes[key] = lane + 1
+            blocks.append(blockRect(
+                col: c.col,
+                row: c.row,
+                color: unpackRGBA(c.color),
+                lane: lane))
         }
-        return CursorOverlay(localBlockCell: local, peerBorders: peers)
+        return CursorOverlay(blocks: blocks)
     }
 
-    /// True if the cell at (x,y) is the local block cursor this frame.
-    func isLocalBlockCell(x: Int, y: Int) -> Bool {
-        guard let (cx, cy) = localBlockCell else { return false }
-        return Int(cx) == x && Int(cy) == y
-    }
+    // MARK: - Block geometry
 
-    // MARK: - Border geometry
+    private static let baseAlpha: UInt8 = 200
+    private static let laneInsetStep: Float = 0.12
+    private static let maxInset: Float = 0.30
 
-    /// 2/cell thickness (expressed as a fraction of the cell). The renderer
-    /// scales by cellSize so thickness is in pixels proportional to cell.
-    private static let borderThick: Float = 0.12
-
-    private static func borderRects(
-        col: UInt16, row: UInt16, color: SIMD4<UInt8>
-    ) -> [BorderRect] {
-        let t = borderThick
-        // top, bottom, left, right
-        return [
-            BorderRect(col: col, row: row,
-                originFrac: SIMD2(0, 0),      sizeFrac: SIMD2(1, t),
-                color: color),
-            BorderRect(col: col, row: row,
-                originFrac: SIMD2(0, 1 - t),  sizeFrac: SIMD2(1, t),
-                color: color),
-            BorderRect(col: col, row: row,
-                originFrac: SIMD2(0, t),      sizeFrac: SIMD2(t, 1 - 2 * t),
-                color: color),
-            BorderRect(col: col, row: row,
-                originFrac: SIMD2(1 - t, t),  sizeFrac: SIMD2(t, 1 - 2 * t),
-                color: color),
-        ]
+    private static func blockRect(
+        col: UInt16,
+        row: UInt16,
+        color: SIMD4<UInt8>,
+        lane: Int
+    ) -> BlockRect {
+        let inset = min(Float(lane) * laneInsetStep, maxInset)
+        return BlockRect(
+            col: col,
+            row: row,
+            originFrac: SIMD2<Float>(repeating: inset),
+            sizeFrac: SIMD2<Float>(repeating: max(0.0, 1.0 - inset * 2.0)),
+            color: SIMD4<UInt8>(color.x, color.y, color.z, baseAlpha))
     }
 
     private static func unpackRGBA(_ packed: UInt32) -> SIMD4<UInt8> {

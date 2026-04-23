@@ -74,11 +74,11 @@ final class SessionManager: ObservableObject {
 
     init(identity: UserIdentity = .random(),
          name: String? = nil,
-         color: UInt32 = 0xFFFFFF)
+         color: UInt32? = nil)
     {
         self.localIdentity = identity
         self.localName = name ?? SessionManager.savedOrDefaultName()
-        self.localColor = color
+        self.localColor = color ?? Self.defaultColor(for: identity)
     }
 
     deinit {
@@ -451,5 +451,24 @@ final class SessionManager: ObservableObject {
 
     func persistName() {
         UserDefaults.standard.set(localName, forKey: Self.nameDefaultsKey)
+    }
+
+    nonisolated static func defaultColor(for identity: UserIdentity) -> UInt32 {
+        let palette: [UInt32] = [
+            0xFF6B6B,
+            0xFFD166,
+            0x06D6A0,
+            0x4CC9F0,
+            0xA78BFA,
+            0xF72585,
+            0x90BE6D,
+            0xF9844A,
+        ]
+        var hash: UInt32 = 2166136261
+        for byte in identity.bytes {
+            hash ^= UInt32(byte)
+            hash &*= 16777619
+        }
+        return palette[Int(hash % UInt32(palette.count))]
     }
 }

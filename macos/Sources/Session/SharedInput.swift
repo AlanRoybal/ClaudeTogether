@@ -273,6 +273,14 @@ struct SharedInputState {
         }
     }
 
+    mutating func overrideAnchor(anchorCol: UInt16,
+                                 anchorRow: UInt16)
+    {
+        guard isActive else { return }
+        self.anchorCol = anchorCol
+        self.anchorRow = anchorRow
+    }
+
     func snapshot(participants: [UserIdentity]) -> SharedInputSnapshot {
         let activeCursors: [SharedInputCursorState]
         if isActive {

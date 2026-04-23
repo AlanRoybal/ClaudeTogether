@@ -203,14 +203,14 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                 for x in 0..<cols {
                     let c = snap[y * cols + x]
                     if c.width == 0 { continue } // trailing half of wide glyph
-                    let isCursor = overlay.isLocalBlockCell(x: x, y: y)
                     let fg = unpack(c.fg)
                     let bg = unpack(c.bg)
 
-                    // BG: always render, swap on cursor.
+                    // BG: render the terminal's actual background. Colored
+                    // collaborator blocks are composited in the cursor pass.
                     var bi = BgInstance()
                     bi.gridPos = SIMD2<UInt16>(UInt16(x), UInt16(y))
-                    bi.color = isCursor ? fg : bg
+                    bi.color = bg
                     bgInstances.append(bi)
 
                     // TEXT: skip blanks.
@@ -235,16 +235,16 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                     ti.uvSize = SIMD2<Float>(
                         Float(entry.pixelW) / atlasW,
                         Float(entry.pixelH) / atlasH)
-                    ti.fg = isCursor ? bg : fg
+                    ti.fg = fg
                     textInstances.append(ti)
                 }
             }
         }
 
-        // Peer cursor borders (Phase 3+ populates peers; empty otherwise).
+        // Full colored collaborator blocks.
         var cursorInstances: [CursorInstance] = []
-        cursorInstances.reserveCapacity(overlay.peerBorders.count)
-        for r in overlay.peerBorders {
+        cursorInstances.reserveCapacity(overlay.blocks.count)
+        for r in overlay.blocks {
             var ci = CursorInstance()
             ci.gridPos = SIMD2<UInt16>(r.col, r.row)
             ci.originFrac = r.originFrac
@@ -300,7 +300,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                                instanceCount: textInstances.count)
         }
 
-        // Pass 3: CURSOR (peer borders)
+        // Pass 3: CURSOR (colored participant blocks)
         if !cursorInstances.isEmpty, let cBuf = cursorBuffer {
             enc.setRenderPipelineState(cursorPipeline)
             enc.setVertexBuffer(cBuf, offset: 0, index: 0)

@@ -296,9 +296,13 @@ final class TerminalModel: ObservableObject {
                 pty.send(Array(data))
             }
         case .hello:
-            syncSharedInputParticipants(broadcast: sessionManager.role == .host)
             if sessionManager.role == .host, sessionManager.state == .running {
+                syncSharedInputParticipants(broadcast: false)
                 sessionManager.sendMode(lastLocalCreatorOnlyMode ? .raw : .line)
+                broadcastTerminalSnapshot()
+                broadcastSharedInputSnapshot()
+            } else {
+                syncSharedInputParticipants(broadcast: false)
             }
         case .roster:
             syncSharedInputParticipants(broadcast: false)
@@ -436,7 +440,21 @@ final class TerminalModel: ObservableObject {
             applyAuthoritativeSharedInputRequest(request)
         case .snapshot(let snapshot):
             guard sessionManager.role == .peer else { return }
+            let wasActive = sharedInput.isActive
+            let preservedAnchor = (sharedInput.anchorCol, sharedInput.anchorRow)
+            let localAnchor = grid?.term.cursor()
             sharedInput.apply(snapshot)
+            if snapshot.isActive {
+                if wasActive {
+                    sharedInput.overrideAnchor(
+                        anchorCol: preservedAnchor.0,
+                        anchorRow: preservedAnchor.1)
+                } else if let localAnchor {
+                    sharedInput.overrideAnchor(
+                        anchorCol: localAnchor.x,
+                        anchorRow: localAnchor.y)
+                }
+            }
             syncGridSharedInputOverlay()
         }
     }
@@ -551,6 +569,79 @@ final class TerminalModel: ObservableObject {
             SharedInputCodec.encode(.snapshot(snapshot))))
     }
 
+    private func broadcastTerminalSnapshot() {
+        guard sessionManager.role == .host,
+              sessionManager.state == .running,
+              let grid
+        else {
+            return
+        }
+
+        let bytes = encodeTerminalSnapshot(from: grid)
+        guard !bytes.isEmpty else { return }
+        sessionManager.sendPtyOutput(Data(bytes))
+    }
+
+    private func encodeTerminalSnapshot(from grid: GridModel) -> [UInt8] {
+        let snapshot = grid.snapshot()
+        let cols = Int(grid.cols)
+        let rows = Int(grid.rows)
+        guard cols > 0, rows > 0, snapshot.count >= cols * rows else {
+            return []
+        }
+
+        var out = ""
+        // Repaint the host's visible screen so a newly joined peer inherits
+        // the current prompt and command line before new output arrives.
+        out += "\u{1B}[?25l"
+        out += "\u{1B}[0m"
+        out += "\u{1B}[2J"
+
+        var lastStyle = SnapshotStyle.default
+        for row in 0..<rows {
+            var rendered = ""
+            var visibleLine = ""
+            var pendingStyle = lastStyle
+
+            for col in 0..<cols {
+                let cell = snapshot[row * cols + col]
+                if cell.width == 0 { continue }
+
+                let ch = scalarString(from: cell.codepoint)
+                let style = SnapshotStyle(cell: cell)
+
+                if style != pendingStyle {
+                    rendered += style.sgrTransition(from: pendingStyle)
+                    pendingStyle = style
+                }
+                rendered += ch
+                if ch != " " || style != .default {
+                    visibleLine = rendered
+                }
+            }
+
+            guard !visibleLine.isEmpty else { continue }
+            out += "\u{1B}[\(row + 1);1H"
+            out += visibleLine
+            lastStyle = pendingStyle
+        }
+
+        let cursor = grid.term.cursor()
+        out += "\u{1B}[0m"
+        out += "\u{1B}[\(Int(cursor.y) + 1);\(Int(cursor.x) + 1)H"
+        out += "\u{1B}[?25h"
+        return Array(out.utf8)
+    }
+
+    private func scalarString(from codepoint: UInt32) -> String {
+        guard codepoint != 0,
+              let scalar = UnicodeScalar(codepoint)
+        else {
+            return " "
+        }
+        return String(scalar)
+    }
+
     private func syncGridSharedInputOverlay() {
         guard let grid else { return }
         guard sharedInput.isActive else {
@@ -588,5 +679,39 @@ final class TerminalModel: ObservableObject {
             ?? (identity == sessionManager.localIdentity
                 ? sessionManager.localColor
                 : 0x5AC8FA)
+    }
+}
+
+private struct SnapshotStyle: Equatable {
+    static let `default` = SnapshotStyle(fg: 0xCCCCCC,
+                                         bg: 0x000000,
+                                         attrs: 0)
+
+    var fg: UInt32
+    var bg: UInt32
+    var attrs: UInt16
+
+    init(fg: UInt32, bg: UInt32, attrs: UInt16) {
+        self.fg = fg
+        self.bg = bg
+        self.attrs = attrs
+    }
+
+    init(cell: ct_cell) {
+        self.init(fg: cell.fg, bg: cell.bg, attrs: cell.attrs)
+    }
+
+    func sgrTransition(from previous: SnapshotStyle) -> String {
+        if self == previous { return "" }
+
+        var parts = ["0"]
+        if attrs & 0x01 != 0 { parts.append("1") }
+        if attrs & 0x02 != 0 { parts.append("3") }
+        if attrs & 0x04 != 0 { parts.append("4") }
+        if attrs & 0x08 != 0 { parts.append("7") }
+        if attrs & 0x10 != 0 { parts.append("2") }
+        parts.append("38;2;\((fg >> 16) & 0xFF);\((fg >> 8) & 0xFF);\(fg & 0xFF)")
+        parts.append("48;2;\((bg >> 16) & 0xFF);\((bg >> 8) & 0xFF);\(bg & 0xFF)")
+        return "\u{1B}[\(parts.joined(separator: ";"))m"
     }
 }
