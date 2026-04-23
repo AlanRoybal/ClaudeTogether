@@ -11,7 +11,7 @@ import Carbon.HIToolbox
 final class MetalTerminalNSView: NSView {
     let mtkView: MTKView
     let renderer: TerminalRenderer
-    let grid: GridModel
+    private(set) var grid: GridModel
     private let onKey: ([UInt8]) -> Void
     private let onResize: (UInt16, UInt16) -> Void
     /// When true, keystrokes are dropped (peer in raw mode: creator-only input).
@@ -49,6 +49,17 @@ final class MetalTerminalNSView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError("not used") }
+
+    func updateGrid(_ grid: GridModel) {
+        guard self.grid !== grid else { return }
+        self.grid = grid
+        renderer.grid = grid
+
+        // A reused NSView does not get a fresh resize callback when the model
+        // swaps grids, so bring the new grid up to the renderer's live size
+        // immediately.
+        grid.resize(cols: renderer.cols, rows: renderer.rows)
+    }
 
     override var acceptsFirstResponder: Bool { true }
 
@@ -166,6 +177,7 @@ struct MetalTerminalView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: MetalTerminalNSView, context: Context) {
+        nsView.updateGrid(grid)
         nsView.inputEnabled = inputEnabled
     }
 }
