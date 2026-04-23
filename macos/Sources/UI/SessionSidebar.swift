@@ -90,6 +90,9 @@ struct SessionSidebar: View {
                                 participants: model.sessionManager.participants,
                                 localIdentity: model.sessionManager.localIdentity)
                         }
+
+                        fsSyncRow
+
                         Button("Leave") { model.stopSharing() }
                             .controlSize(.small)
                     case .disconnected:
@@ -110,6 +113,30 @@ struct SessionSidebar: View {
             }
 
             Divider()
+
+            if !model.externalEditPaths.isEmpty {
+                GroupBox("External edits detected") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Files below were modified locally between host updates. The host's version overwrote your changes.")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                        ForEach(model.externalEditPaths.prefix(5), id: \.self) { path in
+                            Text(path)
+                                .font(.system(.caption2, design: .monospaced))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                        if model.externalEditPaths.count > 5 {
+                            Text("+\(model.externalEditPaths.count - 5) more")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Button("Dismiss") { model.dismissExternalEditWarnings() }
+                            .controlSize(.mini)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
 
             GroupBox("Diagnostics") {
                 VStack(alignment: .leading, spacing: 4) {
@@ -136,5 +163,49 @@ struct SessionSidebar: View {
             Spacer()
         }
         .padding(12)
+    }
+
+    /// FS-sync readout that differs by role:
+    ///   host — "Syncing <path> (N files)"
+    ///   peer — "Receiving into <path>" + applied-count + external edits
+    @ViewBuilder
+    private var fsSyncRow: some View {
+        Divider()
+        if model.sessionManager.role == .host {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("File sync")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                if let path = model.rootPath {
+                    Text("Sharing \(path)")
+                        .font(.system(.caption2, design: .monospaced))
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                } else {
+                    Text("No folder")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("File sync")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                if let root = model.syncRoot {
+                    Text("Receiving into \(root.path)")
+                        .font(.system(.caption2, design: .monospaced))
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                    Text("\(model.syncAppliedCount) applied")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("No local sync folder")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
     }
 }

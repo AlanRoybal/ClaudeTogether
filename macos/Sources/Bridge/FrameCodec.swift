@@ -54,6 +54,21 @@ struct RosterEntry: Equatable, Hashable {
     var name: String
 }
 
+struct FsDelta: Equatable {
+    enum Op: UInt8 {
+        case upsert = 0
+        case delete = 1
+    }
+
+    var op: Op
+    /// Forward-slash relative path from the host's session root.
+    var path: String
+    /// Nanoseconds since Unix epoch; ignored for deletes.
+    var mtimeNs: Int64
+    /// Empty for deletes.
+    var content: Data
+}
+
 enum Frame {
     case ptyOutput(Data)
     case inputOp(Data)
@@ -62,6 +77,7 @@ enum Frame {
     case hello(UserIdentity, role: SessionRole, color: UInt32, name: String)
     case modeChange(TermMode)
     case roster([RosterEntry])
+    case fsDelta(FsDelta)
     case heartbeat
 }
 
@@ -116,6 +132,15 @@ enum FrameCodec {
                 appendU16(&out, UInt16(min(utf8.count, Int(UInt16.max))))
                 out.append(contentsOf: utf8.prefix(Int(UInt16.max)))
             }
+        case .fsDelta(let delta):
+            out.append(FrameTag.fsDelta.rawValue)
+            out.append(delta.op.rawValue)
+            let pathBytes = Array(delta.path.utf8)
+            appendU16(&out, UInt16(min(pathBytes.count, Int(UInt16.max))))
+            out.append(contentsOf: pathBytes.prefix(Int(UInt16.max)))
+            appendI64(&out, delta.mtimeNs)
+            appendU32(&out, UInt32(delta.content.count))
+            out.append(delta.content)
         case .heartbeat:
             out.append(FrameTag.heartbeat.rawValue)
         }
@@ -182,9 +207,25 @@ enum FrameCodec {
                     identity: id, role: role, color: color, name: name))
             }
             return .roster(entries)
+        case .fsDelta:
+            let opByte = try r.readU8()
+            guard let op = FsDelta.Op(rawValue: opByte) else {
+                throw FrameCodecError.invalidEnum
+            }
+            let pathLen = try r.readU16()
+            let pathBytes = try r.readBytes(Int(pathLen))
+            let path = String(data: pathBytes, encoding: .utf8) ?? ""
+            let mtime = try r.readI64()
+            let contentLen = try r.readU32()
+            let content = try r.readBytes(Int(contentLen))
+            return .fsDelta(FsDelta(
+                op: op,
+                path: path,
+                mtimeNs: mtime,
+                content: content))
         case .heartbeat:
             return .heartbeat
-        case .fsDelta, .fsSnapshot:
+        case .fsSnapshot:
             throw FrameCodecError.unsupportedTag
         }
     }
@@ -201,6 +242,18 @@ enum FrameCodec {
         d.append(UInt8((v >> 16) & 0xFF))
         d.append(UInt8((v >>  8) & 0xFF))
         d.append(UInt8( v        & 0xFF))
+    }
+
+    private static func appendI64(_ d: inout Data, _ v: Int64) {
+        let u = UInt64(bitPattern: v)
+        d.append(UInt8((u >> 56) & 0xFF))
+        d.append(UInt8((u >> 48) & 0xFF))
+        d.append(UInt8((u >> 40) & 0xFF))
+        d.append(UInt8((u >> 32) & 0xFF))
+        d.append(UInt8((u >> 24) & 0xFF))
+        d.append(UInt8((u >> 16) & 0xFF))
+        d.append(UInt8((u >>  8) & 0xFF))
+        d.append(UInt8( u        & 0xFF))
     }
 }
 
@@ -233,6 +286,24 @@ private struct Reader {
              UInt32(data[base + 3])
         pos += 4
         return v
+    }
+
+    mutating func readI64() throws -> Int64 {
+        guard pos + 8 <= data.count else { throw FrameCodecError.truncated }
+        let base = data.startIndex + pos
+        // Split up per-byte so the type-checker doesn't choke on the
+        // 8-term OR expression.
+        var u: UInt64 = 0
+        u |= UInt64(data[base])     << 56
+        u |= UInt64(data[base + 1]) << 48
+        u |= UInt64(data[base + 2]) << 40
+        u |= UInt64(data[base + 3]) << 32
+        u |= UInt64(data[base + 4]) << 24
+        u |= UInt64(data[base + 5]) << 16
+        u |= UInt64(data[base + 6]) <<  8
+        u |= UInt64(data[base + 7])
+        pos += 8
+        return Int64(bitPattern: u)
     }
 
     mutating func readBytes(_ n: Int) throws -> Data {

@@ -87,6 +87,13 @@ uint32_t    ct_session_peer_count(ct_session *s);
 /* Broadcast `len` bytes to all connected peers. Returns 0 on success. */
 int ct_session_broadcast(ct_session *s, const uint8_t *bytes, size_t len);
 
+/* Send `len` bytes to exactly one peer by its transport id. Returns 0 on
+ * success, -1 if the peer id is unknown or the write failed — inspect
+ * ct_last_error() for a human-readable reason. */
+int ct_session_send_to(ct_session *s,
+                       uint32_t peer_id,
+                       const uint8_t *bytes, size_t len);
+
 /* Pop the next inbound frame. Writes up to `cap` bytes into `out` and the
  * sending peer id into `*out_peer_id`. Returns the full frame length (which
  * may exceed `cap` — caller should grow its buffer and retry). Returns 0
