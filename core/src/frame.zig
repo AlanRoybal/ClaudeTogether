@@ -3,8 +3,10 @@
 //! All frames share header: `tag:u8 | payload`. Decoding returns a tagged
 //! union; encoding writes into a caller-provided buffer or allocates.
 //!
-//! Only Phase 3 frames are implemented here. FsDelta/FsSnapshot (0x04/0x05)
-//! land with Phase 4.
+//! Phase 3 frames + Phase 4 FsDelta are implemented. FsSnapshot (0x05) is
+//! currently unused — peers receive their initial state as a sequence of
+//! FsDelta frames instead of a single batched snapshot, which keeps the
+//! transport layer's per-frame size cap (16 MB) comfortable for large trees.
 
 const std = @import("std");
 
@@ -68,11 +70,29 @@ pub const ModeChange = struct {
     mode: Mode,
 };
 
+pub const FsDeltaOp = enum(u8) {
+    /// Create or overwrite a file at `path` with `content`.
+    upsert = 0,
+    /// Remove the file at `path`. `content` is empty, `mtime_ns` is ignored.
+    delete = 1,
+};
+
+/// One-way filesystem change from host to peers (Phase 4). Paths are
+/// forward-slash-separated, UTF-8, and relative to the session root.
+/// `mtime_ns` is nanoseconds since Unix epoch (signed — pre-1970 permitted
+/// but uncommon in practice).
+pub const FsDelta = struct {
+    op: FsDeltaOp,
+    path: []const u8,
+    mtime_ns: i64,
+    content: []const u8,
+};
+
 pub const Frame = union(Tag) {
     pty_output: PtyOutput,
     input_op: InputOp,
     input_commit: InputCommit,
-    fs_delta: void,
+    fs_delta: FsDelta,
     fs_snapshot: void,
     cursor_pos: CursorPos,
     hello: Hello,
@@ -122,6 +142,13 @@ const Reader = struct {
         if (self.remaining() < 4) return error.Truncated;
         const v = std.mem.readInt(u32, self.buf[self.pos..][0..4], .big);
         self.pos += 4;
+        return v;
+    }
+
+    fn readI64(self: *Reader) !i64 {
+        if (self.remaining() < 8) return error.Truncated;
+        const v = std.mem.readInt(i64, self.buf[self.pos..][0..8], .big);
+        self.pos += 8;
         return v;
     }
 
@@ -190,8 +217,24 @@ pub fn decode(bytes: []const u8) DecodeError!Frame {
                 return error.InvalidEnum;
             break :blk Frame{ .mode_change = .{ .mode = mode } };
         },
+        .fs_delta => blk: {
+            const op_b = try r.readU8();
+            const op = std.meta.intToEnum(FsDeltaOp, op_b) catch
+                return error.InvalidEnum;
+            const path_len = try r.readU16();
+            const path = try r.readBytes(path_len);
+            const mtime_ns = try r.readI64();
+            const content_len = try r.readU32();
+            const content = try r.readBytes(content_len);
+            break :blk Frame{ .fs_delta = .{
+                .op = op,
+                .path = path,
+                .mtime_ns = mtime_ns,
+                .content = content,
+            } };
+        },
         .heartbeat => Frame{ .heartbeat = {} },
-        .fs_delta, .fs_snapshot, .roster => error.NotImplemented,
+        .fs_snapshot, .roster => error.NotImplemented,
     };
 }
 
@@ -221,6 +264,12 @@ const Writer = struct {
         if (self.remaining() < 4) return error.BufferTooSmall;
         std.mem.writeInt(u32, self.buf[self.pos..][0..4], v, .big);
         self.pos += 4;
+    }
+
+    fn writeI64(self: *Writer, v: i64) !void {
+        if (self.remaining() < 8) return error.BufferTooSmall;
+        std.mem.writeInt(i64, self.buf[self.pos..][0..8], v, .big);
+        self.pos += 8;
     }
 
     fn writeBytes(self: *Writer, s: []const u8) !void {
@@ -257,8 +306,16 @@ pub fn encode(frame: Frame, out: []u8) EncodeError!usize {
             try w.writeBytes(p.name);
         },
         .mode_change => |p| try w.writeU8(@intFromEnum(p.mode)),
+        .fs_delta => |p| {
+            try w.writeU8(@intFromEnum(p.op));
+            try w.writeU16(@intCast(p.path.len));
+            try w.writeBytes(p.path);
+            try w.writeI64(p.mtime_ns);
+            try w.writeU32(@intCast(p.content.len));
+            try w.writeBytes(p.content);
+        },
         .heartbeat => {},
-        .fs_delta, .fs_snapshot, .roster => return error.BufferTooSmall, // NYI
+        .fs_snapshot, .roster => return error.BufferTooSmall, // NYI
     }
     return w.pos;
 }
@@ -272,8 +329,9 @@ pub fn encodedLen(frame: Frame) usize {
         .cursor_pos => 1 + 16 + 2 + 2,
         .hello => |p| 1 + 16 + 1 + 4 + 2 + p.name.len,
         .mode_change => 1 + 1,
+        .fs_delta => |p| 1 + 1 + 2 + p.path.len + 8 + 4 + p.content.len,
         .heartbeat => 1,
-        .fs_delta, .fs_snapshot, .roster => 1,
+        .fs_snapshot, .roster => 1,
     };
 }
 
@@ -350,6 +408,46 @@ test "input_op roundtrip" {
     const n = try encode(Frame{ .input_op = .{ .op = &op } }, &buf);
     const decoded = try decode(buf[0..n]);
     try std.testing.expectEqualSlices(u8, &op, decoded.input_op.op);
+}
+
+test "fs_delta upsert roundtrip" {
+    const content = "fn main() void {}\n";
+    const frame = Frame{ .fs_delta = .{
+        .op = .upsert,
+        .path = "src/main.zig",
+        .mtime_ns = 1_714_000_000_123_456_789,
+        .content = content,
+    } };
+    var buf: [128]u8 = undefined;
+    const n = try encode(frame, &buf);
+    const decoded = try decode(buf[0..n]);
+    try std.testing.expectEqual(FsDeltaOp.upsert, decoded.fs_delta.op);
+    try std.testing.expectEqualStrings("src/main.zig", decoded.fs_delta.path);
+    try std.testing.expectEqual(
+        @as(i64, 1_714_000_000_123_456_789),
+        decoded.fs_delta.mtime_ns);
+    try std.testing.expectEqualStrings(content, decoded.fs_delta.content);
+}
+
+test "fs_delta delete roundtrip" {
+    const frame = Frame{ .fs_delta = .{
+        .op = .delete,
+        .path = "old/gone.txt",
+        .mtime_ns = 0,
+        .content = "",
+    } };
+    var buf: [64]u8 = undefined;
+    const n = try encode(frame, &buf);
+    const decoded = try decode(buf[0..n]);
+    try std.testing.expectEqual(FsDeltaOp.delete, decoded.fs_delta.op);
+    try std.testing.expectEqualStrings("old/gone.txt", decoded.fs_delta.path);
+    try std.testing.expectEqual(@as(usize, 0), decoded.fs_delta.content.len);
+}
+
+test "fs_delta rejects unknown op byte" {
+    // tag=0x04, op=0x7F (invalid), path_len=0, mtime=0, content_len=0
+    const bad = [_]u8{ 0x04, 0x7F, 0, 0 } ++ [_]u8{0} ** 8 ++ [_]u8{ 0, 0, 0, 0 };
+    try std.testing.expectError(error.InvalidEnum, decode(&bad));
 }
 
 test "truncated input errors" {

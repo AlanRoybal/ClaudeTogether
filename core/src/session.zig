@@ -160,6 +160,40 @@ pub const Session = struct {
         }
     }
 
+    pub const SendError = error{
+        PeerNotFound,
+        PeerGone,
+        FrameTooLarge,
+        WriteFailed,
+    };
+
+    /// Send `payload` to exactly one peer by transport id. Returns an error
+    /// instead of silently dropping so callers (e.g. FS snapshot delivery)
+    /// can decide whether to retry.
+    pub fn sendTo(self: *Session, peer_id: u32, payload: []const u8) SendError!void {
+        self.mutex.lock();
+        var target: ?*Peer = null;
+        for (self.peers.items) |p| {
+            if (p.id == peer_id) {
+                target = p;
+                break;
+            }
+        }
+        self.mutex.unlock();
+
+        const p = target orelse return error.PeerNotFound;
+        p.write_mutex.lock();
+        defer p.write_mutex.unlock();
+        if (p.dead) return error.PeerGone;
+        p.conn.sendFrame(payload) catch |err| {
+            self.markDead(p, err);
+            return switch (err) {
+                error.FrameTooLarge => error.FrameTooLarge,
+                else => error.WriteFailed,
+            };
+        };
+    }
+
     /// Pop the next inbound frame. Caller must `freeFrame` the payload.
     /// Returns null if none pending.
     pub fn pollFrame(self: *Session) ?InboundFrame {
@@ -305,6 +339,56 @@ pub const Session = struct {
 // --- tests ----------------------------------------------------------------
 
 const testing = std.testing;
+
+test "sendTo delivers to a single peer by id" {
+    var host = try Session.initHost(testing.allocator, 0);
+    defer host.deinit();
+
+    const port = host.boundPort();
+    var peer_a = try Session.initPeer(testing.allocator, "127.0.0.1", port);
+    defer peer_a.deinit();
+    var peer_b = try Session.initPeer(testing.allocator, "127.0.0.1", port);
+    defer peer_b.deinit();
+
+    // Wait until both peers show up on the host.
+    var waited: usize = 0;
+    while (host.peerCount() < 2 and waited < 400) : (waited += 1) {
+        std.time.sleep(5 * std.time.ns_per_ms);
+    }
+    try testing.expect(host.peerCount() == 2);
+
+    // Peer ids are assigned in accept order starting at 1.
+    try host.sendTo(1, "only-to-one");
+
+    var got_a: bool = false;
+    var got_b: bool = false;
+    var attempts: usize = 0;
+    while (attempts < 200 and !got_a) : (attempts += 1) {
+        if (peer_a.pollFrame()) |f| {
+            defer peer_a.freeFrame(f);
+            try testing.expectEqualStrings("only-to-one", f.payload);
+            got_a = true;
+            break;
+        }
+        std.time.sleep(5 * std.time.ns_per_ms);
+    }
+    try testing.expect(got_a);
+
+    // Peer B must NOT have received the targeted frame. Drain for a bit and
+    // confirm the queue stays empty.
+    attempts = 0;
+    while (attempts < 20) : (attempts += 1) {
+        if (peer_b.pollFrame()) |f| {
+            defer peer_b.freeFrame(f);
+            got_b = true;
+            break;
+        }
+        std.time.sleep(5 * std.time.ns_per_ms);
+    }
+    try testing.expect(!got_b);
+
+    try testing.expectError(error.PeerNotFound, host.sendTo(999, "nobody"));
+}
 
 test "host + peer exchange frames" {
     var host = try Session.initHost(testing.allocator, 0);

@@ -49,6 +49,7 @@ test {
     _ = @import("bore.zig");
     _ = @import("transport.zig");
     _ = @import("session.zig");
+    _ = @import("fs_sync.zig");
 }
 
 export fn ct_hello(buf: [*]u8, len: usize) c_int {
@@ -158,6 +159,23 @@ export fn ct_session_broadcast(
 ) c_int {
     const s: *session_mod.Session = @ptrCast(@alignCast(handle orelse return -1));
     s.broadcast(bytes[0..len]) catch return -1;
+    return 0;
+}
+
+/// Send `len` bytes to exactly one peer. Returns 0 on success, -1 if the
+/// peer id is unknown or the write failed (inspect `ct_last_error` for
+/// a human-readable reason).
+export fn ct_session_send_to(
+    handle: ?*anyopaque,
+    peer_id: u32,
+    bytes: [*]const u8,
+    len: usize,
+) c_int {
+    const s: *session_mod.Session = @ptrCast(@alignCast(handle orelse return -1));
+    s.sendTo(peer_id, bytes[0..len]) catch |err| {
+        setLastError("send_to peer {d} failed: {s}", .{ peer_id, @errorName(err) });
+        return -1;
+    };
     return 0;
 }
 

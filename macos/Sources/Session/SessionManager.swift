@@ -209,6 +209,29 @@ final class SessionManager: ObservableObject {
         }
     }
 
+    /// Send a frame to exactly one transport peer. Used for snapshots
+    /// (terminal + filesystem) on peer join where re-broadcasting the entire
+    /// state to existing peers would be wasteful.
+    @discardableResult
+    func sendToPeer(_ peerID: UInt32, frame: Frame) -> Bool {
+        guard let h = handle else { return false }
+        let data = FrameCodec.encode(frame)
+        let rc = data.withUnsafeBytes { raw -> Int32 in
+            guard let base = raw.baseAddress else { return -1 }
+            return ct_session_send_to(
+                h,
+                peerID,
+                base.assumingMemoryBound(to: UInt8.self),
+                data.count)
+        }
+        if rc != 0 {
+            let detail = Self.readLastError() ?? "rc=\(rc)"
+            NSLog("[ct] sendToPeer(%u) failed: %@", peerID, detail)
+            return false
+        }
+        return true
+    }
+
     func sendHello() {
         broadcast(.hello(
             localIdentity,

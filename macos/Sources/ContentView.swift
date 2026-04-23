@@ -69,6 +69,19 @@ final class TerminalModel: ObservableObject {
     private var sharedInput = SharedInputState()
     private var sharedInputPromptTimer: Timer?
 
+    // MARK: FS sync (Phase 4)
+
+    /// Peer-side only: local directory where host's files land.
+    @Published var syncRoot: URL?
+    /// Peer-side only: count of deltas applied since session start (for UI).
+    @Published var syncAppliedCount: Int = 0
+    /// Peer-side only: relative paths where we detected an external edit
+    /// between our writes. Surfaced as a sidebar warning.
+    @Published var externalEditPaths: [String] = []
+
+    private var fsWatcher: FSSyncWatcher?
+    private var fsApplier: FSSyncApplier?
+
     init() {
         coreVersion = ct_version()
         boreBundlePath = Self.findBoreBinaryPath()
@@ -85,8 +98,8 @@ final class TerminalModel: ObservableObject {
         }.store(in: &cancellables)
 
         // Route inbound frames.
-        sessionManager.onFrame = { [weak self] frame, _peerID in
-            self?.handleInbound(frame)
+        sessionManager.onFrame = { [weak self] frame, peerID in
+            self?.handleInbound(frame, from: peerID)
         }
 
         // DIAG: auto-share on launch when CT_AUTOSHARE=1 so we can test
@@ -189,6 +202,7 @@ final class TerminalModel: ObservableObject {
         if let borePath = boreBundlePath {
             sessionManager.startBoreTunnel(borePath: borePath)
         }
+        startFSWatcher()
         // Immediately publish our current mode so fresh joiners aren't stuck
         // on the default (.line) assumption.
         probeLocalMode(force: true)
@@ -200,6 +214,66 @@ final class TerminalModel: ObservableObject {
     func stopSharing() {
         sessionManager.stop()
         resetSharedInputState()
+        stopFSWatcher()
+        teardownFSApplier()
+    }
+
+    // MARK: FS sync wiring
+
+    private func startFSWatcher() {
+        guard let rootPath, fsWatcher == nil else { return }
+        let watcher = FSSyncWatcher(root: URL(fileURLWithPath: rootPath))
+        watcher.onDelta = { [weak self] delta in
+            guard let self = self,
+                  self.sessionManager.role == .host,
+                  self.sessionManager.state == .running
+            else { return }
+            self.sessionManager.broadcast(.fsDelta(delta))
+        }
+        watcher.start()
+        fsWatcher = watcher
+    }
+
+    private func stopFSWatcher() {
+        fsWatcher?.stop()
+        fsWatcher = nil
+    }
+
+    private func setupFSApplier(at root: URL) {
+        let applier = FSSyncApplier(root: root)
+        applier.onApply = { [weak self] in
+            self?.syncAppliedCount += 1
+        }
+        applier.onExternalEdit = { [weak self] path in
+            guard let self = self else { return }
+            if !self.externalEditPaths.contains(path) {
+                self.externalEditPaths.append(path)
+            }
+        }
+        fsApplier = applier
+        syncRoot = root
+        syncAppliedCount = 0
+        externalEditPaths = []
+    }
+
+    private func teardownFSApplier() {
+        fsApplier = nil
+        syncRoot = nil
+        syncAppliedCount = 0
+        externalEditPaths = []
+    }
+
+    /// Host: on peer Hello, ship the FS snapshot just to that peer. Existing
+    /// peers already have the files.
+    private func sendFSSnapshot(toPeer peerID: UInt32) {
+        guard let watcher = fsWatcher else { return }
+        watcher.enumerateSnapshot { delta in
+            _ = sessionManager.sendToPeer(peerID, frame: .fsDelta(delta))
+        }
+    }
+
+    func dismissExternalEditWarnings() {
+        externalEditPaths.removeAll()
     }
 
     func promptJoin() {
@@ -223,6 +297,17 @@ final class TerminalModel: ObservableObject {
             return
         }
         let host = String(raw[..<colon])
+
+        // Peers pick a local folder to receive host's files into. This
+        // directory is owned by us — host writes land here; user edits
+        // between deltas trigger an external-edit warning.
+        guard let folderStr = FolderPicker.pick(
+            prompt: "Choose a local folder to receive files from this session")
+        else {
+            return
+        }
+        let syncRootURL = URL(fileURLWithPath: folderStr)
+
         // Tear down any existing session (local PTY or stale peer) before
         // joining — peers have no PTY.
         endSession()
@@ -234,7 +319,9 @@ final class TerminalModel: ObservableObject {
             return
         }
         grid = g
+        rootPath = folderStr
         resetSharedInputState()
+        setupFSApplier(at: syncRootURL)
         sessionManager.joinPeer(host: host, port: port)
     }
 
@@ -270,7 +357,7 @@ final class TerminalModel: ObservableObject {
 
     // MARK: inbound frames
 
-    private func handleInbound(_ frame: Frame) {
+    private func handleInbound(_ frame: Frame, from peerID: UInt32) {
         switch frame {
         case .ptyOutput(let data):
             NSLog("[ct] inbound ptyOutput bytes=%d role=%@ grid=%@",
@@ -301,6 +388,7 @@ final class TerminalModel: ObservableObject {
                 sessionManager.sendMode(lastLocalCreatorOnlyMode ? .raw : .line)
                 broadcastTerminalSnapshot()
                 broadcastSharedInputSnapshot()
+                sendFSSnapshot(toPeer: peerID)
             } else {
                 syncSharedInputParticipants(broadcast: false)
             }
@@ -312,6 +400,11 @@ final class TerminalModel: ObservableObject {
                 _ = sharedInput.deactivate(bumpRevision: false)
                 syncGridSharedInputOverlay()
             }
+        case .fsDelta(let delta):
+            // One-way host → peer. Hosts originate these, so ignoring
+            // inbound deltas on the host side is belt-and-suspenders.
+            guard sessionManager.role == .peer else { return }
+            fsApplier?.apply(delta)
         default:
             break
         }
