@@ -98,6 +98,13 @@ export fn ct_term_cursor(t: ?*Term, out_x: *u16, out_y: *u16) void {
     }
 }
 
+/// Returns 1 while the terminal is rendering its alternate screen buffer
+/// (typical full-screen TUIs like vim/less), 0 otherwise.
+export fn ct_term_is_using_alt(t: ?*Term) c_int {
+    if (t) |p| return if (p.grid.using_alt) 1 else 0;
+    return 0;
+}
+
 /// Monotonically increasing counter bumped on any grid mutation.
 /// Swift should redraw when this changes.
 export fn ct_term_dirty_epoch(t: ?*Term) u32 {

@@ -4,6 +4,9 @@ struct SessionSidebar: View {
     @ObservedObject var model: TerminalModel
 
     var body: some View {
+        let _ = NSLog("[ct] sidebar render url=%@ state=%@",
+                      model.sessionManager.publicURL ?? "<nil>",
+                      "\(model.sessionManager.state)")
         VStack(alignment: .leading, spacing: 12) {
             Text("Session")
                 .font(.headline)
@@ -22,7 +25,7 @@ struct SessionSidebar: View {
                 }
             }
 
-            if model.session != nil {
+            if model.pty != nil {
                 Button("End session") { model.endSession() }
             } else {
                 Button("Start session…") { model.startSession() }
@@ -68,9 +71,16 @@ struct SessionSidebar: View {
                                 .controlSize(.mini)
                             }
                         } else if model.sessionManager.role == .host {
-                            Text("Waiting for bore URL…")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            if let err = model.sessionManager.lastError {
+                                Text(err)
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                                    .textSelection(.enabled)
+                            } else {
+                                Text("Waiting for bore URL…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                         if !model.sessionManager.participants.isEmpty {
                             Text("In session:")

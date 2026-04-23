@@ -225,6 +225,21 @@ export fn ct_bore_pump(
     return @intCast(url.len);
 }
 
+/// Copy the bore stdout/stderr scratch buffer for diagnostics. Returns the
+/// total buffered length (may exceed `cap`).
+export fn ct_bore_debug(
+    handle: ?*anyopaque,
+    out: [*]u8,
+    cap: usize,
+) isize {
+    const sup: *bore_mod.Supervisor =
+        @ptrCast(@alignCast(handle orelse return -1));
+    const buf = sup.debugBuffer();
+    const n = @min(buf.len, cap);
+    if (n > 0) @memcpy(out[0..n], buf[0..n]);
+    return @intCast(buf.len);
+}
+
 export fn ct_bore_stop(handle: ?*anyopaque) void {
     const sup: *bore_mod.Supervisor =
         @ptrCast(@alignCast(handle orelse return));

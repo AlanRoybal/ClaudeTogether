@@ -46,13 +46,14 @@ targets:
       - package: SwiftTerm
         product: SwiftTerm
     postBuildScripts:
-      - name: Bundle bore binary into Resources
-        # xcodegen `resources:` won't route a no-extension Mach-O into
-        # PBXResourcesBuildPhase, so copy it manually into the .app bundle.
+      - name: Bundle bore helper
+        # Bundle bore as nested code under Contents/Helpers. Launching a Mach-O
+        # from Contents/Resources gets rejected by taskgated as invalid nested
+        # code even when the outer app is signed.
         script: |
           set -euo pipefail
           SRC="$SRCROOT/Resources/bore"
-          DST="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/bore"
+          DST="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Helpers/bore"
           if [[ ! -f "$SRC" ]]; then
             echo "error: bore binary missing at $SRC — run scripts/build-bore.sh first" >&2
             exit 1
@@ -60,5 +61,7 @@ targets:
           mkdir -p "$(dirname "$DST")"
           cp -f "$SRC" "$DST"
           chmod +x "$DST"
-          echo "bundled bore -> $DST"
+          codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" "$DST"
+          rm -f "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/bore"
+          echo "bundled bore helper -> $DST"
         shell: /bin/bash

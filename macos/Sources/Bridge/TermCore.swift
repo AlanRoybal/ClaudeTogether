@@ -63,6 +63,11 @@ final class TermCore {
         return (x, y)
     }
 
+    var isUsingAlternateScreen: Bool {
+        guard let h = handle else { return false }
+        return ct_term_is_using_alt(h) == 1
+    }
+
     var dirtyEpoch: UInt32 {
         guard let h = handle else { return 0 }
         return ct_term_dirty_epoch(h)

@@ -5,23 +5,29 @@ import MetalKit
 import Carbon.HIToolbox
 
 /// NSView subclass: MTKView wrapper that owns the `TerminalRenderer` and
-/// routes keystrokes into a `PTYSession`. Feeds PTY output bytes into a
-/// `TermCore` backed by libcollabterm.
+/// routes keystrokes through a caller-supplied closure. The grid is also
+/// supplied externally so the same view can front either a local PTY (host)
+/// or inbound PTY-output frames (peer viewer).
 final class MetalTerminalNSView: NSView {
     let mtkView: MTKView
     let renderer: TerminalRenderer
     let grid: GridModel
-    let session: PTYSession
+    private let onKey: ([UInt8]) -> Void
+    private let onResize: (UInt16, UInt16) -> Void
+    /// When true, keystrokes are dropped (peer in raw mode: creator-only input).
+    var inputEnabled: Bool = true
 
-    init?(session: PTYSession) {
+    init?(grid: GridModel,
+          onKey: @escaping ([UInt8]) -> Void,
+          onResize: @escaping (UInt16, UInt16) -> Void)
+    {
         let view = MTKView(frame: .zero)
         self.mtkView = view
-        // GridModel size is recomputed on first layout.
-        guard let grid = GridModel(cols: 80, rows: 24) else { return nil }
         self.grid = grid
         guard let renderer = TerminalRenderer(view: view) else { return nil }
         self.renderer = renderer
-        self.session = session
+        self.onKey = onKey
+        self.onResize = onResize
         super.init(frame: .zero)
 
         renderer.grid = grid
@@ -38,15 +44,7 @@ final class MetalTerminalNSView: NSView {
         renderer.onResize = { [weak self] cols, rows in
             guard let self = self else { return }
             self.grid.resize(cols: cols, rows: rows)
-            self.session.resize(cols: cols, rows: rows)
-        }
-
-        session.onOutput = { [weak self] bytes in
-            self?.grid.feed(bytes)
-        }
-        session.onExit = { [weak self] in
-            let msg: [UInt8] = Array("\r\n[process exited]\r\n".utf8)
-            self?.grid.feed(msg)
+            self.onResize(cols, rows)
         }
     }
 
@@ -59,11 +57,15 @@ final class MetalTerminalNSView: NSView {
         window?.makeFirstResponder(self)
     }
 
-    // MARK: keyboard -> PTY
+    // MARK: keyboard -> closure
 
     override func keyDown(with event: NSEvent) {
+        guard inputEnabled else {
+            NSSound.beep()
+            return
+        }
         if let bytes = encodeKey(event) {
-            session.send(bytes)
+            onKey(bytes)
         }
     }
 
@@ -72,8 +74,12 @@ final class MetalTerminalNSView: NSView {
         if event.modifierFlags.contains(.command),
            event.charactersIgnoringModifiers == "v"
         {
+            guard inputEnabled else {
+                NSSound.beep()
+                return true
+            }
             if let s = NSPasteboard.general.string(forType: .string) {
-                session.send(Array(s.utf8))
+                onKey(Array(s.utf8))
                 return true
             }
         }
@@ -127,30 +133,39 @@ final class MetalTerminalNSView: NSView {
     }
 }
 
-/// SwiftUI bridge.
+/// SwiftUI bridge. Caller supplies the grid and closures; this view is
+/// agnostic to whether the bytes come from a local PTY or a remote host.
 struct MetalTerminalView: NSViewRepresentable {
-    let session: PTYSession
+    let grid: GridModel
+    let onKey: ([UInt8]) -> Void
+    let onResize: (UInt16, UInt16) -> Void
+    let inputEnabled: Bool
+
+    init(grid: GridModel,
+         onKey: @escaping ([UInt8]) -> Void,
+         onResize: @escaping (UInt16, UInt16) -> Void = { _, _ in },
+         inputEnabled: Bool = true)
+    {
+        self.grid = grid
+        self.onKey = onKey
+        self.onResize = onResize
+        self.inputEnabled = inputEnabled
+    }
 
     func makeNSView(context: Context) -> MetalTerminalNSView {
-        guard let v = MetalTerminalNSView(session: session) else {
-            // If Metal init failed (unlikely on Apple silicon), return an
-            // empty placeholder view so the app doesn't crash.
-            NSLog("MetalTerminalNSView init failed")
-            let dummy = MetalTerminalNSView.placeholder()
-            return dummy
+        guard let v = MetalTerminalNSView(
+            grid: grid, onKey: onKey, onResize: onResize)
+        else {
+            NSLog("MetalTerminalNSView init failed — Metal unavailable")
+            // Return an empty placeholder view rather than crash.
+            return MetalTerminalNSView(
+                grid: grid, onKey: { _ in }, onResize: { _, _ in })!
         }
+        v.inputEnabled = inputEnabled
         return v
     }
 
-    func updateNSView(_ nsView: MetalTerminalNSView, context: Context) {}
-}
-
-private extension MetalTerminalNSView {
-    static func placeholder() -> MetalTerminalNSView {
-        // Unsafe fallback — only hit if Metal is unavailable.
-        let session = PTYSession()
-        return MetalTerminalNSView(session: session) ?? {
-            fatalError("Metal unavailable")
-        }()
+    func updateNSView(_ nsView: MetalTerminalNSView, context: Context) {
+        nsView.inputEnabled = inputEnabled
     }
 }

@@ -44,6 +44,11 @@ final class SessionManager: ObservableObject {
     @Published private(set) var publicURL: String?
     @Published var lastError: String?
 
+    /// Last mode broadcast by the host. Peers consult this to decide whether
+    /// to drop keystrokes and surface a creator-only banner. Defaults to
+    /// `.line` so a fresh peer allows input until it hears otherwise.
+    @Published private(set) var remoteMode: TermMode = .line
+
     let localIdentity: UserIdentity
     @Published var localName: String {
         didSet {
@@ -142,21 +147,34 @@ final class SessionManager: ObservableObject {
         transportToIdentity.removeAll()
         localPort = 0
         publicURL = nil
+        lastError = nil
         state = .idle
     }
 
     // MARK: bore tunnel (host only)
 
     func startBoreTunnel(borePath: String) {
-        guard role == .host, boreHandle == nil, localPort != 0 else { return }
+        NSLog("[ct] startBoreTunnel role=%@ handle=%@ port=%d path=%@",
+              role == .host ? "host" : "peer",
+              boreHandle == nil ? "nil" : "set",
+              Int32(localPort),
+              borePath)
+        guard role == .host, boreHandle == nil, localPort != 0 else {
+            NSLog("[ct] startBoreTunnel early return")
+            return
+        }
+        publicURL = nil
+        lastError = nil
         guard let b = ct_bore_new() else {
             lastError = "ct_bore_new failed"
+            NSLog("[ct] ct_bore_new returned nil")
             return
         }
         boreHandle = b
         let rc = borePath.withCString { cstr in
             ct_bore_start(b, cstr, localPort)
         }
+        NSLog("[ct] ct_bore_start rc=%d", rc)
         if rc != 0 {
             lastError = "ct_bore_start failed"
             ct_bore_free(b)
@@ -172,12 +190,15 @@ final class SessionManager: ObservableObject {
     func broadcast(_ frame: Frame) {
         guard let h = handle else { return }
         let data = FrameCodec.encode(frame)
-        _ = data.withUnsafeBytes { raw -> Int32 in
+        let rc = data.withUnsafeBytes { raw -> Int32 in
             guard let base = raw.baseAddress else { return -1 }
             return ct_session_broadcast(
                 h,
                 base.assumingMemoryBound(to: UInt8.self),
                 data.count)
+        }
+        if rc != 0 {
+            NSLog("[ct] broadcast failed rc=%d bytes=%d", rc, data.count)
         }
     }
 
@@ -193,6 +214,28 @@ final class SessionManager: ObservableObject {
         broadcast(.cursorPos(localIdentity, col: col, row: row))
     }
 
+    /// Host only: fan PTY output out to every peer.
+    func sendPtyOutput(_ bytes: Data) {
+        guard role == .host, state == .running, !bytes.isEmpty else { return }
+        broadcast(.ptyOutput(bytes))
+    }
+
+    /// Host only: broadcast a mode transition. Idempotent — callers should
+    /// gate with their own edge detector.
+    func sendMode(_ mode: TermMode) {
+        guard role == .host, state == .running else { return }
+        remoteMode = mode
+        broadcast(.modeChange(mode))
+    }
+
+    /// Peer only: ship keystroke bytes to the host as an opaque `inputOp`
+    /// payload. (Full CRDT merge is a future step; Phase 3 uses this as a
+    /// "raw-bytes passthrough" so end-to-end shared typing works.)
+    func sendInputBytes(_ bytes: Data) {
+        guard role == .peer, state == .running, !bytes.isEmpty else { return }
+        broadcast(.inputOp(bytes))
+    }
+
     // MARK: polling
 
     private func startPolling() {
@@ -201,20 +244,44 @@ final class SessionManager: ObservableObject {
         }
     }
 
+    private var borePumpTickCount: Int = 0
     private func startBorePumping() {
+        NSLog("[ct] startBorePumping scheduling timer")
+        borePumpTickCount = 0
         borePumpTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] t in
             MainActor.assumeIsolated {
                 guard let self = self, let b = self.boreHandle else {
+                    NSLog("[ct] bore pump timer: no handle, invalidating")
                     t.invalidate()
                     return
                 }
+                self.borePumpTickCount += 1
                 var buf = [UInt8](repeating: 0, count: 256)
                 let n = buf.withUnsafeMutableBufferPointer { p -> Int in
                     Int(ct_bore_pump(b, p.baseAddress, p.count))
                 }
+                if self.borePumpTickCount <= 5 || self.borePumpTickCount % 5 == 0 {
+                    NSLog("[ct] bore pump tick=%d rc=%d", self.borePumpTickCount, n)
+                }
                 if n > 0 {
                     let url = String(bytes: buf.prefix(min(n, buf.count)), encoding: .utf8)
                     self.publicURL = url
+                    NSLog("[ct] bore url ready: %@", url ?? "<nil>")
+                    t.invalidate()
+                } else if n < 0 {
+                    // Snapshot whatever bore has printed so we can diagnose.
+                    var dbuf = [UInt8](repeating: 0, count: 4096)
+                    let dlen = dbuf.withUnsafeMutableBufferPointer { p -> Int in
+                        Int(ct_bore_debug(b, p.baseAddress, p.count))
+                    }
+                    let preview = String(bytes: dbuf.prefix(min(dlen, dbuf.count)),
+                                         encoding: .utf8) ?? "<binary>"
+                    let trimmed = preview.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.lastError = trimmed.isEmpty
+                        ? "bore exited before reporting a public URL"
+                        : trimmed
+                    NSLog("[ct] bore pump rc=-1 bufferedLen=%d preview=%@",
+                          dlen, preview)
                     t.invalidate()
                 }
             }
@@ -315,6 +382,8 @@ final class SessionManager: ObservableObject {
                 }
                 participants = next
             }
+        case .modeChange(let m):
+            if role == .peer { remoteMode = m }
         default:
             break
         }

@@ -64,6 +64,7 @@ size_t   ct_term_snapshot(ct_term *t, ct_cell *out, size_t capacity);
 
 void     ct_term_size(ct_term *t, uint16_t *out_cols, uint16_t *out_rows);
 void     ct_term_cursor(ct_term *t, uint16_t *out_x, uint16_t *out_y);
+int      ct_term_is_using_alt(ct_term *t);
 
 /* Monotonic counter bumped on any grid mutation. Swift redraws when this changes. */
 uint32_t ct_term_dirty_epoch(ct_term *t);
@@ -116,6 +117,10 @@ int      ct_bore_start(ct_bore *b, const char *bore_path, uint16_t port);
  * (NOT NUL-terminated) into `out` and returns the URL length. Returns 0 if
  * not ready, -1 on error. */
 ptrdiff_t ct_bore_pump(ct_bore *b, uint8_t *out, size_t cap);
+
+/* Copy the bore stdout/stderr scratch buffer for diagnostics. Returns total
+ * buffered length (may exceed cap). */
+ptrdiff_t ct_bore_debug(ct_bore *b, uint8_t *out, size_t cap);
 
 void      ct_bore_stop(ct_bore *b);
 
