@@ -13,6 +13,7 @@ enum FrameTag: UInt8 {
     case hello       = 0x07
     case modeChange  = 0x08
     case roster      = 0x09
+    case heartbeat   = 0x0A
 }
 
 enum SessionRole: UInt8 {
@@ -61,6 +62,7 @@ enum Frame {
     case hello(UserIdentity, role: SessionRole, color: UInt32, name: String)
     case modeChange(TermMode)
     case roster([RosterEntry])
+    case heartbeat
 }
 
 enum FrameCodecError: Error {
@@ -114,6 +116,8 @@ enum FrameCodec {
                 appendU16(&out, UInt16(min(utf8.count, Int(UInt16.max))))
                 out.append(contentsOf: utf8.prefix(Int(UInt16.max)))
             }
+        case .heartbeat:
+            out.append(FrameTag.heartbeat.rawValue)
         }
         return out
     }
@@ -178,6 +182,8 @@ enum FrameCodec {
                     identity: id, role: role, color: color, name: name))
             }
             return .roster(entries)
+        case .heartbeat:
+            return .heartbeat
         case .fsDelta, .fsSnapshot:
             throw FrameCodecError.unsupportedTag
         }

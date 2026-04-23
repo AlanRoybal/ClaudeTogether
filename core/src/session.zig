@@ -154,8 +154,8 @@ pub const Session = struct {
             p.write_mutex.lock();
             defer p.write_mutex.unlock();
             if (p.dead) continue;
-            p.conn.sendFrame(payload) catch {
-                p.dead = true;
+            p.conn.sendFrame(payload) catch |err| {
+                self.markDead(p, err);
             };
         }
     }

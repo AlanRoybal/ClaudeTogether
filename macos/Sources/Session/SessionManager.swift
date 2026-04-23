@@ -65,9 +65,12 @@ final class SessionManager: ObservableObject {
     private var boreHandle: OpaquePointer?
     private var pollTimer: Timer?
     private var borePumpTimer: Timer?
+    private var keepAliveTimer: Timer?
 
     /// Host-only: transport peer id → user identity (filled on Hello).
     private var transportToIdentity: [UInt32: UserIdentity] = [:]
+
+    private static let keepAliveInterval: TimeInterval = 15
 
     /// Decoded inbound frame + the transport peer id that sent it.
     var onFrame: ((Frame, UInt32) -> Void)?
@@ -84,6 +87,7 @@ final class SessionManager: ObservableObject {
     deinit {
         pollTimer?.invalidate()
         borePumpTimer?.invalidate()
+        keepAliveTimer?.invalidate()
         if let h = handle { ct_session_free(h) }
         if let b = boreHandle { ct_bore_free(b) }
     }
@@ -106,6 +110,7 @@ final class SessionManager: ObservableObject {
             name: localName, color: localColor)]
         state = .running
         startPolling()
+        startKeepAlive()
     }
 
     /// Connect to `host:port`. `host` can be an IP literal or DNS name
@@ -129,12 +134,14 @@ final class SessionManager: ObservableObject {
             name: localName, color: localColor)]
         state = .running
         startPolling()
+        startKeepAlive()
         sendHello()  // tell the host who we are; host broadcasts Roster back
     }
 
     func stop() {
         pollTimer?.invalidate(); pollTimer = nil
         borePumpTimer?.invalidate(); borePumpTimer = nil
+        keepAliveTimer?.invalidate(); keepAliveTimer = nil
         if let h = handle {
             ct_session_free(h)
             handle = nil
@@ -236,11 +243,26 @@ final class SessionManager: ObservableObject {
         broadcast(.inputOp(bytes))
     }
 
+    func sendHeartbeat() {
+        guard state == .running else { return }
+        broadcast(.heartbeat)
+    }
+
     // MARK: polling
 
     private func startPolling() {
         pollTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.pump() }
+        }
+    }
+
+    private func startKeepAlive() {
+        keepAliveTimer?.invalidate()
+        keepAliveTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.keepAliveInterval,
+            repeats: true
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.sendHeartbeat() }
         }
     }
 
@@ -384,6 +406,8 @@ final class SessionManager: ObservableObject {
             }
         case .modeChange(let m):
             if role == .peer { remoteMode = m }
+        case .heartbeat:
+            break
         default:
             break
         }

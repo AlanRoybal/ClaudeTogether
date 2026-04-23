@@ -19,6 +19,8 @@ pub const Tag = enum(u8) {
     mode_change = 0x08,
     /// Host broadcasts the full session roster whenever it changes.
     roster = 0x09,
+    /// Lightweight keepalive frame to keep idle tunnels/sockets warm.
+    heartbeat = 0x0A,
 };
 
 pub const Role = enum(u8) {
@@ -78,6 +80,7 @@ pub const Frame = union(Tag) {
     /// Encoded/decoded on the Swift side (FrameCodec); zig treats these as
     /// opaque bytes passing through the transport layer.
     roster: void,
+    heartbeat: void,
 };
 
 pub const DecodeError = error{
@@ -187,6 +190,7 @@ pub fn decode(bytes: []const u8) DecodeError!Frame {
                 return error.InvalidEnum;
             break :blk Frame{ .mode_change = .{ .mode = mode } };
         },
+        .heartbeat => Frame{ .heartbeat = {} },
         .fs_delta, .fs_snapshot, .roster => error.NotImplemented,
     };
 }
@@ -253,6 +257,7 @@ pub fn encode(frame: Frame, out: []u8) EncodeError!usize {
             try w.writeBytes(p.name);
         },
         .mode_change => |p| try w.writeU8(@intFromEnum(p.mode)),
+        .heartbeat => {},
         .fs_delta, .fs_snapshot, .roster => return error.BufferTooSmall, // NYI
     }
     return w.pos;
@@ -267,6 +272,7 @@ pub fn encodedLen(frame: Frame) usize {
         .cursor_pos => 1 + 16 + 2 + 2,
         .hello => |p| 1 + 16 + 1 + 4 + 2 + p.name.len,
         .mode_change => 1 + 1,
+        .heartbeat => 1,
         .fs_delta, .fs_snapshot, .roster => 1,
     };
 }
@@ -321,6 +327,13 @@ test "mode_change roundtrip" {
     const n = try encode(Frame{ .mode_change = .{ .mode = .raw } }, &buf);
     const decoded = try decode(buf[0..n]);
     try std.testing.expectEqual(Mode.raw, decoded.mode_change.mode);
+}
+
+test "heartbeat roundtrip" {
+    var buf: [8]u8 = undefined;
+    const n = try encode(Frame{ .heartbeat = {} }, &buf);
+    const decoded = try decode(buf[0..n]);
+    try std.testing.expectEqual(Tag.heartbeat, @as(Tag, decoded));
 }
 
 test "input_commit roundtrip" {
