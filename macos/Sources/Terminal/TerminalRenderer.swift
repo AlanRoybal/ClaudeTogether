@@ -2,6 +2,7 @@ import AppKit
 import Metal
 import MetalKit
 import simd
+import CollabTermC
 
 /// Matches `BgInstance` in Shaders.metal. 2 + 4 = 8 bytes, round to 16.
 struct BgInstance {
@@ -51,6 +52,8 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     private var bgCapacity: Int = 0
     private var textBuffer: MTLBuffer?
     private var textCapacity: Int = 0
+    private var cursorTextBuffer: MTLBuffer?
+    private var cursorTextCapacity: Int = 0
     private var cursorBuffer: MTLBuffer?
     private var cursorCapacity: Int = 0
 
@@ -193,8 +196,10 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
 
         var bgInstances: [BgInstance] = []
         var textInstances: [TextInstance] = []
+        var cursorTextInstances: [TextInstance] = []
         bgInstances.reserveCapacity(cellCount)
         textInstances.reserveCapacity(cellCount)
+        cursorTextInstances.reserveCapacity(overlay.blocks.count)
 
         if snap.count >= cellCount {
             let atlasW = Float(atlas.atlasWidthPx)
@@ -214,30 +219,37 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                     bgInstances.append(bi)
 
                     // TEXT: skip blanks.
-                    let cp = c.codepoint
-                    if cp == 0 || cp == 0x20 { continue }
-                    let cw = Int(max(c.width, 1))
-                    guard let entry = atlas.entry(for: cp, cellsWide: cw),
-                          entry.pixelW > 0, entry.pixelH > 0
-                    else { continue }
-
-                    var ti = TextInstance()
-                    ti.gridPos = SIMD2<UInt16>(UInt16(x), UInt16(y))
-                    ti.offset = SIMD2<Int16>(
-                        Int16(entry.bearingX),
-                        Int16(atlas.cellHeightPx - entry.bearingYTop))
-                    ti.glyphSize = SIMD2<UInt16>(
-                        UInt16(entry.pixelW),
-                        UInt16(entry.pixelH))
-                    ti.uvOrigin = SIMD2<Float>(
-                        Float(entry.atlasX) / atlasW,
-                        Float(entry.atlasY) / atlasH)
-                    ti.uvSize = SIMD2<Float>(
-                        Float(entry.pixelW) / atlasW,
-                        Float(entry.pixelH) / atlasH)
-                    ti.fg = fg
-                    textInstances.append(ti)
+                    if let ti = makeTextInstance(
+                        cell: c,
+                        col: UInt16(x),
+                        row: UInt16(y),
+                        color: fg,
+                        atlasW: atlasW,
+                        atlasH: atlasH)
+                    {
+                        textInstances.append(ti)
+                    }
                 }
+            }
+
+            var cursorCells = Set<Int>()
+            cursorCells.reserveCapacity(overlay.blocks.count)
+            for block in overlay.blocks {
+                let index = Int(block.row) * cols + Int(block.col)
+                guard index >= 0, index < snap.count else { continue }
+                if !cursorCells.insert(index).inserted { continue }
+                let cell = snap[index]
+                guard let ti = makeTextInstance(
+                    cell: cell,
+                    col: block.col,
+                    row: block.row,
+                    color: cursorTextColor(on: block.color),
+                    atlasW: atlasW,
+                    atlasH: atlasH)
+                else {
+                    continue
+                }
+                cursorTextInstances.append(ti)
             }
         }
 
@@ -255,6 +267,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
 
         ensureBgCapacity(bgInstances.count)
         ensureTextCapacity(textInstances.count)
+        ensureCursorTextCapacity(cursorTextInstances.count)
         ensureCursorCapacity(cursorInstances.count)
         if !bgInstances.isEmpty, let bgBuf = bgBuffer {
             bgInstances.withUnsafeBytes { raw in
@@ -264,6 +277,11 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         if !textInstances.isEmpty, let tBuf = textBuffer {
             textInstances.withUnsafeBytes { raw in
                 _ = memcpy(tBuf.contents(), raw.baseAddress!, raw.count)
+            }
+        }
+        if !cursorTextInstances.isEmpty, let cursorTextBuf = cursorTextBuffer {
+            cursorTextInstances.withUnsafeBytes { raw in
+                _ = memcpy(cursorTextBuf.contents(), raw.baseAddress!, raw.count)
             }
         }
         if !cursorInstances.isEmpty, let cBuf = cursorBuffer {
@@ -309,6 +327,18 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                                instanceCount: cursorInstances.count)
         }
 
+        // Pass 4: redraw any glyph under a block cursor in a contrasting color
+        // so full block cursors still leave typed text legible.
+        if !cursorTextInstances.isEmpty, let cursorTextBuf = cursorTextBuffer {
+            enc.setRenderPipelineState(textPipeline)
+            enc.setVertexBuffer(cursorTextBuf, offset: 0, index: 0)
+            enc.setVertexBytes(&uniforms, length: MemoryLayout<RendererUniforms>.stride, index: 1)
+            enc.setFragmentTexture(atlas.texture, index: 0)
+            enc.setFragmentSamplerState(sampler, index: 0)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6,
+                               instanceCount: cursorTextInstances.count)
+        }
+
         enc.endEncoding()
         cmd.present(drawable)
         cmd.commit()
@@ -348,6 +378,15 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         textCapacity = cap
     }
 
+    private func ensureCursorTextCapacity(_ n: Int) {
+        if n <= cursorTextCapacity { return }
+        let cap = max(n, 64)
+        cursorTextBuffer = device.makeBuffer(
+            length: cap * MemoryLayout<TextInstance>.stride,
+            options: [.storageModeShared])
+        cursorTextCapacity = cap
+    }
+
     private func ensureCursorCapacity(_ n: Int) {
         if n <= cursorCapacity { return }
         let cap = max(n, 16)
@@ -364,5 +403,53 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             UInt8((packed >>  8) & 0xFF),
             UInt8( packed        & 0xFF),
             255)
+    }
+
+    private func makeTextInstance(
+        cell: ct_cell,
+        col: UInt16,
+        row: UInt16,
+        color: SIMD4<UInt8>,
+        atlasW: Float,
+        atlasH: Float
+    ) -> TextInstance? {
+        let cp = cell.codepoint
+        if cell.width == 0 || cp == 0 || cp == 0x20 {
+            return nil
+        }
+        let cw = Int(max(cell.width, 1))
+        guard let entry = atlas.entry(for: cp, cellsWide: cw),
+              entry.pixelW > 0, entry.pixelH > 0
+        else {
+            return nil
+        }
+
+        var ti = TextInstance()
+        ti.gridPos = SIMD2<UInt16>(col, row)
+        ti.offset = SIMD2<Int16>(
+            Int16(entry.bearingX),
+            Int16(atlas.cellHeightPx - entry.bearingYTop))
+        ti.glyphSize = SIMD2<UInt16>(
+            UInt16(entry.pixelW),
+            UInt16(entry.pixelH))
+        ti.uvOrigin = SIMD2<Float>(
+            Float(entry.atlasX) / atlasW,
+            Float(entry.atlasY) / atlasH)
+        ti.uvSize = SIMD2<Float>(
+            Float(entry.pixelW) / atlasW,
+            Float(entry.pixelH) / atlasH)
+        ti.fg = color
+        return ti
+    }
+
+    private func cursorTextColor(on cursorColor: SIMD4<UInt8>) -> SIMD4<UInt8> {
+        let luminance = (
+            0.2126 * Double(cursorColor.x) +
+            0.7152 * Double(cursorColor.y) +
+            0.0722 * Double(cursorColor.z)
+        ) / 255.0
+        return luminance < 0.45
+            ? SIMD4<UInt8>(245, 247, 250, 255)
+            : SIMD4<UInt8>(17, 17, 17, 255)
     }
 }

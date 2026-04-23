@@ -10,9 +10,10 @@
 //! - C0 executes: LF/VT/FF, CR, BS, BEL, HT.
 //! - Save/restore cursor: CSI s/u, ESC 7/8 (DECSC/DECRC — via term.zig).
 //! - Private-mode switches (CSI ?h / ?l): 47, 1047, 1048, 1049 (alt screen).
+//! - Region + screen editing: DECSTBM, IL/DL, ICH/DCH/ECH, SU/SD.
 //! - Scrollback ring buffer (~10K rows) for the primary buffer.
 //!
-//! Not yet: scrolling regions (DECSTBM), tab stops beyond 8-col fixed.
+//! Not yet: tab stops beyond 8-col fixed.
 
 const std = @import("std");
 const vt = @import("vt.zig");
@@ -106,6 +107,8 @@ pub const Grid = struct {
     sgr_fg: u32 = DEFAULT_FG,
     sgr_bg: u32 = DEFAULT_BG,
     saved: CursorState = .{},
+    scroll_top: u16 = 0,
+    scroll_bottom: u16 = 0,
 
     scrollback: Scrollback,
 
@@ -127,6 +130,7 @@ pub const Grid = struct {
             .primary = primary,
             .alt = alt,
             .cells = primary,
+            .scroll_bottom = rows - 1,
             .scrollback = sb,
         };
     }
@@ -139,6 +143,8 @@ pub const Grid = struct {
 
     pub fn resize(self: *Grid, cols: u16, rows: u16) !void {
         if (cols == self.cols and rows == self.rows) return;
+        const old_cols = self.cols;
+        const old_rows = self.rows;
         const sz: usize = @as(usize, cols) * @as(usize, rows);
         const new_primary = try self.alloc.alloc(Cell, sz);
         errdefer self.alloc.free(new_primary);
@@ -147,19 +153,32 @@ pub const Grid = struct {
         for (new_primary) |*c| c.* = .{};
         for (new_alt) |*c| c.* = .{};
 
-        const copy_cols = @min(cols, self.cols);
-        const copy_rows = @min(rows, self.rows);
-        var y: u16 = 0;
-        while (y < copy_rows) : (y += 1) {
-            @memcpy(
-                new_primary[@as(usize, y) * cols ..][0..copy_cols],
-                self.primary[@as(usize, y) * self.cols ..][0..copy_cols],
-            );
-            @memcpy(
-                new_alt[@as(usize, y) * cols ..][0..copy_cols],
-                self.alt[@as(usize, y) * self.cols ..][0..copy_cols],
-            );
+        if (!self.using_alt and cols == old_cols and rows < old_rows) {
+            var y: u16 = 0;
+            while (y < old_rows - rows) : (y += 1) {
+                const row_start: usize = @as(usize, y) * @as(usize, old_cols);
+                self.scrollback.pushRow(self.primary[row_start .. row_start + old_cols]);
+            }
         }
+
+        const primary_shift = copyResizedBuffer(
+            new_primary,
+            self.primary,
+            old_cols,
+            old_rows,
+            cols,
+            rows,
+            true,
+        );
+        _ = copyResizedBuffer(
+            new_alt,
+            self.alt,
+            old_cols,
+            old_rows,
+            cols,
+            rows,
+            false,
+        );
 
         self.alloc.free(self.primary);
         self.alloc.free(self.alt);
@@ -168,9 +187,15 @@ pub const Grid = struct {
         self.cells = if (self.using_alt) self.alt else self.primary;
         self.cols = cols;
         self.rows = rows;
-        try self.scrollback.reshape(cols);
-        if (self.cursor_x >= cols) self.cursor_x = cols - 1;
-        if (self.cursor_y >= rows) self.cursor_y = rows - 1;
+        if (cols != old_cols) {
+            try self.scrollback.reshape(cols);
+        }
+        self.cursor_x = @min(self.cursor_x, cols - 1);
+        self.cursor_y = shiftClampedRow(self.cursor_y, primary_shift, rows);
+        self.saved.x = @min(self.saved.x, cols - 1);
+        self.saved.y = @min(self.saved.y, rows - 1);
+        self.scroll_top = 0;
+        self.scroll_bottom = rows - 1;
         self.epoch +%= 1;
     }
 
@@ -242,33 +267,79 @@ pub const Grid = struct {
         switch (b) {
             '7' => self.saveCursor(), // DECSC
             '8' => self.restoreCursor(), // DECRC
+            'D' => self.lineFeed(), // IND
+            'E' => {
+                self.cursor_x = 0;
+                self.lineFeed();
+            }, // NEL
+            'M' => self.reverseIndex(), // RI
             else => {},
         }
     }
 
     fn lineFeed(self: *Grid) void {
-        if (self.cursor_y + 1 < self.rows) {
+        if (self.cursor_y == self.scroll_bottom) {
+            self.scrollUpRegion(self.scroll_top, self.scroll_bottom, 1);
+        } else if (self.cursor_y + 1 < self.rows) {
             self.cursor_y += 1;
-        } else {
-            self.scrollUp(1);
+        }
+    }
+
+    fn reverseIndex(self: *Grid) void {
+        if (self.cursor_y == self.scroll_top) {
+            self.scrollDownRegion(self.scroll_top, self.scroll_bottom, 1);
+        } else if (self.cursor_y > 0) {
+            self.cursor_y -= 1;
         }
     }
 
     fn scrollUp(self: *Grid, n: u16) void {
-        const amt = @min(n, self.rows);
+        self.scrollUpRegion(0, self.rows - 1, n);
+    }
+
+    fn scrollUpRegion(self: *Grid, top: u16, bottom: u16, n: u16) void {
+        if (top > bottom or bottom >= self.rows) return;
+        const height = bottom - top + 1;
+        const amt = @min(n, height);
+        if (amt == 0) return;
         const cols = self.cols;
-        // Evict top `amt` rows into scrollback (primary only).
-        if (!self.using_alt) {
+        // Evict top rows into scrollback only when the primary viewport itself
+        // scrolls, not for nested scroll regions inside TUIs.
+        if (!self.using_alt and top == 0 and bottom + 1 == self.rows) {
             var y: u16 = 0;
             while (y < amt) : (y += 1) {
-                const row_start: usize = @as(usize, y) * @as(usize, cols);
+                const row_start: usize = @as(usize, top + y) * @as(usize, cols);
                 self.scrollback.pushRow(self.cells[row_start .. row_start + cols]);
             }
         }
-        const src = self.cells[@as(usize, amt) * cols ..];
-        const keep = (self.rows - amt) * cols;
-        std.mem.copyForwards(Cell, self.cells[0..keep], src[0..keep]);
-        for (self.cells[keep..]) |*c| c.* = .{ .bg = self.sgr_bg };
+        const region_start: usize = @as(usize, top) * @as(usize, cols);
+        const src_start: usize = @as(usize, top + amt) * @as(usize, cols);
+        const keep_rows = height - amt;
+        const keep_cells = @as(usize, keep_rows) * @as(usize, cols);
+        std.mem.copyForwards(
+            Cell,
+            self.cells[region_start .. region_start + keep_cells],
+            self.cells[src_start .. src_start + keep_cells],
+        );
+        self.clearRows(bottom + 1 - amt, amt);
+    }
+
+    fn scrollDownRegion(self: *Grid, top: u16, bottom: u16, n: u16) void {
+        if (top > bottom or bottom >= self.rows) return;
+        const height = bottom - top + 1;
+        const amt = @min(n, height);
+        if (amt == 0) return;
+        const cols = self.cols;
+        const dst_start: usize = @as(usize, top + amt) * @as(usize, cols);
+        const src_start: usize = @as(usize, top) * @as(usize, cols);
+        const keep_rows = height - amt;
+        const keep_cells = @as(usize, keep_rows) * @as(usize, cols);
+        std.mem.copyBackwards(
+            Cell,
+            self.cells[dst_start .. dst_start + keep_cells],
+            self.cells[src_start .. src_start + keep_cells],
+        );
+        self.clearRows(top, amt);
     }
 
     fn csi(self: *Grid, c: vt.Csi) void {
@@ -278,6 +349,7 @@ pub const Grid = struct {
             return;
         }
         switch (c.final) {
+            '@' => self.insertBlankChars(@intCast(@max(1, c.get(0, 1)))),
             'A' => self.moveCursor(0, -@as(i32, c.get(0, 1))),
             'B' => self.moveCursor(0, c.get(0, 1)),
             'C' => self.moveCursor(c.get(0, 1), 0),
@@ -301,7 +373,22 @@ pub const Grid = struct {
             },
             'J' => self.eraseDisplay(@intCast(@max(0, c.get(0, 0)))),
             'K' => self.eraseLine(@intCast(@max(0, c.get(0, 0)))),
+            'L' => self.insertLines(@intCast(@max(1, c.get(0, 1)))),
+            'M' => self.deleteLines(@intCast(@max(1, c.get(0, 1)))),
+            'P' => self.deleteChars(@intCast(@max(1, c.get(0, 1)))),
+            'S' => self.scrollUpRegion(self.scroll_top, self.scroll_bottom, @intCast(@max(1, c.get(0, 1)))),
+            'T' => self.scrollDownRegion(self.scroll_top, self.scroll_bottom, @intCast(@max(1, c.get(0, 1)))),
+            'X' => self.eraseChars(@intCast(@max(1, c.get(0, 1)))),
+            'd' => {
+                const row = @max(1, c.get(0, 1));
+                self.cursor_y = @intCast(@min(@as(i32, self.rows) - 1, row - 1));
+            },
+            'e' => self.moveCursor(0, c.get(0, 1)),
             'm' => self.sgr(c),
+            'r' => self.setScrollRegion(
+                @intCast(@max(1, c.get(0, 1))),
+                @intCast(@max(1, c.get(1, @as(i32, self.rows)))),
+            ),
             's' => self.saveCursor(),
             'u' => self.restoreCursor(),
             else => {},
@@ -343,6 +430,8 @@ pub const Grid = struct {
         if (to_alt == self.using_alt) return;
         self.using_alt = to_alt;
         self.cells = if (to_alt) self.alt else self.primary;
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows - 1;
     }
 
     fn clearActive(self: *Grid) void {
@@ -372,6 +461,84 @@ pub const Grid = struct {
         const ny = @as(i32, self.cursor_y) + dy;
         self.cursor_x = @intCast(@max(0, @min(@as(i32, self.cols) - 1, nx)));
         self.cursor_y = @intCast(@max(0, @min(@as(i32, self.rows) - 1, ny)));
+    }
+
+    fn setScrollRegion(self: *Grid, top_1: u16, bottom_1: u16) void {
+        const top = top_1 - 1;
+        const bottom = bottom_1 - 1;
+        if (top >= bottom or bottom >= self.rows) {
+            self.scroll_top = 0;
+            self.scroll_bottom = self.rows - 1;
+        } else {
+            self.scroll_top = top;
+            self.scroll_bottom = bottom;
+        }
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+    }
+
+    fn insertLines(self: *Grid, n: u16) void {
+        if (self.cursor_y < self.scroll_top or self.cursor_y > self.scroll_bottom) return;
+        const amt = @min(n, self.scroll_bottom - self.cursor_y + 1);
+        const cols = self.cols;
+        const dst_start: usize = @as(usize, self.cursor_y + amt) * @as(usize, cols);
+        const src_start: usize = @as(usize, self.cursor_y) * @as(usize, cols);
+        const keep_rows = self.scroll_bottom - self.cursor_y + 1 - amt;
+        const keep_cells = @as(usize, keep_rows) * @as(usize, cols);
+        std.mem.copyBackwards(
+            Cell,
+            self.cells[dst_start .. dst_start + keep_cells],
+            self.cells[src_start .. src_start + keep_cells],
+        );
+        self.clearRows(self.cursor_y, amt);
+    }
+
+    fn deleteLines(self: *Grid, n: u16) void {
+        if (self.cursor_y < self.scroll_top or self.cursor_y > self.scroll_bottom) return;
+        const amt = @min(n, self.scroll_bottom - self.cursor_y + 1);
+        const cols = self.cols;
+        const dst_start: usize = @as(usize, self.cursor_y) * @as(usize, cols);
+        const src_start: usize = @as(usize, self.cursor_y + amt) * @as(usize, cols);
+        const keep_rows = self.scroll_bottom - self.cursor_y + 1 - amt;
+        const keep_cells = @as(usize, keep_rows) * @as(usize, cols);
+        std.mem.copyForwards(
+            Cell,
+            self.cells[dst_start .. dst_start + keep_cells],
+            self.cells[src_start .. src_start + keep_cells],
+        );
+        self.clearRows(self.scroll_bottom + 1 - amt, amt);
+    }
+
+    fn insertBlankChars(self: *Grid, n: u16) void {
+        const row = self.rowSlice(self.cursor_y);
+        const amt = @min(n, self.cols - self.cursor_x);
+        const start = @as(usize, self.cursor_x);
+        const keep = @as(usize, self.cols - self.cursor_x - amt);
+        std.mem.copyBackwards(
+            Cell,
+            row[start + amt .. start + amt + keep],
+            row[start .. start + keep],
+        );
+        self.clearRange(row, self.cursor_x, self.cursor_x + amt);
+    }
+
+    fn deleteChars(self: *Grid, n: u16) void {
+        const row = self.rowSlice(self.cursor_y);
+        const amt = @min(n, self.cols - self.cursor_x);
+        const start = @as(usize, self.cursor_x);
+        const keep = @as(usize, self.cols - self.cursor_x - amt);
+        std.mem.copyForwards(
+            Cell,
+            row[start .. start + keep],
+            row[start + amt .. start + amt + keep],
+        );
+        self.clearRange(row, self.cols - amt, self.cols);
+    }
+
+    fn eraseChars(self: *Grid, n: u16) void {
+        const row = self.rowSlice(self.cursor_y);
+        const end = @min(self.cols, self.cursor_x + n);
+        self.clearRange(row, self.cursor_x, end);
     }
 
     fn eraseDisplay(self: *Grid, mode: u8) void {
@@ -473,6 +640,26 @@ pub const Grid = struct {
         self.sgr_bg = DEFAULT_BG;
     }
 
+    fn rowSlice(self: *Grid, y: u16) []Cell {
+        const row_start = @as(usize, y) * @as(usize, self.cols);
+        return self.cells[row_start .. row_start + self.cols];
+    }
+
+    fn clearRows(self: *Grid, top: u16, count: u16) void {
+        var y = top;
+        while (y < top + count) : (y += 1) {
+            self.clearRange(self.rowSlice(y), 0, self.cols);
+        }
+    }
+
+    fn clearRange(self: *Grid, row: []Cell, start: u16, end: u16) void {
+        for (row[start..end]) |*c| c.* = self.blankCell();
+    }
+
+    fn blankCell(self: *Grid) Cell {
+        return .{ .bg = self.sgr_bg };
+    }
+
     fn cellIdx(self: *const Grid, x: u16, y: u16) usize {
         return @as(usize, y) * self.cols + x;
     }
@@ -532,6 +719,46 @@ fn xterm256(n: u8) u32 {
 
 fn rgb(r: u8, g: u8, b: u8) u32 {
     return (@as(u32, r) << 16) | (@as(u32, g) << 8) | @as(u32, b);
+}
+
+fn copyResizedBuffer(
+    dst: []Cell,
+    src: []const Cell,
+    old_cols: u16,
+    old_rows: u16,
+    new_cols: u16,
+    new_rows: u16,
+    preserve_bottom: bool,
+) i32 {
+    const copy_cols = @min(new_cols, old_cols);
+    const copy_rows = @min(new_rows, old_rows);
+    // Preserve the bottom edge only when rows are removed. When rows are added
+    // (the common initial window-size sync path), keep existing content pinned
+    // to the top so the shell prompt does not appear to "fall" toward center.
+    const preserve_bottom_rows = preserve_bottom and new_rows < old_rows;
+    const src_row0: u16 = if (preserve_bottom_rows and old_rows > copy_rows)
+        old_rows - copy_rows
+    else
+        0;
+    const dst_row0: u16 = if (preserve_bottom_rows and new_rows > copy_rows)
+        new_rows - copy_rows
+    else
+        0;
+    var y: u16 = 0;
+    while (y < copy_rows) : (y += 1) {
+        const src_row = src_row0 + y;
+        const dst_row = dst_row0 + y;
+        @memcpy(
+            dst[@as(usize, dst_row) * @as(usize, new_cols) ..][0..copy_cols],
+            src[@as(usize, src_row) * @as(usize, old_cols) ..][0..copy_cols],
+        );
+    }
+    return @as(i32, dst_row0) - @as(i32, src_row0);
+}
+
+fn shiftClampedRow(row: u16, delta: i32, max_rows: u16) u16 {
+    const shifted = @as(i32, row) + delta;
+    return @intCast(@max(0, @min(@as(i32, max_rows) - 1, shifted)));
 }
 
 test "print puts a cell and advances cursor" {
@@ -617,4 +844,78 @@ test "save/restore cursor via CSI s/u" {
     g.apply(.{ .csi = restore });
     try std.testing.expectEqual(@as(u16, 3), g.cursor_x);
     try std.testing.expectEqual(@as(u16, 2), g.cursor_y);
+}
+
+test "resize keeps bottom rows of primary buffer" {
+    var g = try Grid.init(std.testing.allocator, 4, 4);
+    defer g.deinit();
+    var row: u16 = 0;
+    while (row < g.rows) : (row += 1) {
+        g.cursor_x = 0;
+        g.cursor_y = row;
+        g.putCodepoint(@as(u32, 'A') + row);
+    }
+    g.cursor_y = 3;
+    try g.resize(4, 2);
+    try std.testing.expectEqual(@as(u32, 'C'), g.cells[0].codepoint);
+    try std.testing.expectEqual(@as(u32, 'D'), g.cells[4].codepoint);
+    try std.testing.expectEqual(@as(u16, 1), g.cursor_y);
+}
+
+test "resize growth keeps existing content top-anchored" {
+    var g = try Grid.init(std.testing.allocator, 4, 2);
+    defer g.deinit();
+    g.cursor_x = 0;
+    g.cursor_y = 0;
+    g.putCodepoint('A');
+    g.cursor_x = 0;
+    g.cursor_y = 1;
+    g.putCodepoint('B');
+    try g.resize(4, 4);
+    try std.testing.expectEqual(@as(u32, 'A'), g.cells[0].codepoint);
+    try std.testing.expectEqual(@as(u32, 'B'), g.cells[4].codepoint);
+    try std.testing.expectEqual(@as(u32, ' '), g.cells[8].codepoint);
+    try std.testing.expectEqual(@as(u16, 1), g.cursor_y);
+}
+
+test "DECSTBM scrolls only inside region" {
+    var g = try Grid.init(std.testing.allocator, 3, 4);
+    defer g.deinit();
+    var row: u16 = 0;
+    while (row < g.rows) : (row += 1) {
+        g.cursor_x = 0;
+        g.cursor_y = row;
+        g.putCodepoint(@as(u32, 'A') + row);
+    }
+    var set = vt.Csi{ .final = 'r', .param_count = 2 };
+    set.params[0] = 2;
+    set.params[1] = 3;
+    g.apply(.{ .csi = set });
+    g.cursor_x = 0;
+    g.cursor_y = 2;
+    g.apply(.{ .execute = 0x0A });
+    try std.testing.expectEqual(@as(u32, 'A'), g.cells[0].codepoint);
+    try std.testing.expectEqual(@as(u32, 'C'), g.cells[3].codepoint);
+    try std.testing.expectEqual(@as(u32, ' '), g.cells[6].codepoint);
+    try std.testing.expectEqual(@as(u32, 'D'), g.cells[9].codepoint);
+}
+
+test "insert and delete chars edit the active row" {
+    var g = try Grid.init(std.testing.allocator, 5, 1);
+    defer g.deinit();
+    for ("abcd") |ch| g.putCodepoint(ch);
+    g.cursor_x = 1;
+    var insert = vt.Csi{ .final = '@', .param_count = 1 };
+    insert.params[0] = 1;
+    g.apply(.{ .csi = insert });
+    try std.testing.expectEqual(@as(u32, 'a'), g.cells[0].codepoint);
+    try std.testing.expectEqual(@as(u32, ' '), g.cells[1].codepoint);
+    try std.testing.expectEqual(@as(u32, 'b'), g.cells[2].codepoint);
+
+    var delete = vt.Csi{ .final = 'P', .param_count = 1 };
+    delete.params[0] = 2;
+    g.apply(.{ .csi = delete });
+    try std.testing.expectEqual(@as(u32, 'a'), g.cells[0].codepoint);
+    try std.testing.expectEqual(@as(u32, 'c'), g.cells[1].codepoint);
+    try std.testing.expectEqual(@as(u32, 'd'), g.cells[2].codepoint);
 }

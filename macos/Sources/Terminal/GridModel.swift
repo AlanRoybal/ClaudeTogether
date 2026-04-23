@@ -246,6 +246,40 @@ final class GridModel: ObservableObject {
         var cell = base
         cell.codepoint = 0x20
         cell.width = 1
+        cell.attrs = 0
+        cell.fg = readableOverlayForeground(
+            preferred: base.fg,
+            on: base.bg)
         return cell
+    }
+
+    private func readableOverlayForeground(preferred: UInt32, on background: UInt32) -> UInt32 {
+        if contrastRatio(between: preferred, and: background) >= 4.5 {
+            return preferred
+        }
+        return relativeLuminance(of: background) < 0.25 ? 0xF5F7FA : 0x111111
+    }
+
+    private func contrastRatio(between lhs: UInt32, and rhs: UInt32) -> Double {
+        let l1 = relativeLuminance(of: lhs)
+        let l2 = relativeLuminance(of: rhs)
+        let lighter = max(l1, l2)
+        let darker = min(l1, l2)
+        return (lighter + 0.05) / (darker + 0.05)
+    }
+
+    private func relativeLuminance(of packed: UInt32) -> Double {
+        let r = linearizeComponent((packed >> 16) & 0xFF)
+        let g = linearizeComponent((packed >> 8) & 0xFF)
+        let b = linearizeComponent(packed & 0xFF)
+        return 0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    private func linearizeComponent(_ component: UInt32) -> Double {
+        let normalized = Double(component) / 255.0
+        if normalized <= 0.04045 {
+            return normalized / 12.92
+        }
+        return pow((normalized + 0.055) / 1.055, 2.4)
     }
 }
