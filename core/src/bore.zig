@@ -22,7 +22,7 @@ pub const Supervisor = struct {
     /// this supervisor (freed on stop()).
     public_url: ?[]u8 = null,
     /// Scratch buffer for incremental stdout/stderr reads while waiting for
-    /// the "listening at ..." line.
+    /// the "listening at ..." announcement.
     output_buf: std.ArrayList(u8),
 
     pub fn init(allocator: std.mem.Allocator) Supervisor {
@@ -148,23 +148,22 @@ fn setPipeNonBlocking(file: std.fs.File) !void {
 }
 
 /// Scans `output` (accumulated bore stdout/stderr) for the announcement line
-/// and returns a borrowed slice pointing at "bore.pub:NNNNN", or null.
+/// and returns the borrowed address token after "listening at ", or null.
 ///
 /// Bore prints lines like:
 ///   2024-01-01T00:00:00Z  INFO bore_cli::client: listening at bore.pub:12345
 pub fn parsePublicUrl(output: []const u8) ?[]const u8 {
-    const needle = "bore.pub:";
+    const needle = "listening at ";
     var i: usize = 0;
-    while (std.mem.indexOfPos(u8, output, i, needle)) |start| {
-        // Require a digit immediately after the colon.
-        const after = start + needle.len;
-        if (after >= output.len or !std.ascii.isDigit(output[after])) {
-            i = after;
-            continue;
+    while (std.mem.indexOfPos(u8, output, i, needle)) |match_start| {
+        const start = match_start + needle.len;
+        if (start >= output.len) return null;
+        var end = start;
+        while (end < output.len and !std.ascii.isWhitespace(output[end])) {
+            end += 1;
         }
-        var end = after;
-        while (end < output.len and std.ascii.isDigit(output[end])) end += 1;
-        return output[start..end];
+        if (end > start) return output[start..end];
+        i = start;
     }
     return null;
 }
@@ -192,12 +191,20 @@ test "parsePublicUrl ignores bore.pub without port digits" {
     try testing.expect(parsePublicUrl(noise) == null);
 }
 
-test "parsePublicUrl picks first numeric match" {
+test "parsePublicUrl ignores control-port lines and picks announcement" {
     const two =
-        "listening at bore.pub:11111\n" ++
+        "2024-01-01T00:00:00Z  INFO bore_cli::client: connected to bore.pub:7835\n" ++
+        "2024-01-01T00:00:00Z  INFO bore_cli::client: listening at bore.pub:11111\n" ++
         "later line bore.pub:22222\n";
     const got = parsePublicUrl(two);
     try testing.expectEqualStrings("bore.pub:11111", got.?);
+}
+
+test "parsePublicUrl supports non-bore domains" {
+    const sample =
+        "2024-01-01T00:00:00Z  INFO bore_cli::client: listening at tunnel.example.com:43210\n";
+    const got = parsePublicUrl(sample);
+    try testing.expectEqualStrings("tunnel.example.com:43210", got.?);
 }
 
 test "Supervisor parses public URL from stderr" {
