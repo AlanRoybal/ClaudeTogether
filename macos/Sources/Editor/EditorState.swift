@@ -34,6 +34,10 @@ final class EditorState: ObservableObject {
     /// Per-remote-user cursor/selection state, keyed by identity.
     @Published var remoteCursors: [UserIdentity: RemoteCursor] = [:]
 
+    /// Local user's editor cursor color.
+    @Published var localCursorColor: NSColor = NSColor(
+        srgbRed: 0.96, green: 0.97, blue: 0.98, alpha: 1.0)
+
     /// Bumped by the controller on every state-visible change so the
     /// renderer can early-out when nothing changed.
     @Published var epoch: UInt64 = 0

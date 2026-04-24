@@ -58,6 +58,8 @@ pub const Op = union(OpKind) {
 };
 
 pub const Sequence = struct {
+    const snapshot_client: u32 = 0;
+
     allocator: std.mem.Allocator,
     client: u32,
     clock: u32 = 0,
@@ -158,17 +160,23 @@ pub const Sequence = struct {
     }
 
     /// Bulk-insert the UTF-8-decoded codepoints of `s` at the end of the
-    /// sequence. Each codepoint becomes a full CRDT `Item` authored by
-    /// `self.client` with monotonically increasing clocks, so concurrent
-    /// edits during/after load behave correctly. Existing items are
+    /// sequence. Snapshot-loaded items always use the reserved
+    /// `snapshot_client` so every replica derives the same ids for the same
+    /// initial file contents; that keeps stable cursor anchors meaningful
+    /// across peers before any live edits happen. Existing items are
     /// preserved; insertions land after the current last live item.
     pub fn loadFromString(self: *Sequence, s: []const u8) !void {
+        var next_snapshot_clock = self.maxClockForClient(snapshot_client) + 1;
         var view = try std.unicode.Utf8View.init(s);
         var it = view.iterator();
         while (it.nextCodepoint()) |cp| {
             const after_id = self.idBeforeVisiblePos(self.len());
-            self.clock += 1;
-            const new_id = Id{ .client = self.client, .clock = self.clock };
+            const new_id = Id{
+                .client = snapshot_client,
+                .clock = next_snapshot_clock,
+            };
+            next_snapshot_clock += 1;
+            if (new_id.clock > self.clock) self.clock = new_id.clock;
             try self.applyInsert(new_id, after_id, cp);
         }
     }
@@ -256,6 +264,16 @@ pub const Sequence = struct {
             if (Id.eql(it.id, id)) return i;
         }
         return null;
+    }
+
+    fn maxClockForClient(self: *const Sequence, client: u32) u32 {
+        var max_clock: u32 = 0;
+        for (self.items.items) |it| {
+            if (it.id.client == client and it.id.clock > max_clock) {
+                max_clock = it.id.clock;
+            }
+        }
+        return max_clock;
     }
 
     /// Id of the live item just before `visible_pos`, or null if at head.
@@ -492,6 +510,20 @@ test "loadFromString multibyte utf8 roundtrip" {
     try testing.expectEqualStrings("héllo\nworld", got);
     // 'é' is one codepoint, so len is 11 (not 12 bytes).
     try testing.expectEqual(@as(usize, 11), s.len());
+}
+
+test "loadFromString uses replica-stable ids" {
+    var a = Sequence.init(testing.allocator, 101);
+    defer a.deinit();
+    var b = Sequence.init(testing.allocator, 202);
+    defer b.deinit();
+
+    try a.loadFromString("hello");
+    try b.loadFromString("hello");
+
+    for (0..5) |idx| {
+        try testing.expectEqual(a.idAtVisiblePos(idx).?, b.idAtVisiblePos(idx).?);
+    }
 }
 
 test "idAtVisiblePos basic" {

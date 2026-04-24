@@ -815,6 +815,7 @@ final class TerminalModel: ObservableObject {
             docId: docId,
             path: path,
             clientId: clientId,
+            localCursorColor: nsColor(for: sessionManager.localIdentity),
             snapshot: snapshot,
             sendOp: { [weak self] opBytes in
                 self?.sessionManager.sendEditorOp(docId: docId, opBytes: opBytes)

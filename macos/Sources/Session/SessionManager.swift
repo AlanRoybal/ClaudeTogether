@@ -605,7 +605,10 @@ final class SessionManager: ObservableObject {
     }
 
     nonisolated static func editorUserID(for identity: UserIdentity) -> UInt32 {
-        colorHash(for: identity)
+        let hash = colorHash(for: identity)
+        // Reserve 0 for deterministic snapshot-loaded CRDT items so anchor
+        // ids from initial file contents are replica-stable across peers.
+        return hash == 0 ? 1 : hash
     }
 
     func participant(forEditorUserID editorUserID: UInt32) -> Participant? {

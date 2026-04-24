@@ -90,6 +90,7 @@ final class EditorController {
     init(docId: UInt64,
          path: String,
          clientId: UInt32,
+         localCursorColor: NSColor,
          snapshot: Data,
          sendOp: @escaping (Data) -> Void,
          sendPresence: @escaping (CrdtId?, CrdtId?) -> Void,
@@ -97,6 +98,7 @@ final class EditorController {
          requestClose: @escaping () -> Void = {})
     {
         self.state = EditorState(docId: docId, path: path, clientId: clientId)
+        self.state.localCursorColor = localCursorColor
         self.sendOp = sendOp
         self.sendPresence = sendPresence
         self.requestSaveAction = requestSave

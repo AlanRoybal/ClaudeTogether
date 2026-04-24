@@ -195,7 +195,7 @@ final class EditorGridModel: ObservableObject {
         if let local = visibleCursor(
             id: localCursorID,
             offset: state.localCaret,
-            color: 0xF5F7FA,
+            color: packed(state.localCursorColor),
             isLocal: true)
         {
             next.append(local)
