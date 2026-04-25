@@ -92,6 +92,9 @@ final class TerminalModel: ObservableObject {
             self.syncGridSharedInputOverlay()
             self.syncEditorParticipants()
         }.store(in: &cancellables)
+        sessionManager.$accessMode.sink { [weak self] _ in
+            self?.syncEditorReadOnlyState()
+        }.store(in: &cancellables)
 
         // Route inbound frames.
         sessionManager.onFrame = { [weak self] frame, peerID in
@@ -137,8 +140,18 @@ final class TerminalModel: ObservableObject {
         sessionManager.remoteMode == .raw
     }
 
-    /// False when the terminal view should drop keystrokes (peer + creator-only mode).
-    var inputEnabled: Bool { !showRawBanner }
+    /// True when the host has put the session into view-only mode and we
+    /// are observing as a peer.
+    var isViewOnlyPeer: Bool {
+        sessionManager.role == .peer &&
+        sessionManager.state == .running &&
+        sessionManager.accessMode == .viewOnly
+    }
+
+    /// False when the terminal view should drop keystrokes:
+    /// either the host is in creator-only mode (raw) or the host has
+    /// flipped access to view-only.
+    var inputEnabled: Bool { !showRawBanner && !isViewOnlyPeer }
 
     // MARK: host session
 
@@ -268,6 +281,13 @@ final class TerminalModel: ObservableObject {
 
     /// Called by MetalTerminalView when the user types.
     func handleKey(_ bytes: [UInt8]) {
+        // View-only enforcement: the MetalTerminalNSView already gates via
+        // `inputEnabled`, but defend in depth so a programmatic call site
+        // can't bypass the policy. The host always types locally.
+        if isViewOnlyPeer {
+            NSSound.beep()
+            return
+        }
         if isHostSharedLineSession || isPeerSharedLineSession {
             _ = handleSharedInputKey(bytes)
             return
@@ -325,6 +345,7 @@ final class TerminalModel: ObservableObject {
             if sessionManager.role == .host, sessionManager.state == .running {
                 syncSharedInputParticipants(broadcast: false)
                 sessionManager.sendMode(lastLocalCreatorOnlyMode ? .raw : .line)
+                sessionManager.broadcastAccessMode()
                 broadcastTerminalSnapshot()
                 broadcastSharedInputSnapshot()
                 if let editor = activeEditor {
@@ -361,6 +382,10 @@ final class TerminalModel: ObservableObject {
         case .editorOp(let docId, let opBytes):
             guard let editor = activeEditor, editor.state.docId == docId else { return }
             if sessionManager.role == .host {
+                // Host-side enforcement: in view-only access mode, inbound
+                // editor ops can only have come from a peer, so drop them
+                // and don't fan them out.
+                if sessionManager.accessMode == .viewOnly { return }
                 editor.onRemoteOp(opBytes)
                 sessionManager.sendEditorOp(docId: docId, opBytes: opBytes)
             } else {
@@ -464,7 +489,8 @@ final class TerminalModel: ObservableObject {
 
     private var canUsePeerSharedInput: Bool {
         isPeerSharedLineSession &&
-        sharedInput.isActive
+        sharedInput.isActive &&
+        sessionManager.accessMode == .full
     }
 
     private func handleSharedInputKey(_ bytes: [UInt8]) -> Bool {
@@ -850,6 +876,7 @@ final class TerminalModel: ObservableObject {
         }
 
         activeEditor = controller
+        syncEditorReadOnlyState()
         controller.broadcastPresenceNow()
     }
 
@@ -932,6 +959,15 @@ final class TerminalModel: ObservableObject {
         for identity in Array(editor.state.remoteCursors.keys) where !live.contains(identity) {
             editor.removeRemoteUser(identity)
         }
+    }
+
+    /// Mirror the SessionManager's access policy onto the active editor.
+    /// Hosts always retain edit rights; peers go read-only when the host
+    /// has flipped access to view-only.
+    private func syncEditorReadOnlyState() {
+        guard let editor = activeEditor else { return }
+        editor.isReadOnly = sessionManager.role == .peer
+            && sessionManager.accessMode == .viewOnly
     }
 
     private func resolveEditorURL(sessionPath: String) -> URL? {

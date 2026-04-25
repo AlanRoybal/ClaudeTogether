@@ -14,6 +14,7 @@ enum FrameTag: UInt8 {
     case modeChange  = 0x08
     case roster      = 0x09
     case heartbeat   = 0x0A
+    case accessMode  = 0x0B
     // Collaborative editor frames (0x10..0x15). Tags start at 0x10 to leave
     // room above the core session frames; must match `Tag` in frame.zig.
     case editorOpen      = 0x10
@@ -32,6 +33,14 @@ enum SessionRole: UInt8 {
 enum TermMode: UInt8 {
     case line = 0
     case raw  = 1
+}
+
+/// Host-controlled session access policy. Peers consult this to decide
+/// whether their input (terminal keystrokes, shared input, editor ops)
+/// should be allowed to leave the box. The host is always full-access.
+enum AccessMode: UInt8 {
+    case full     = 0
+    case viewOnly = 1
 }
 
 typealias UserID = (UInt8, UInt8, UInt8, UInt8,
@@ -102,6 +111,7 @@ enum Frame {
     case modeChange(TermMode)
     case roster([RosterEntry])
     case heartbeat
+    case accessMode(AccessMode)
     case editorOpen(docId: UInt64, path: String, snapshot: Data)
     case editorOp(docId: UInt64, opBytes: Data)
     case editorPresence(docId: UInt64, userId: UInt32,
@@ -181,6 +191,9 @@ enum FrameCodec {
             }
         case .heartbeat:
             out.append(FrameTag.heartbeat.rawValue)
+        case .accessMode(let mode):
+            out.append(FrameTag.accessMode.rawValue)
+            out.append(mode.rawValue)
         case .editorOpen(let docId, let path, let snapshot):
             out.append(FrameTag.editorOpen.rawValue)
             appendU64(&out, docId)
@@ -302,6 +315,12 @@ enum FrameCodec {
             return .roster(entries)
         case .heartbeat:
             return .heartbeat
+        case .accessMode:
+            let mByte = try r.readU8()
+            guard let mode = AccessMode(rawValue: mByte) else {
+                throw FrameCodecError.invalidEnum
+            }
+            return .accessMode(mode)
         case .editorOpen:
             let docId = try r.readU64()
             let pathLen = try r.readU16()

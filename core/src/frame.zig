@@ -22,6 +22,9 @@ pub const Tag = enum(u8) {
     roster = 0x09,
     /// Lightweight keepalive frame to keep idle tunnels/sockets warm.
     heartbeat = 0x0A,
+    /// Host announces the active access mode (full / view-only) so peers
+    /// know whether their input should be accepted.
+    access_mode = 0x0B,
     // --- collaborative editor frames (0x10..0x15) -------------------------
     // Tags start at 0x10 to leave room above the core session frames.
     /// Host announces an editor is open with initial file contents.
@@ -46,6 +49,19 @@ pub const Role = enum(u8) {
 pub const Mode = enum(u8) {
     line = 0,
     raw = 1,
+};
+
+pub const Access = enum(u8) {
+    /// Default. Peers can send keystrokes, edit shared files, and type into
+    /// the shared input line.
+    full = 0,
+    /// Peers cannot mutate any shared state; they only observe the host's
+    /// terminal output, file tree, and editor.
+    view_only = 1,
+};
+
+pub const AccessMode = struct {
+    mode: Access,
 };
 
 pub const UserId = [16]u8;
@@ -154,6 +170,7 @@ pub const Frame = union(Tag) {
     /// opaque bytes passing through the transport layer.
     roster: void,
     heartbeat: void,
+    access_mode: AccessMode,
     editor_open: EditorOpen,
     editor_op: EditorOp,
     editor_presence: EditorPresence,
@@ -286,6 +303,12 @@ pub fn decode(bytes: []const u8) DecodeError!Frame {
             break :blk Frame{ .mode_change = .{ .mode = mode } };
         },
         .heartbeat => Frame{ .heartbeat = {} },
+        .access_mode => blk: {
+            const a_b = try r.readU8();
+            const access = std.meta.intToEnum(Access, a_b) catch
+                return error.InvalidEnum;
+            break :blk Frame{ .access_mode = .{ .mode = access } };
+        },
         .editor_open => blk: {
             const doc_id = try r.readU64();
             const path_len = try r.readU16();
@@ -423,6 +446,7 @@ pub fn encode(frame: Frame, out: []u8) EncodeError!usize {
         },
         .mode_change => |p| try w.writeU8(@intFromEnum(p.mode)),
         .heartbeat => {},
+        .access_mode => |p| try w.writeU8(@intFromEnum(p.mode)),
         .editor_open => |p| {
             try w.writeU64(p.doc_id);
             try w.writeU16(@intCast(p.path.len));
@@ -464,6 +488,7 @@ pub fn encodedLen(frame: Frame) usize {
         .hello => |p| 1 + 16 + 1 + 4 + 2 + p.name.len,
         .mode_change => 1 + 1,
         .heartbeat => 1,
+        .access_mode => 1 + 1,
         .editor_open => |p| 1 + 8 + 2 + p.path.len + 4 + p.snapshot.len,
         .editor_op => |p| 1 + 8 + 4 + p.op_bytes.len,
         // doc_id + user_id + two optional CrdtIds (each: 1 tag + up to 8 body)
@@ -534,6 +559,20 @@ test "heartbeat roundtrip" {
     const n = try encode(Frame{ .heartbeat = {} }, &buf);
     const decoded = try decode(buf[0..n]);
     try std.testing.expectEqual(Tag.heartbeat, @as(Tag, decoded));
+}
+
+test "access_mode roundtrip full" {
+    var buf: [8]u8 = undefined;
+    const n = try encode(Frame{ .access_mode = .{ .mode = .full } }, &buf);
+    const decoded = try decode(buf[0..n]);
+    try std.testing.expectEqual(Access.full, decoded.access_mode.mode);
+}
+
+test "access_mode roundtrip view_only" {
+    var buf: [8]u8 = undefined;
+    const n = try encode(Frame{ .access_mode = .{ .mode = .view_only } }, &buf);
+    const decoded = try decode(buf[0..n]);
+    try std.testing.expectEqual(Access.view_only, decoded.access_mode.mode);
 }
 
 test "input_commit roundtrip" {
