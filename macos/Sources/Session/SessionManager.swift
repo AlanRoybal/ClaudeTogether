@@ -252,6 +252,54 @@ final class SessionManager: ObservableObject {
         broadcast(.modeChange(mode))
     }
 
+    // MARK: tab send helpers (host only)
+
+    /// Host only: announce a new tab (broadcast or directed).
+    func sendTabOpen(tabId: UInt32, title: String,
+                     toTransportPeerID peerID: UInt32? = nil)
+    {
+        guard role == .host, state == .running else { return }
+        let frame = Frame.tabOpen(tabId: tabId, title: title)
+        if let peerID {
+            send(frame, toTransportPeerID: peerID)
+        } else {
+            broadcast(frame)
+        }
+    }
+
+    /// Host only: announce a tab teardown.
+    func sendTabClose(tabId: UInt32) {
+        guard role == .host, state == .running else { return }
+        broadcast(.tabClose(tabId: tabId))
+    }
+
+    /// Host only: announce which tab is currently focused (broadcast or
+    /// directed). Peers use this to align their active grid with the host.
+    func sendTabFocus(tabId: UInt32,
+                      toTransportPeerID peerID: UInt32? = nil)
+    {
+        guard role == .host, state == .running else { return }
+        let frame = Frame.tabFocus(tabId: tabId)
+        if let peerID {
+            send(frame, toTransportPeerID: peerID)
+        } else {
+            broadcast(frame)
+        }
+    }
+
+    /// Host only: fan a chunk of PTY output for a specific tab to peers.
+    func sendTabPtyOutput(tabId: UInt32, data: Data,
+                          toTransportPeerID peerID: UInt32? = nil)
+    {
+        guard role == .host, state == .running, !data.isEmpty else { return }
+        let frame = Frame.tabPtyOutput(tabId: tabId, data: data)
+        if let peerID {
+            send(frame, toTransportPeerID: peerID)
+        } else {
+            broadcast(frame)
+        }
+    }
+
     /// Peer only: ship keystroke bytes to the host as an opaque `inputOp`
     /// payload. (Full CRDT merge is a future step; Phase 3 uses this as a
     /// "raw-bytes passthrough" so end-to-end shared typing works.)

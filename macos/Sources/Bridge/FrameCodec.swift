@@ -14,6 +14,12 @@ enum FrameTag: UInt8 {
     case modeChange  = 0x08
     case roster      = 0x09
     case heartbeat   = 0x0A
+    // Multi-tab frames (0x0C..0x0F). Each session can host N concurrent PTY
+    // shells; these tags carry per-tab lifecycle and per-tab PTY output.
+    case tabOpen      = 0x0C
+    case tabClose     = 0x0D
+    case tabFocus     = 0x0E
+    case tabPtyOutput = 0x0F
     // Collaborative editor frames (0x10..0x15). Tags start at 0x10 to leave
     // room above the core session frames; must match `Tag` in frame.zig.
     case editorOpen      = 0x10
@@ -102,6 +108,10 @@ enum Frame {
     case modeChange(TermMode)
     case roster([RosterEntry])
     case heartbeat
+    case tabOpen(tabId: UInt32, title: String)
+    case tabClose(tabId: UInt32)
+    case tabFocus(tabId: UInt32)
+    case tabPtyOutput(tabId: UInt32, data: Data)
     case editorOpen(docId: UInt64, path: String, snapshot: Data)
     case editorOp(docId: UInt64, opBytes: Data)
     case editorPresence(docId: UInt64, userId: UInt32,
@@ -181,6 +191,23 @@ enum FrameCodec {
             }
         case .heartbeat:
             out.append(FrameTag.heartbeat.rawValue)
+        case .tabOpen(let tabId, let title):
+            out.append(FrameTag.tabOpen.rawValue)
+            appendU32(&out, tabId)
+            let utf8 = Array(title.utf8)
+            appendU16(&out, UInt16(min(utf8.count, Int(UInt16.max))))
+            out.append(contentsOf: utf8.prefix(Int(UInt16.max)))
+        case .tabClose(let tabId):
+            out.append(FrameTag.tabClose.rawValue)
+            appendU32(&out, tabId)
+        case .tabFocus(let tabId):
+            out.append(FrameTag.tabFocus.rawValue)
+            appendU32(&out, tabId)
+        case .tabPtyOutput(let tabId, let data):
+            out.append(FrameTag.tabPtyOutput.rawValue)
+            appendU32(&out, tabId)
+            appendU32(&out, UInt32(data.count))
+            out.append(data)
         case .editorOpen(let docId, let path, let snapshot):
             out.append(FrameTag.editorOpen.rawValue)
             appendU64(&out, docId)
@@ -302,6 +329,23 @@ enum FrameCodec {
             return .roster(entries)
         case .heartbeat:
             return .heartbeat
+        case .tabOpen:
+            let tabId = try r.readU32()
+            let titleLen = try r.readU16()
+            let titleBytes = try r.readBytes(Int(titleLen))
+            let title = String(data: titleBytes, encoding: .utf8) ?? ""
+            return .tabOpen(tabId: tabId, title: title)
+        case .tabClose:
+            let tabId = try r.readU32()
+            return .tabClose(tabId: tabId)
+        case .tabFocus:
+            let tabId = try r.readU32()
+            return .tabFocus(tabId: tabId)
+        case .tabPtyOutput:
+            let tabId = try r.readU32()
+            let n = try r.readU32()
+            let payload = try r.readBytes(Int(n))
+            return .tabPtyOutput(tabId: tabId, data: payload)
         case .editorOpen:
             let docId = try r.readU64()
             let pathLen = try r.readU16()

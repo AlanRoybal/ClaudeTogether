@@ -15,14 +15,19 @@ struct ContentView: View {
                     EditorHost(controller: controller)
                         .frame(minWidth: 500, minHeight: 300)
                 } else if let grid = model.grid {
-                    MetalTerminalView(
-                        grid: grid,
-                        onKey: { model.handleKey($0) },
-                        onResize: { cols, rows in
-                            model.handleResize(cols: cols, rows: rows)
-                        },
-                        inputEnabled: model.inputEnabled)
-                        .frame(minWidth: 500, minHeight: 300)
+                    VStack(spacing: 0) {
+                        if model.shouldShowTabStrip {
+                            TabStripView(model: model)
+                        }
+                        MetalTerminalView(
+                            grid: grid,
+                            onKey: { model.handleKey($0) },
+                            onResize: { cols, rows in
+                                model.handleResize(cols: cols, rows: rows)
+                            },
+                            inputEnabled: model.inputEnabled)
+                            .frame(minWidth: 500, minHeight: 300)
+                    }
                 } else {
                     VStack(spacing: 16) {
                         Text("ClaudeTogether")
@@ -52,18 +57,55 @@ struct ContentView: View {
     }
 }
 
+/// One tab in a session. Each tab owns its own grid; on the host each tab
+/// also owns a PTY shell (peer tabs are display-only and have nil pty).
+struct TabState: Identifiable {
+    let id: UInt32
+    var title: String
+    /// Host: the PTY backing this tab. Peer: nil (display-only mirror).
+    let pty: PTYSession?
+    /// Render target for this tab. The active tab's grid is the one that
+    /// `MetalTerminalView` is currently rendering.
+    let grid: GridModel
+}
+
+extension Notification.Name {
+    static let ctTabsNew = Notification.Name("ct.tabs.new")
+    static let ctTabsClose = Notification.Name("ct.tabs.close")
+    static let ctTabsNext = Notification.Name("ct.tabs.next")
+    static let ctTabsPrevious = Notification.Name("ct.tabs.previous")
+}
+
 @MainActor
 final class TerminalModel: ObservableObject {
-    /// Single source of truth for rendered cells. Created when a local PTY
-    /// spawns (host) or when a peer connects to a shared session (peer).
-    @Published var grid: GridModel?
-    @Published var pty: PTYSession?
+    /// All open tabs. On the host, each tab owns a PTY; on peers they're
+    /// display-only mirrors fed by inbound TabPtyOutput frames.
+    @Published var tabs: [TabState] = []
+    /// Which tab is currently focused (the one MetalTerminalView renders).
+    @Published var activeTabId: UInt32?
+
     @Published var rootPath: String?
     @Published var boreBundlePath: String?
     @Published var coreVersion: Int32 = 0
     @Published var activeEditor: EditorController?
 
     let sessionManager = SessionManager()
+
+    /// Compatibility shim: returns the active tab's grid. Kept so existing
+    /// call sites that read `model.grid` (renderer, sidebar, snapshot helpers)
+    /// continue to work after the multi-tab refactor.
+    var grid: GridModel? { tabs.first(where: { $0.id == activeTabId })?.grid }
+    /// Compatibility shim: returns the active tab's PTY (nil for peer tabs).
+    var pty: PTYSession? { tabs.first(where: { $0.id == activeTabId })?.pty }
+
+    private var activeTab: TabState? {
+        tabs.first(where: { $0.id == activeTabId })
+    }
+    private var nextTabId: UInt32 = 1
+
+    /// Hide the tab strip when a session has at most one tab so the
+    /// single-tab UX is identical to the pre-tabs implementation.
+    var shouldShowTabStrip: Bool { tabs.count > 1 }
 
     /// Host only: edge-detector for creator-only mode. We currently treat the
     /// terminal alternate screen as the signal for "a full-screen app owns the
@@ -108,6 +150,28 @@ final class TerminalModel: ObservableObject {
                 self?.startSharing()
             }
         }
+
+        // Menubar / keyboard-shortcut hooks for tabs (see App.swift commands).
+        NotificationCenter.default.addObserver(
+            forName: .ctTabsNew, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.openNewTab() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .ctTabsClose, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.closeActiveTab() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .ctTabsNext, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.nextTab() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .ctTabsPrevious, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.previousTab() }
+        }
     }
 
     private var cancellables = Set<AnyCancellable>()
@@ -144,50 +208,23 @@ final class TerminalModel: ObservableObject {
 
     func startSession() {
         guard let folder = FolderPicker.pick() else { return }
-        let s = PTYSession()
-        guard s.spawn(cwd: folder) else {
-            NSLog("PTY spawn failed")
-            return
-        }
-        guard let g = GridModel(cols: 80, rows: 24) else {
-            NSLog("GridModel init failed")
-            s.terminate()
-            return
-        }
-        // Host: PTY output → feed grid AND broadcast to peers.
-        s.onOutput = { [weak self] bytes in
-            guard let self = self else { return }
-            self.grid?.feed(bytes)
-            let shouldShare = self.sessionManager.role == .host
-                && self.sessionManager.state == .running
-            NSLog("[ct] pty->out bytes=%d share=%@",
-                  bytes.count, shouldShare ? "Y" : "N")
-            if shouldShare {
-                self.sessionManager.sendPtyOutput(Data(bytes))
-            }
-            // Mode may have flipped as a side effect of stty / app launch.
-            self.probeLocalMode()
-            if shouldShare {
-                self.handleHostPtyOutput()
-            }
-        }
-        s.onExit = { [weak self] in
-            let msg: [UInt8] = Array("\r\n[process exited]\r\n".utf8)
-            self?.grid?.feed(msg)
-        }
         rootPath = folder
-        pty = s
-        grid = g
         fileSyncWatcher = nil
         fileSyncApplier.configure(rootPath: nil)
+        // Default to one tab so the single-session UX matches the pre-tabs
+        // experience. Subsequent tabs are user-initiated (⌘T / +).
+        openNewTab()
         startModeProbe()
         syncGridSharedInputOverlay()
     }
 
     func endSession() {
-        pty?.terminate()
-        pty = nil
-        grid = nil
+        for tab in tabs {
+            tab.pty?.terminate()
+        }
+        tabs.removeAll()
+        activeTabId = nil
+        nextTabId = 1
         rootPath = nil
         activeEditor = nil
         editorSavedRevisions.removeAll()
@@ -196,6 +233,163 @@ final class TerminalModel: ObservableObject {
         stopFileSyncPolling()
         fileSyncApplier.configure(rootPath: nil)
         resetSharedInputState()
+    }
+
+    // MARK: tabs
+
+    /// Host: spawn a new PTY at the current rootPath, allocate a tab id,
+    /// broadcast TabOpen + TabFocus, and switch to the new tab.
+    func openNewTab() {
+        guard sessionManager.role == .host else { return }
+        guard let folder = rootPath ?? activeTab.flatMap({ _ in rootPath }) else {
+            // No session yet — bootstrap one.
+            startSession()
+            return
+        }
+        let tabId = nextTabId
+        nextTabId &+= 1
+        let title = "Shell \(tabId)"
+        guard let tab = makeHostTab(id: tabId, title: title, cwd: folder) else {
+            return
+        }
+        tabs.append(tab)
+        activeTabId = tabId
+        if sessionManager.state == .running {
+            sessionManager.sendTabOpen(tabId: tabId, title: title)
+            sessionManager.sendTabFocus(tabId: tabId)
+        }
+        syncGridSharedInputOverlay()
+    }
+
+    /// Host: close a tab by id. Terminates the PTY, broadcasts TabClose, and
+    /// if the closed tab was active, switches focus to a sibling. Closing the
+    /// last tab is treated as ending the session.
+    func closeTab(id: UInt32) {
+        guard sessionManager.role == .host else { return }
+        guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
+        let tab = tabs[idx]
+        tab.pty?.terminate()
+        tabs.remove(at: idx)
+        if sessionManager.state == .running {
+            sessionManager.sendTabClose(tabId: id)
+        }
+        if activeTabId == id {
+            if let next = tabs.first {
+                focusTab(id: next.id)
+            } else {
+                activeTabId = nil
+                // Last tab gone — tear down the rest of the session.
+                endSession()
+            }
+        }
+    }
+
+    func closeActiveTab() {
+        guard let id = activeTabId else { return }
+        closeTab(id: id)
+    }
+
+    /// Update which tab is focused. On the host this is the source of truth
+    /// and is broadcast via TabFocus; on the peer this is also called from
+    /// inbound TabFocus frames (without re-broadcasting).
+    func focusTab(id: UInt32) {
+        guard tabs.contains(where: { $0.id == id }) else { return }
+        activeTabId = id
+        if sessionManager.role == .host, sessionManager.state == .running {
+            sessionManager.sendTabFocus(tabId: id)
+            // Re-paint legacy peers' single-grid view to match the new
+            // active tab — they only see content from the bare PtyOutput
+            // channel and would otherwise stay stuck on the old tab's
+            // last frame.
+            broadcastTerminalSnapshot()
+        }
+        syncGridSharedInputOverlay()
+        // Mode/raw-screen state is per-tab; re-probe so the banner/raw-mode
+        // signal reflects the new active tab right away.
+        probeLocalMode(force: true)
+    }
+
+    func nextTab() {
+        guard !tabs.isEmpty else { return }
+        guard let activeId = activeTabId,
+              let idx = tabs.firstIndex(where: { $0.id == activeId })
+        else {
+            focusTab(id: tabs[0].id)
+            return
+        }
+        let next = tabs[(idx + 1) % tabs.count]
+        focusTab(id: next.id)
+    }
+
+    func previousTab() {
+        guard !tabs.isEmpty else { return }
+        guard let activeId = activeTabId,
+              let idx = tabs.firstIndex(where: { $0.id == activeId })
+        else {
+            focusTab(id: tabs[0].id)
+            return
+        }
+        let count = tabs.count
+        let prev = tabs[(idx - 1 + count) % count]
+        focusTab(id: prev.id)
+    }
+
+    private func makeHostTab(id: UInt32, title: String, cwd: String) -> TabState? {
+        // Match the user's current viewport so the new tab's PTY and grid
+        // come up at the same size the renderer is about to lay them out at,
+        // not the default 80x24.
+        let cols = activeTab?.grid.cols ?? 80
+        let rows = activeTab?.grid.rows ?? 24
+        let pty = PTYSession()
+        guard pty.spawn(cwd: cwd, cols: cols, rows: rows) else {
+            NSLog("PTY spawn failed for tab %u", id)
+            return nil
+        }
+        guard let grid = GridModel(cols: cols, rows: rows) else {
+            NSLog("GridModel init failed for tab %u", id)
+            pty.terminate()
+            return nil
+        }
+        // Host: PTY output → feed this tab's grid AND fan out to peers.
+        pty.onOutput = { [weak self] bytes in
+            guard let self = self else { return }
+            guard let tab = self.tabs.first(where: { $0.id == id }) else { return }
+            tab.grid.feed(bytes)
+            let shouldShare = self.sessionManager.role == .host
+                && self.sessionManager.state == .running
+            NSLog("[ct] pty->out tab=%u bytes=%d share=%@",
+                  id, bytes.count, shouldShare ? "Y" : "N")
+            if shouldShare {
+                let payload = Data(bytes)
+                self.sessionManager.sendTabPtyOutput(tabId: id, data: payload)
+                // Backward compat: legacy peers (and our own legacy code path)
+                // expect bare PtyOutput frames for the active tab.
+                if id == self.activeTabId {
+                    self.sessionManager.sendPtyOutput(payload)
+                }
+            }
+            // Mode probe is per-tab via the active grid; only re-probe when
+            // output landed on the active tab.
+            if id == self.activeTabId {
+                self.probeLocalMode()
+                if shouldShare {
+                    self.handleHostPtyOutput()
+                }
+            }
+        }
+        pty.onExit = { [weak self] in
+            let msg: [UInt8] = Array("\r\n[process exited]\r\n".utf8)
+            self?.tabs.first(where: { $0.id == id })?.grid.feed(msg)
+        }
+        return TabState(id: id, title: title, pty: pty, grid: grid)
+    }
+
+    private func makePeerTab(id: UInt32, title: String) -> TabState? {
+        guard let grid = GridModel(cols: 80, rows: 24) else {
+            NSLog("GridModel init failed for peer tab %u", id)
+            return nil
+        }
+        return TabState(id: id, title: title, pty: nil, grid: grid)
     }
 
     // MARK: sharing
@@ -248,21 +442,32 @@ final class TerminalModel: ObservableObject {
             return
         }
         // Tear down any existing session (local PTY or stale peer) before
-        // joining — peers have no PTY.
+        // joining — peers have no PTY of their own.
         endSession()
         sessionManager.stop()
 
-        // Peer path: create a display-only grid fed by inbound .ptyOutput.
-        guard let g = GridModel(cols: 80, rows: 24) else {
-            NSLog("GridModel init failed")
+        // Peer path: create a placeholder display-only tab so the UI is
+        // populated immediately. This tab is replaced by real tabs as soon
+        // as the host announces them via TabOpen frames; it also serves as
+        // a fallback target for any legacy bare PtyOutput frames.
+        guard let placeholder = makePeerTab(
+            id: TerminalModel.placeholderTabId,
+            title: "Shell")
+        else {
+            NSLog("placeholder tab create failed")
             return
         }
-        grid = g
+        tabs = [placeholder]
+        activeTabId = placeholder.id
         rootPath = peerRoot
         fileSyncApplier.configure(rootPath: peerRoot)
         resetSharedInputState()
         sessionManager.joinPeer(host: host, port: port)
     }
+
+    /// Sentinel id used for the peer-side placeholder tab created on join.
+    /// Replaced as soon as the host announces a real tab via TabOpen.
+    static let placeholderTabId: UInt32 = .max
 
     // MARK: keystroke + resize handling
 
@@ -287,11 +492,14 @@ final class TerminalModel: ObservableObject {
         }
     }
 
-    /// Called when the Metal renderer re-measures the terminal grid.
+    /// Called when the Metal renderer re-measures the terminal grid. We
+    /// resize every tab's grid (and host PTY) so output streamed while a
+    /// tab is inactive still renders correctly when the user switches to it.
     func handleResize(cols: UInt16, rows: UInt16) {
-        pty?.resize(cols: cols, rows: rows)
-        // Peers size their grid to their own viewport; the host-side PTY
-        // determines wrap/scroll.
+        for tab in tabs {
+            tab.pty?.resize(cols: cols, rows: rows)
+            tab.grid.resize(cols: cols, rows: rows)
+        }
     }
 
     // MARK: inbound frames
@@ -303,10 +511,18 @@ final class TerminalModel: ObservableObject {
                   data.count,
                   sessionManager.role == .peer ? "peer" : "host",
                   grid != nil ? "Y" : "N")
-            // Peers render the host's PTY stream; hosts ignore (they're the
-            // source).
+            // Peers prefer per-tab TabPtyOutput frames. Legacy bare
+            // PtyOutput is treated as a backward-compat fallback: feed it
+            // only when we have no real tabs yet (i.e. just the join-time
+            // placeholder, or nothing at all). Once any real TabOpen has
+            // arrived, ignore it — otherwise the host's active tab would
+            // overwrite whichever tab the peer has chosen to view.
             if sessionManager.role == .peer {
-                grid?.feed(Array(data))
+                let onlyPlaceholder = tabs.count == 1
+                    && tabs[0].id == TerminalModel.placeholderTabId
+                if tabs.isEmpty || onlyPlaceholder {
+                    grid?.feed(Array(data))
+                }
             }
         case .inputOp(let data):
             NSLog("[ct] inbound inputOp bytes=%d role=%@ pty=%@",
@@ -325,6 +541,10 @@ final class TerminalModel: ObservableObject {
             if sessionManager.role == .host, sessionManager.state == .running {
                 syncSharedInputParticipants(broadcast: false)
                 sessionManager.sendMode(lastLocalCreatorOnlyMode ? .raw : .line)
+                // Send current tab list (TabOpen + per-tab snapshot + TabFocus)
+                // to the joining peer so it materializes the same tabs we have.
+                sendTabSnapshots(toTransportPeerID: peerID)
+                // Legacy bare-PtyOutput snapshot for backward compat.
                 broadcastTerminalSnapshot()
                 broadcastSharedInputSnapshot()
                 if let editor = activeEditor {
@@ -338,6 +558,49 @@ final class TerminalModel: ObservableObject {
             } else {
                 syncSharedInputParticipants(broadcast: false)
             }
+        case .tabOpen(let tabId, let title):
+            guard sessionManager.role == .peer else { return }
+            // Replace the placeholder once a real tab announces itself so we
+            // don't leave a phantom "Shell" entry around.
+            if tabId != TerminalModel.placeholderTabId,
+               tabs.count == 1,
+               tabs[0].id == TerminalModel.placeholderTabId
+            {
+                let placeholder = tabs.removeFirst()
+                if activeTabId == placeholder.id {
+                    activeTabId = nil
+                }
+            }
+            if !tabs.contains(where: { $0.id == tabId }) {
+                if let tab = makePeerTab(id: tabId, title: title) {
+                    // Match the live grid size so output streamed in via
+                    // TabPtyOutput renders at the user's viewport size.
+                    if let template = activeTab?.grid {
+                        tab.grid.resize(cols: template.cols, rows: template.rows)
+                    }
+                    tabs.append(tab)
+                    if activeTabId == nil {
+                        activeTabId = tabId
+                    }
+                }
+            }
+        case .tabClose(let tabId):
+            guard sessionManager.role == .peer else { return }
+            if let idx = tabs.firstIndex(where: { $0.id == tabId }) {
+                tabs.remove(at: idx)
+            }
+            if activeTabId == tabId {
+                activeTabId = tabs.first?.id
+            }
+        case .tabFocus(let tabId):
+            guard sessionManager.role == .peer else { return }
+            if tabs.contains(where: { $0.id == tabId }) {
+                activeTabId = tabId
+                syncGridSharedInputOverlay()
+            }
+        case .tabPtyOutput(let tabId, let data):
+            guard sessionManager.role == .peer else { return }
+            tabs.first(where: { $0.id == tabId })?.grid.feed(Array(data))
         case .fsDelta(let delta):
             guard sessionManager.role == .peer else { return }
             fileSyncApplier.apply(delta)
@@ -671,6 +934,33 @@ final class TerminalModel: ObservableObject {
         let bytes = encodeTerminalSnapshot(from: grid)
         guard !bytes.isEmpty else { return }
         sessionManager.sendPtyOutput(Data(bytes))
+    }
+
+    /// Send a TabOpen + per-tab snapshot + TabFocus to a freshly-joined peer
+    /// so its tab strip and grids match the host's state. Companion to the
+    /// legacy bare-PtyOutput snapshot sent by `broadcastTerminalSnapshot()`.
+    private func sendTabSnapshots(toTransportPeerID peerID: UInt32) {
+        guard sessionManager.role == .host,
+              sessionManager.state == .running
+        else { return }
+        for tab in tabs {
+            sessionManager.sendTabOpen(
+                tabId: tab.id,
+                title: tab.title,
+                toTransportPeerID: peerID)
+            let bytes = encodeTerminalSnapshot(from: tab.grid)
+            if !bytes.isEmpty {
+                sessionManager.sendTabPtyOutput(
+                    tabId: tab.id,
+                    data: Data(bytes),
+                    toTransportPeerID: peerID)
+            }
+        }
+        if let activeId = activeTabId {
+            sessionManager.sendTabFocus(
+                tabId: activeId,
+                toTransportPeerID: peerID)
+        }
     }
 
     private func encodeTerminalSnapshot(from grid: GridModel) -> [UInt8] {
@@ -1020,6 +1310,9 @@ final class TerminalModel: ObservableObject {
         grid?.feed(bytes)
         if sessionManager.role == .host, sessionManager.state == .running {
             sessionManager.sendPtyOutput(Data(bytes))
+            if let activeId = activeTabId {
+                sessionManager.sendTabPtyOutput(tabId: activeId, data: Data(bytes))
+            }
         }
     }
 
