@@ -70,6 +70,17 @@ int      ct_term_is_using_alt(ct_term *t);
 /* Monotonic counter bumped on any grid mutation. Swift redraws when this changes. */
 uint32_t ct_term_dirty_epoch(ct_term *t);
 
+/* Bitmask of currently-active mouse-reporting modes. The running terminal app
+ * sets these via DECSET (CSI ?h); Swift consults the bits to decide whether to
+ * forward macOS mouse events to the PTY using the SGR (1006) encoding. 0 = no
+ * mouse mode active, default NSView behavior should apply. */
+#define CT_MOUSE_X10   (1u << 0) /* DECSET 1000  — press/release only        */
+#define CT_MOUSE_DRAG  (1u << 1) /* DECSET 1002  — press/release + drag      */
+#define CT_MOUSE_MOVE  (1u << 2) /* DECSET 1003  — any motion                */
+#define CT_MOUSE_SGR   (1u << 3) /* DECSET 1006  — xterm SGR encoding        */
+#define CT_MOUSE_URXVT (1u << 4) /* DECSET 1015  — urxvt encoding (rarely)   */
+uint32_t ct_term_mouse_mode(ct_term *t);
+
 /* ---- Session (Phase 3) ----------------------------------------------- */
 
 typedef struct ct_session ct_session;

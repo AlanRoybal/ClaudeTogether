@@ -72,4 +72,47 @@ final class TermCore {
         guard let h = handle else { return 0 }
         return ct_term_dirty_epoch(h)
     }
+
+    // MARK: mouse-reporting modes
+    //
+    // The running app sets/clears these via DECSET 1000/1002/1003/1006/1015.
+    // The Zig core just records the bits; encoding macOS NSEvents to PTY
+    // input bytes happens in `MetalTerminalNSView`.
+    //
+    // Bit values mirror `CT_MOUSE_*` macros in `collabterm.h`. We hard-code
+    // them here so Swift doesn't depend on whether the importer translates
+    // the parenthesized `(1u << N)` macros into typed constants — that
+    // behavior can be inconsistent across Xcode releases.
+
+    /// Bitmask values matching `CT_MOUSE_*` in `collabterm.h`.
+    enum MouseMode {
+        static let x10: UInt32   = 1 << 0  // DECSET 1000
+        static let drag: UInt32  = 1 << 1  // DECSET 1002
+        static let move: UInt32  = 1 << 2  // DECSET 1003
+        static let sgr: UInt32   = 1 << 3  // DECSET 1006
+        static let urxvt: UInt32 = 1 << 4  // DECSET 1015
+    }
+
+    /// Raw bitmask. See `MouseMode` for the bit layout.
+    var mouseModeBits: UInt32 {
+        guard let h = handle else { return 0 }
+        return ct_term_mouse_mode(h)
+    }
+
+    /// True if any mouse-reporting mode is active.
+    var mouseEnabled: Bool { mouseModeBits != 0 }
+
+    /// DECSET 1006 — xterm SGR encoding. The only encoding we currently
+    /// emit; if this bit is missing the running app likely expects the
+    /// legacy X10 byte format which we don't synthesize today.
+    var sgrMouse: Bool { mouseModeBits & MouseMode.sgr != 0 }
+
+    /// DECSET 1000 — report press/release only.
+    var x10Mouse: Bool { mouseModeBits & MouseMode.x10 != 0 }
+
+    /// DECSET 1002 — press/release + motion while a button is held.
+    var dragMouse: Bool { mouseModeBits & MouseMode.drag != 0 }
+
+    /// DECSET 1003 — press/release + every motion, no button required.
+    var anyMotionMouse: Bool { mouseModeBits & MouseMode.move != 0 }
 }

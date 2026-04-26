@@ -31,6 +31,12 @@ struct SessionSidebar: View {
                 Button("Start session…") { model.startSession() }
             }
 
+            // Mouse-reporting (xterm SGR) — when off, mouse events fall
+            // through to default NSView behavior. TUIs that DECSET 1000/
+            // 1002/1003 will still work the moment this is flipped back on.
+            Toggle("Mouse mode", isOn: $model.mouseMode)
+                .help("Forward mouse clicks, drags, scroll, and motion to apps that have requested xterm-style mouse reporting (DECSET 1000/1002/1003 + 1006).")
+
             Divider()
 
             GroupBox("Your name") {

@@ -21,7 +21,8 @@ struct ContentView: View {
                         onResize: { cols, rows in
                             model.handleResize(cols: cols, rows: rows)
                         },
-                        inputEnabled: model.inputEnabled)
+                        inputEnabled: model.inputEnabled,
+                        mouseModeEnabled: model.mouseMode)
                         .frame(minWidth: 500, minHeight: 300)
                 } else {
                     VStack(spacing: 16) {
@@ -62,6 +63,11 @@ final class TerminalModel: ObservableObject {
     @Published var boreBundlePath: String?
     @Published var coreVersion: Int32 = 0
     @Published var activeEditor: EditorController?
+    /// User-visible "Mouse mode" toggle. When false, MetalTerminalView drops
+    /// mouse events on the floor (no SGR encoding, no PTY traffic) regardless
+    /// of what the running app has DECSET. Default ON because most TUIs that
+    /// request mouse reporting expect it to just work.
+    @Published var mouseMode: Bool = true
 
     let sessionManager = SessionManager()
 

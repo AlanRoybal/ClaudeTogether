@@ -111,3 +111,11 @@ export fn ct_term_dirty_epoch(t: ?*Term) u32 {
     if (t) |p| return p.grid.epoch;
     return 0;
 }
+
+/// Returns the active mouse-reporting bitmask. See `Grid.mouse_mode` for the
+/// bit layout. 0 means the running app has not requested any mouse mode and
+/// macOS mouse events should fall through to default NSView behavior.
+export fn ct_term_mouse_mode(t: ?*Term) u32 {
+    if (t) |p| return p.grid.mouse_mode;
+    return 0;
+}

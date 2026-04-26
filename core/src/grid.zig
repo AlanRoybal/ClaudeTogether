@@ -9,7 +9,10 @@
 //!   truecolor, defaults.
 //! - C0 executes: LF/VT/FF, CR, BS, BEL, HT.
 //! - Save/restore cursor: CSI s/u, ESC 7/8 (DECSC/DECRC — via term.zig).
-//! - Private-mode switches (CSI ?h / ?l): 47, 1047, 1048, 1049 (alt screen).
+//! - Private-mode switches (CSI ?h / ?l): 47, 1047, 1048, 1049 (alt screen);
+//!   1000/1002/1003/1006/1015 (mouse-reporting modes — tracked as a bitmask
+//!   on `Grid.mouse_mode`; the actual encoding of macOS mouse events into
+//!   PTY input bytes happens Swift-side in `MetalTerminalNSView`).
 //! - Region + screen editing: DECSTBM, IL/DL, ICH/DCH/ECH, SU/SD.
 //! - Scrollback ring buffer (~10K rows) for the primary buffer.
 //!
@@ -41,6 +44,13 @@ pub const DEFAULT_FG: u32 = 0xCCCCCC;
 pub const DEFAULT_BG: u32 = 0x000000;
 
 pub const SCROLLBACK_ROWS: u32 = 10_000;
+
+/// Mouse-mode bitmask values shared across the C ABI. See `Grid.mouse_mode`.
+pub const MOUSE_BIT_X10: u32 = 1 << 0;
+pub const MOUSE_BIT_DRAG: u32 = 1 << 1;
+pub const MOUSE_BIT_MOVE: u32 = 1 << 2;
+pub const MOUSE_BIT_SGR: u32 = 1 << 3;
+pub const MOUSE_BIT_URXVT: u32 = 1 << 4;
 
 const PALETTE_16 = [_]u32{
     0x000000, 0xCD3131, 0x0DBC79, 0xE5E510, 0x2472C8, 0xBC3FBC, 0x11A8CD, 0xE5E5E5,
@@ -113,6 +123,17 @@ pub const Grid = struct {
     scrollback: Scrollback,
 
     epoch: u32 = 1,
+
+    /// Bitmask of currently-active mouse-reporting modes set by the running
+    /// app via DECSET (CSI ?h) / DECRST (CSI ?l):
+    ///   bit 0 = X10 (1000)        — press/release only
+    ///   bit 1 = drag (1002)       — press/release + motion-while-pressed
+    ///   bit 2 = move (1003)       — press/release + any motion
+    ///   bit 3 = SGR  (1006)       — xterm SGR encoding
+    ///   bit 4 = URXVT (1015)      — urxvt encoding
+    /// Swift-side mouse handlers consult this to decide whether to forward
+    /// macOS mouse events to the PTY.
+    mouse_mode: u32 = 0,
 
     pub fn init(alloc: std.mem.Allocator, cols: u16, rows: u16) !Grid {
         const sz: usize = @as(usize, cols) * @as(usize, rows);
@@ -404,6 +425,11 @@ pub const Grid = struct {
             const p = c.params[i];
             switch (p) {
                 47 => self.switchScreen(set),
+                1000 => self.setMouseModeBit(MOUSE_BIT_X10, set),
+                1002 => self.setMouseModeBit(MOUSE_BIT_DRAG, set),
+                1003 => self.setMouseModeBit(MOUSE_BIT_MOVE, set),
+                1006 => self.setMouseModeBit(MOUSE_BIT_SGR, set),
+                1015 => self.setMouseModeBit(MOUSE_BIT_URXVT, set),
                 1047 => {
                     if (!set) self.clearActive();
                     self.switchScreen(set);
@@ -423,6 +449,14 @@ pub const Grid = struct {
                 },
                 else => {},
             }
+        }
+    }
+
+    fn setMouseModeBit(self: *Grid, bit: u32, on: bool) void {
+        if (on) {
+            self.mouse_mode |= bit;
+        } else {
+            self.mouse_mode &= ~bit;
         }
     }
 
@@ -918,4 +952,45 @@ test "insert and delete chars edit the active row" {
     try std.testing.expectEqual(@as(u32, 'a'), g.cells[0].codepoint);
     try std.testing.expectEqual(@as(u32, 'c'), g.cells[1].codepoint);
     try std.testing.expectEqual(@as(u32, 'd'), g.cells[2].codepoint);
+}
+
+test "mouse modes via DECSET/DECRST update bitmask" {
+    var g = try Grid.init(std.testing.allocator, 4, 2);
+    defer g.deinit();
+    try std.testing.expectEqual(@as(u32, 0), g.mouse_mode);
+
+    // DECSET 1000;1002;1006 in one CSI (matches what xterm apps emit).
+    var enable = vt.Csi{ .final = 'h', .private = '?', .param_count = 3 };
+    enable.params[0] = 1000;
+    enable.params[1] = 1002;
+    enable.params[2] = 1006;
+    g.apply(.{ .csi = enable });
+    try std.testing.expectEqual(
+        MOUSE_BIT_X10 | MOUSE_BIT_DRAG | MOUSE_BIT_SGR,
+        g.mouse_mode,
+    );
+
+    // DECRST 1002 should clear only that bit.
+    var disable_drag = vt.Csi{ .final = 'l', .private = '?', .param_count = 1 };
+    disable_drag.params[0] = 1002;
+    g.apply(.{ .csi = disable_drag });
+    try std.testing.expectEqual(MOUSE_BIT_X10 | MOUSE_BIT_SGR, g.mouse_mode);
+
+    // 1003 (any-motion) is independent.
+    var enable_move = vt.Csi{ .final = 'h', .private = '?', .param_count = 1 };
+    enable_move.params[0] = 1003;
+    g.apply(.{ .csi = enable_move });
+    try std.testing.expectEqual(
+        MOUSE_BIT_X10 | MOUSE_BIT_SGR | MOUSE_BIT_MOVE,
+        g.mouse_mode,
+    );
+
+    // DECRST everything we touched.
+    var disable_all = vt.Csi{ .final = 'l', .private = '?', .param_count = 4 };
+    disable_all.params[0] = 1000;
+    disable_all.params[1] = 1003;
+    disable_all.params[2] = 1006;
+    disable_all.params[3] = 1015;
+    g.apply(.{ .csi = disable_all });
+    try std.testing.expectEqual(@as(u32, 0), g.mouse_mode);
 }
