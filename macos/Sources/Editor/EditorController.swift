@@ -54,6 +54,34 @@ final class EditorController {
     /// Debounce token for presence broadcasts.
     private var presenceWork: DispatchWorkItem?
 
+    // MARK: Autocomplete
+
+    /// Autocomplete state (suggestions + selection) shared with the
+    /// SwiftUI overlay. Updated reactively as the caret moves and as
+    /// text mutates (locally or remotely).
+    let autocomplete = AutocompleteState()
+
+    /// Incremental word index sourced from the current document. The
+    /// editor rebuilds the index on every text refresh and queries it
+    /// for prefix matches as the user types.
+    let wordIndex = EditorWordIndex()
+
+    /// Minimum prefix length before we surface autocomplete. Spec
+    /// requires >= 2 visible characters at the caret.
+    private static let autocompleteMinPrefixLength = 2
+
+    /// Cap on the number of suggestions surfaced at once.
+    private static let autocompleteMaxItems = 8
+
+    // MARK: Display projection
+
+    /// Shared display-side projection of the document, owned by the
+    /// controller so SwiftUI overlays (e.g. the autocomplete popover)
+    /// can position themselves above the local caret without tunneling
+    /// through the NSViewRepresentable. Lazy because it captures
+    /// `self`.
+    lazy var gridModel: EditorGridModel = EditorGridModel(controller: self)
+
     // MARK: Undo/redo
 
     /// Inverse of a local op, sufficient to undo it against the CRDT.
@@ -236,6 +264,7 @@ final class EditorController {
             deleteForward()
         case .clearSelection:
             state.localSelectionAnchor = nil
+            autocomplete.dismiss()
             bumpEpoch()
         case .selectExtend(let movement):
             if state.localSelectionAnchor == nil {
@@ -244,6 +273,7 @@ final class EditorController {
             applyMovement(movement)
             bumpEpoch()
             schedulePresence()
+            recomputeAutocomplete()
             return
         case .undo:
             performUndo()
@@ -258,10 +288,12 @@ final class EditorController {
             applyMovement(intent)
             bumpEpoch()
             schedulePresence()
+            recomputeAutocomplete()
             return
         }
         bumpEpoch()
         schedulePresence()
+        recomputeAutocomplete()
     }
 
     // MARK: - Mutation
@@ -636,6 +668,58 @@ final class EditorController {
         } catch {
             NSLog("EditorController.refreshText failed: \(error)")
         }
+        wordIndex.setText(state.text)
+        recomputeAutocomplete()
+    }
+
+    // MARK: Autocomplete pipeline
+
+    /// Recompute the autocomplete suggestion list from the current
+    /// caret + word index. Called after every local intent and after
+    /// every remote op via `refreshText`.
+    private func recomputeAutocomplete() {
+        let scalars = scalarArray
+        let caret = state.localCaret
+        // Only show when caret sits at the end of a word — i.e. the
+        // user is typing an identifier — and there is no live selection.
+        guard state.localSelectionAnchor == nil,
+              let word = EditorWordIndex.wordEndingAt(scalars: scalars, caret: caret),
+              word.count >= Self.autocompleteMinPrefixLength
+        else {
+            autocomplete.dismiss()
+            return
+        }
+
+        // Only suggest if the *next* scalar is also a non-word scalar
+        // (or end of doc): this keeps the popover hidden while the
+        // caret is in the middle of an existing word.
+        if caret < scalars.count, EditorWordIndex.isWordScalar(scalars[caret]) {
+            autocomplete.dismiss()
+            return
+        }
+
+        let matches = wordIndex.prefixMatches(
+            prefix: word,
+            limit: Self.autocompleteMaxItems,
+            excluding: word)
+        if matches.isEmpty {
+            autocomplete.dismiss()
+            return
+        }
+        autocomplete.update(items: matches, prefix: word)
+    }
+
+    /// Accept the currently-selected autocomplete suggestion. Inserts
+    /// the suggestion's suffix at the caret (so the user's typed
+    /// prefix is preserved). Dismisses the popover.
+    func acceptAutocompleteSuggestion() {
+        guard let suggestion = autocomplete.currentSelection else { return }
+        let prefix = autocomplete.prefix
+        autocomplete.dismiss()
+        guard suggestion.hasPrefix(prefix) else { return }
+        let suffix = String(suggestion.dropFirst(prefix.count))
+        guard !suffix.isEmpty else { return }
+        apply(.insert(suffix))
     }
 
     private func bumpEpoch() {

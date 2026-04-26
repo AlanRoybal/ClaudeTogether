@@ -15,14 +15,19 @@ struct ContentView: View {
                     EditorHost(controller: controller)
                         .frame(minWidth: 500, minHeight: 300)
                 } else if let grid = model.grid {
-                    MetalTerminalView(
-                        grid: grid,
-                        onKey: { model.handleKey($0) },
-                        onResize: { cols, rows in
-                            model.handleResize(cols: cols, rows: rows)
-                        },
-                        inputEnabled: model.inputEnabled)
-                        .frame(minWidth: 500, minHeight: 300)
+                    ZStack(alignment: .topLeading) {
+                        MetalTerminalView(
+                            grid: grid,
+                            onKey: { model.handleKey($0) },
+                            onResize: { cols, rows in
+                                model.handleResize(cols: cols, rows: rows)
+                            },
+                            inputEnabled: model.inputEnabled)
+                        SharedInputAutocompleteOverlay(
+                            grid: grid,
+                            autocomplete: model.inputAutocomplete)
+                    }
+                    .frame(minWidth: 500, minHeight: 300)
                 } else {
                     VStack(spacing: 16) {
                         Text("ClaudeTogether")
@@ -62,6 +67,17 @@ final class TerminalModel: ObservableObject {
     @Published var boreBundlePath: String?
     @Published var coreVersion: Int32 = 0
     @Published var activeEditor: EditorController?
+
+    /// Persisted command history feeding the shared-input autocomplete.
+    /// Captured from `inputCommit` whenever a line dispatches to the PTY.
+    let commandHistory = CommandHistory()
+
+    /// Autocomplete state for the shared input line. Updated as the
+    /// shared input mutates; consumed by ContentView's overlay.
+    let inputAutocomplete = AutocompleteState()
+
+    /// Cap on the number of history suggestions surfaced at once.
+    private static let inputAutocompleteMaxItems = 5
 
     let sessionManager = SessionManager()
 
@@ -468,6 +484,37 @@ final class TerminalModel: ObservableObject {
     }
 
     private func handleSharedInputKey(_ bytes: [UInt8]) -> Bool {
+        // Autocomplete navigation/accept keys take precedence so the
+        // popover behaves like the user expects regardless of the
+        // shared-input substrate. We never eat keys when the popover is
+        // hidden, so non-autocomplete behavior is unchanged.
+        if (canUseHostSharedInput || canUsePeerSharedInput),
+           inputAutocomplete.visible
+        {
+            switch bytes {
+            case [0x09]: // Tab — accept top suggestion
+                acceptInputAutocompleteSelection()
+                return true
+            case [0x1B]: // Esc — dismiss popover, swallow key
+                inputAutocomplete.dismiss()
+                return true
+            case Array("\u{1B}[A".utf8): // Up
+                inputAutocomplete.moveSelection(by: -1)
+                return true
+            case Array("\u{1B}[B".utf8): // Down
+                inputAutocomplete.moveSelection(by: +1)
+                return true
+            case [0x0D]: // Enter — auto-accept then commit when navigated
+                if inputAutocomplete.userHasNavigated {
+                    acceptInputAutocompleteSelection()
+                }
+                // Fall through to existing Enter handling so the line
+                // actually commits.
+            default:
+                break
+            }
+        }
+
         let actor = sessionManager.localIdentity
         guard let request = sharedInputRequest(for: bytes, actor: actor) else {
             return false
@@ -542,6 +589,7 @@ final class TerminalModel: ObservableObject {
                 }
             }
             syncGridSharedInputOverlay()
+            refreshInputAutocomplete()
         }
     }
 
@@ -551,6 +599,7 @@ final class TerminalModel: ObservableObject {
         syncGridSharedInputOverlay()
         broadcastSharedInputSnapshot()
         handleSharedInputEffect(effect)
+        refreshInputAutocomplete()
     }
 
     private func applyOptimisticSharedInputRequest(_ request: SharedInputRequest) {
@@ -559,6 +608,7 @@ final class TerminalModel: ObservableObject {
             bumpRevision: false)
         let effect = sharedInput.apply(request, bumpRevision: false)
         syncGridSharedInputOverlay()
+        refreshInputAutocomplete()
         if case .none = effect {
             return
         }
@@ -571,6 +621,8 @@ final class TerminalModel: ObservableObject {
             return
         case .commit(let line):
             syncGridSharedInputOverlay()
+            commandHistory.record(line)
+            inputAutocomplete.dismiss()
             if sessionManager.role == .host,
                interceptEditorCommand(line)
             {
@@ -583,6 +635,7 @@ final class TerminalModel: ObservableObject {
             }
         case .interrupt:
             syncGridSharedInputOverlay()
+            inputAutocomplete.dismiss()
             if sessionManager.role == .host, let pty = pty {
                 sharedInputPromptTimer?.invalidate()
                 pty.send([0x03])
@@ -763,6 +816,96 @@ final class TerminalModel: ObservableObject {
         sharedInputPromptTimer = nil
         _ = sharedInput.deactivate(bumpRevision: false)
         syncGridSharedInputOverlay()
+        inputAutocomplete.dismiss()
+    }
+
+    // MARK: shared-input autocomplete
+
+    /// Recompute the suggestion list from the current shared-input
+    /// text. Hidden when the line is empty, when there's no shared
+    /// session, or when the host is in raw (creator-only) mode.
+    private func refreshInputAutocomplete() {
+        guard isHostSharedLineSession || isPeerSharedLineSession,
+              sharedInput.isActive
+        else {
+            inputAutocomplete.dismiss()
+            return
+        }
+        let text = sharedInput.text
+        guard !text.isEmpty else {
+            inputAutocomplete.dismiss()
+            return
+        }
+        let matches = FuzzyMatcher.rank(
+            candidates: commandHistory.entries,
+            needle: text,
+            recencyRank: commandHistory.recencyRank,
+            limit: Self.inputAutocompleteMaxItems)
+        // Drop exact-match matches against the typed line — the user
+        // is already there, so suggesting it is noise.
+        let filtered = matches.filter { $0 != text }
+        if filtered.isEmpty {
+            inputAutocomplete.dismiss()
+            return
+        }
+        inputAutocomplete.update(items: filtered, prefix: text)
+    }
+
+    /// Accept the currently-highlighted suggestion in the shared-input
+    /// popover by replacing the input line with it. Bulks the
+    /// backspace/insert burst into one snapshot broadcast (host) or
+    /// minimal request packets (peer) so we do not flood the wire.
+    private func acceptInputAutocompleteSelection() {
+        guard let suggestion = inputAutocomplete.currentSelection else { return }
+        replaceSharedInputLine(with: suggestion)
+        inputAutocomplete.dismiss()
+    }
+
+    /// Replace the current shared-input line text with `text` in the
+    /// authoritative state machine, then broadcast / forward as needed.
+    private func replaceSharedInputLine(with text: String) {
+        guard sharedInput.isActive else { return }
+        let actor = sessionManager.localIdentity
+        if canUseHostSharedInput {
+            // Host: apply locally without bumping per-step; emit one
+            // snapshot at the end.
+            _ = sharedInput.apply(
+                SharedInputRequest(actor: actor, kind: .moveEnd),
+                bumpRevision: false)
+            let count = sharedInput.textScalars.count
+            for _ in 0..<count {
+                _ = sharedInput.apply(
+                    SharedInputRequest(actor: actor, kind: .backspace),
+                    bumpRevision: false)
+            }
+            _ = sharedInput.apply(
+                SharedInputRequest(actor: actor,
+                                   kind: .insertText,
+                                   text: text),
+                bumpRevision: true)
+            syncGridSharedInputOverlay()
+            broadcastSharedInputSnapshot()
+        } else if canUsePeerSharedInput {
+            // Peer: optimistic local + one request per step on the wire.
+            // moveEnd
+            let moveEnd = SharedInputRequest(actor: actor, kind: .moveEnd)
+            _ = sharedInput.apply(moveEnd, bumpRevision: false)
+            sessionManager.sendInputBytes(SharedInputCodec.encode(.request(moveEnd)))
+            // backspaces
+            let count = sharedInput.textScalars.count
+            for _ in 0..<count {
+                let bs = SharedInputRequest(actor: actor, kind: .backspace)
+                _ = sharedInput.apply(bs, bumpRevision: false)
+                sessionManager.sendInputBytes(SharedInputCodec.encode(.request(bs)))
+            }
+            // insertText
+            let ins = SharedInputRequest(actor: actor,
+                                         kind: .insertText,
+                                         text: text)
+            _ = sharedInput.apply(ins, bumpRevision: false)
+            sessionManager.sendInputBytes(SharedInputCodec.encode(.request(ins)))
+            syncGridSharedInputOverlay()
+        }
     }
 
     private func interceptEditorCommand(_ line: String) -> Bool {
@@ -1071,5 +1214,53 @@ private struct SnapshotStyle: Equatable {
         parts.append("38;2;\((fg >> 16) & 0xFF);\((fg >> 8) & 0xFF);\(fg & 0xFF)")
         parts.append("48;2;\((bg >> 16) & 0xFF);\((bg >> 8) & 0xFF);\(bg & 0xFF)")
         return "\u{1B}[\(parts.joined(separator: ";"))m"
+    }
+}
+
+
+/// Floats the autocomplete popover above (or below) the local user's
+/// cursor cell in the terminal grid. Reads cursor position from
+/// `GridModel.cursors` and infers cell size from the live SwiftUI
+/// bounds so it tracks the renderer at any window size.
+struct SharedInputAutocompleteOverlay: View {
+    @ObservedObject var grid: GridModel
+    @ObservedObject var autocomplete: AutocompleteState
+
+    private let estItemHeight: CGFloat = 22
+    private let estPadding: CGFloat = 8
+    private let estWidth: CGFloat = 320
+
+    var body: some View {
+        GeometryReader { geo in
+            if autocomplete.visible,
+               !autocomplete.items.isEmpty,
+               let local = grid.cursors.first(where: { $0.isLocal })
+            {
+                let position = computePosition(geo: geo, local: local)
+                AutocompletePopover(state: autocomplete)
+                    .frame(width: estWidth, alignment: .leading)
+                    .offset(x: position.x, y: position.y)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func computePosition(geo: GeometryProxy,
+                                 local: UserCursor) -> CGPoint
+    {
+        let cols = max(CGFloat(grid.cols), 1)
+        let rows = max(CGFloat(grid.rows), 1)
+        let cellW = geo.size.width / cols
+        let cellH = geo.size.height / rows
+        let caretX = CGFloat(local.col) * cellW
+        let caretY = CGFloat(local.row) * cellH
+
+        let estHeight = max(1, CGFloat(autocomplete.items.count)
+                            * estItemHeight + estPadding)
+        let preferredAbove = caretY - estHeight - 4
+        let py = preferredAbove >= 0 ? preferredAbove : caretY + cellH + 4
+        let px = min(max(0, caretX),
+                     max(0, geo.size.width - estWidth))
+        return CGPoint(x: px, y: py)
     }
 }
