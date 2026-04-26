@@ -3,12 +3,14 @@ import Combine
 import CollabTermC
 
 struct ContentView: View {
-    @StateObject private var model = TerminalModel()
+    @ObservedObject var model: TerminalModel
 
     var body: some View {
         HSplitView {
-            SessionSidebar(model: model)
-                .frame(minWidth: 220, idealWidth: 260, maxWidth: 360)
+            if model.sidebarVisible {
+                SessionSidebar(model: model)
+                    .frame(minWidth: 220, idealWidth: 260, maxWidth: 360)
+            }
 
             ZStack(alignment: .top) {
                 if let controller = model.activeEditor {
@@ -21,7 +23,8 @@ struct ContentView: View {
                         onResize: { cols, rows in
                             model.handleResize(cols: cols, rows: rows)
                         },
-                        inputEnabled: model.inputEnabled)
+                        inputEnabled: model.inputEnabled,
+                        fontSize: model.fontSize)
                         .frame(minWidth: 500, minHeight: 300)
                 } else {
                     VStack(spacing: 16) {
@@ -63,6 +66,34 @@ final class TerminalModel: ObservableObject {
     @Published var coreVersion: Int32 = 0
     @Published var activeEditor: EditorController?
 
+    /// Whether the SessionSidebar is visible. Toggled by the View menu
+    /// (⌘⇧S). Persisted across launches so the user's choice survives.
+    @Published var sidebarVisible: Bool = true {
+        didSet {
+            guard sidebarVisible != oldValue else { return }
+            UserDefaults.standard.set(sidebarVisible, forKey: TerminalModel.sidebarDefaultsKey)
+        }
+    }
+
+    /// Terminal text point size. Driven by the View menu (⌘+/⌘-/⌘0).
+    /// `MetalTerminalView` observes this and rebuilds the GlyphAtlas when
+    /// it changes. Persisted to UserDefaults under `ClaudeTogether.fontSize`.
+    @Published var fontSize: CGFloat = TerminalModel.defaultFontSize {
+        didSet {
+            guard fontSize != oldValue else { return }
+            UserDefaults.standard.set(Double(fontSize),
+                                      forKey: TerminalModel.fontSizeDefaultsKey)
+        }
+    }
+
+    static let defaultFontSize: CGFloat = 13
+    static let minimumFontSize: CGFloat = 8
+    static let maximumFontSize: CGFloat = 48
+    static let fontSizeStep: CGFloat = 1
+
+    fileprivate static let fontSizeDefaultsKey = "ClaudeTogether.fontSize"
+    fileprivate static let sidebarDefaultsKey = "ClaudeTogether.sidebarVisible"
+
     let sessionManager = SessionManager()
 
     /// Host only: edge-detector for creator-only mode. We currently treat the
@@ -81,6 +112,16 @@ final class TerminalModel: ObservableObject {
         coreVersion = ct_version()
         boreBundlePath = Self.findBoreBinaryPath()
         NSLog("[ct] TerminalModel init borePath=%@", boreBundlePath ?? "<nil>")
+
+        // Restore persisted UI prefs without firing the didSet writers.
+        let defaults = UserDefaults.standard
+        if defaults.object(forKey: TerminalModel.fontSizeDefaultsKey) != nil {
+            let raw = CGFloat(defaults.double(forKey: TerminalModel.fontSizeDefaultsKey))
+            fontSize = TerminalModel.clampFontSize(raw)
+        }
+        if defaults.object(forKey: TerminalModel.sidebarDefaultsKey) != nil {
+            sidebarVisible = defaults.bool(forKey: TerminalModel.sidebarDefaultsKey)
+        }
         // Re-publish child ObservableObject changes.
         sessionManager.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
@@ -196,6 +237,180 @@ final class TerminalModel: ObservableObject {
         stopFileSyncPolling()
         fileSyncApplier.configure(rootPath: nil)
         resetSharedInputState()
+    }
+
+    // MARK: menu / hotkey actions
+
+    /// True when there's something for ⌘W to close (host PTY, peer grid,
+    /// active shared session, or open editor).
+    var hasActiveSession: Bool {
+        if pty != nil { return true }
+        if grid != nil { return true }
+        if activeEditor != nil { return true }
+        if sessionManager.state != .idle { return true }
+        return false
+    }
+
+    /// ⌘K — clear scrollback + visible screen, home the cursor.
+    /// Sequence: ED 2 (erase display) + CUP 1;1 (home) + ED 3 (erase
+    /// scrollback). Most modern terminals understand `\e[3J`.
+    func clearScreen() {
+        guard let grid = grid else { return }
+        let bytes = Array("\u{1B}[2J\u{1B}[H\u{1B}[3J".utf8)
+        grid.feed(bytes)
+        // If we're hosting a shared session, propagate the clear so peers'
+        // mirrored grids stay in sync.
+        if sessionManager.role == .host, sessionManager.state == .running {
+            sessionManager.sendPtyOutput(Data(bytes))
+        }
+    }
+
+    /// ⌘+ — bump terminal point size by one step (clamped).
+    func increaseFontSize() {
+        fontSize = TerminalModel.clampFontSize(fontSize + TerminalModel.fontSizeStep)
+    }
+
+    /// ⌘- — drop terminal point size by one step (clamped).
+    func decreaseFontSize() {
+        fontSize = TerminalModel.clampFontSize(fontSize - TerminalModel.fontSizeStep)
+    }
+
+    /// ⌘0 — restore default terminal point size.
+    func resetFontSize() {
+        fontSize = TerminalModel.defaultFontSize
+    }
+
+    fileprivate static func clampFontSize(_ value: CGFloat) -> CGFloat {
+        if !value.isFinite || value <= 0 { return defaultFontSize }
+        return min(max(value, minimumFontSize), maximumFontSize)
+    }
+
+    /// ⌘C — copy the visible terminal grid (no selection model yet) to the
+    /// system pasteboard. Matches the "or visible terminal if no selection"
+    /// fallback in the spec.
+    func menuCopy() {
+        if activeEditor != nil {
+            // Forward to the active responder so the editor (or any focused
+            // NSText subclass) gets a chance to copy its own selection.
+            if NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil) {
+                return
+            }
+        }
+        copyVisibleTerminalToPasteboard()
+    }
+
+    /// ⌘V — paste from system pasteboard. Routed through the same
+    /// pipeline as the terminal view's performKeyEquivalent so PTY and
+    /// peer-as-input flows both work.
+    func menuPaste() {
+        if activeEditor != nil {
+            if NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil) {
+                return
+            }
+        }
+        guard inputEnabled else {
+            NSSound.beep()
+            return
+        }
+        guard grid != nil,
+              let s = NSPasteboard.general.string(forType: .string),
+              !s.isEmpty
+        else { return }
+        handleKey(Array(s.utf8))
+    }
+
+    /// Decode the visible cells into a String (one line per row, no trailing
+    /// blanks) and push it to NSPasteboard.
+    func copyVisibleTerminalToPasteboard() {
+        guard let grid = grid else {
+            NSSound.beep()
+            return
+        }
+        let text = visibleTerminalText(grid: grid)
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+    }
+
+    /// ⌘F — prompt for a query and search the visible terminal grid for
+    /// the first occurrence (case-sensitive). Beeps on no match; otherwise
+    /// shows an informational alert with the line number.
+    func presentFindPrompt() {
+        guard let grid = grid else {
+            NSSound.beep()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.messageText = "Find"
+        alert.informativeText = "Search the visible terminal."
+        alert.alertStyle = .informational
+        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        input.placeholderString = "query"
+        alert.accessoryView = input
+        alert.window.initialFirstResponder = input
+        alert.addButton(withTitle: "Find")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        let query = input.stringValue
+        guard !query.isEmpty else { return }
+
+        let lines = visibleTerminalLines(grid: grid)
+        for (idx, line) in lines.enumerated() {
+            if line.range(of: query) != nil {
+                let result = NSAlert()
+                result.messageText = "Found"
+                result.informativeText = "Match on line \(idx + 1)."
+                result.alertStyle = .informational
+                result.addButton(withTitle: "OK")
+                result.runModal()
+                return
+            }
+        }
+        NSSound.beep()
+        let miss = NSAlert()
+        miss.messageText = "Not found"
+        miss.informativeText = "\u{201C}\(query)\u{201D} is not on screen."
+        miss.alertStyle = .warning
+        miss.addButton(withTitle: "OK")
+        miss.runModal()
+    }
+
+    /// Decode visible cells row-by-row into Swift strings. Trailing blanks
+    /// per row are trimmed. Wide cells (`width == 0` continuations) are
+    /// skipped — they're already covered by the leading half.
+    private func visibleTerminalLines(grid: GridModel) -> [String] {
+        let snap = grid.snapshot()
+        let cols = Int(grid.cols)
+        let rows = Int(grid.rows)
+        guard cols > 0, rows > 0, snap.count >= cols * rows else { return [] }
+
+        var lines: [String] = []
+        lines.reserveCapacity(rows)
+        for r in 0..<rows {
+            var line = ""
+            for c in 0..<cols {
+                let cell = snap[r * cols + c]
+                if cell.width == 0 { continue }
+                let cp = cell.codepoint
+                if cp == 0 {
+                    line.append(" ")
+                } else if let scalar = UnicodeScalar(cp) {
+                    line.append(Character(scalar))
+                } else {
+                    line.append(" ")
+                }
+            }
+            // Trim trailing whitespace so blank cells don't pollute matches.
+            while let last = line.last, last == " " { line.removeLast() }
+            lines.append(line)
+        }
+        return lines
+    }
+
+    private func visibleTerminalText(grid: GridModel) -> String {
+        visibleTerminalLines(grid: grid).joined(separator: "\n")
     }
 
     // MARK: sharing

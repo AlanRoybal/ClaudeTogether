@@ -63,12 +63,16 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     private(set) var cols: UInt16 = 80
     private(set) var rows: UInt16 = 24
 
+    /// Live point size for the glyph atlas. Use `setPointSize(_:)` to change
+    /// at runtime — the atlas is rebuilt and the grid is re-measured.
+    private(set) var pointSize: CGFloat = 13
+
     var onResize: ((UInt16, UInt16) -> Void)?
 
     var cursorVisible = true
     private var blinkStart = CACurrentMediaTime()
 
-    init?(view: MTKView) {
+    init?(view: MTKView, pointSize: CGFloat = 13) {
         guard let device = view.device ?? MTLCreateSystemDefaultDevice() else {
             return nil
         }
@@ -83,10 +87,11 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         let scale = view.window?.backingScaleFactor
             ?? NSScreen.main?.backingScaleFactor
             ?? 2.0
-        guard let atlas = GlyphAtlas(device: device, pointSize: 13, scale: scale) else {
+        guard let atlas = GlyphAtlas(device: device, pointSize: pointSize, scale: scale) else {
             return nil
         }
         self.atlas = atlas
+        self.pointSize = pointSize
 
         guard let library = device.makeDefaultLibrary(),
               let bgV = library.makeFunction(name: "bg_vertex"),
@@ -165,12 +170,35 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         if view.bounds.width > 0 {
             let actual = size.width / view.bounds.width
             if abs(actual - atlas.scale) > 0.1,
-               let newAtlas = GlyphAtlas(device: device, pointSize: 13, scale: actual)
+               let newAtlas = GlyphAtlas(device: device,
+                                         pointSize: pointSize,
+                                         scale: actual)
             {
                 self.atlas = newAtlas
             }
         }
         recomputeGrid(for: size)
+    }
+
+    /// Rebuild the glyph atlas at a new point size and re-measure the grid
+    /// so the renderer (and PTY, via `onResize`) catch up immediately.
+    /// Called by `MetalTerminalView` whenever the SwiftUI side advertises a
+    /// new font size from the menu.
+    func setPointSize(_ newPointSize: CGFloat) {
+        guard newPointSize > 0, newPointSize != pointSize else { return }
+        pointSize = newPointSize
+        let scale = view?.window?.backingScaleFactor
+            ?? atlas.scale
+        if let newAtlas = GlyphAtlas(device: device,
+                                     pointSize: newPointSize,
+                                     scale: scale)
+        {
+            self.atlas = newAtlas
+        }
+        if let v = view {
+            recomputeGrid(for: v.drawableSize)
+            v.setNeedsDisplay(v.bounds)
+        }
     }
 
     func draw(in view: MTKView) {

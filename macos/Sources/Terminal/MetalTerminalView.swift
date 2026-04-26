@@ -19,12 +19,15 @@ final class MetalTerminalNSView: NSView {
 
     init?(grid: GridModel,
           onKey: @escaping ([UInt8]) -> Void,
-          onResize: @escaping (UInt16, UInt16) -> Void)
+          onResize: @escaping (UInt16, UInt16) -> Void,
+          pointSize: CGFloat = 13)
     {
         let view = MTKView(frame: .zero)
         self.mtkView = view
         self.grid = grid
-        guard let renderer = TerminalRenderer(view: view) else { return nil }
+        guard let renderer = TerminalRenderer(view: view, pointSize: pointSize) else {
+            return nil
+        }
         self.renderer = renderer
         self.onKey = onKey
         self.onResize = onResize
@@ -59,6 +62,13 @@ final class MetalTerminalNSView: NSView {
         // swaps grids, so bring the new grid up to the renderer's live size
         // immediately.
         grid.resize(cols: renderer.cols, rows: renderer.rows)
+    }
+
+    /// Rebuilds the renderer's glyph atlas if the requested point size has
+    /// changed. Triggers an immediate grid re-measure so PTY and view stay
+    /// in sync.
+    func updatePointSize(_ pointSize: CGFloat) {
+        renderer.setPointSize(pointSize)
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -151,26 +161,30 @@ struct MetalTerminalView: NSViewRepresentable {
     let onKey: ([UInt8]) -> Void
     let onResize: (UInt16, UInt16) -> Void
     let inputEnabled: Bool
+    let fontSize: CGFloat
 
     init(grid: GridModel,
          onKey: @escaping ([UInt8]) -> Void,
          onResize: @escaping (UInt16, UInt16) -> Void = { _, _ in },
-         inputEnabled: Bool = true)
+         inputEnabled: Bool = true,
+         fontSize: CGFloat = 13)
     {
         self.grid = grid
         self.onKey = onKey
         self.onResize = onResize
         self.inputEnabled = inputEnabled
+        self.fontSize = fontSize
     }
 
     func makeNSView(context: Context) -> MetalTerminalNSView {
         guard let v = MetalTerminalNSView(
-            grid: grid, onKey: onKey, onResize: onResize)
+            grid: grid, onKey: onKey, onResize: onResize, pointSize: fontSize)
         else {
             NSLog("MetalTerminalNSView init failed — Metal unavailable")
             // Return an empty placeholder view rather than crash.
             return MetalTerminalNSView(
-                grid: grid, onKey: { _ in }, onResize: { _, _ in })!
+                grid: grid, onKey: { _ in }, onResize: { _, _ in },
+                pointSize: fontSize)!
         }
         v.inputEnabled = inputEnabled
         return v
@@ -179,5 +193,6 @@ struct MetalTerminalView: NSViewRepresentable {
     func updateNSView(_ nsView: MetalTerminalNSView, context: Context) {
         nsView.updateGrid(grid)
         nsView.inputEnabled = inputEnabled
+        nsView.updatePointSize(fontSize)
     }
 }
