@@ -76,6 +76,11 @@ final class EditorController {
     /// Debounce token for presence broadcasts.
     private var presenceWork: DispatchWorkItem?
 
+    /// Debounce token for syntax-highlight recomputation. Tokenizing
+    /// every keystroke is wasteful — coalesce 50 ms of edits into one
+    /// pass, same window we use for presence.
+    private var highlightWork: DispatchWorkItem?
+
     // MARK: Undo/redo
 
     /// Inverse of a local op, sufficient to undo it against the CRDT.
@@ -140,7 +145,11 @@ final class EditorController {
                 NSLog("EditorController: loadSnapshot failed: \(error)")
             }
         }
+        // Detect language up-front from the path so the first frame
+        // already has the right palette ready.
+        self.state.language = SyntaxHighlighter.detectLanguage(forPath: path)
         refreshText()
+        recomputeHighlights()
     }
 
     // MARK: Public helpers
@@ -652,6 +661,44 @@ final class EditorController {
         sendPresence(caretId, selId)
     }
 
+    // MARK: - Syntax highlighting
+
+    /// Coalesce highlight passes 50 ms after the last edit. The pass
+    /// itself runs on the main actor (it touches `@Published` state),
+    /// but the tokenizer is pure CPU work and finishes fast on the
+    /// sub-500KB documents we accept.
+    private func scheduleHighlights() {
+        highlightWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in self?.recomputeHighlights() }
+        }
+        highlightWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50),
+                                      execute: work)
+    }
+
+    /// Tokenize the current document and replace `state.highlights`
+    /// with a line-grouped dictionary. Runs synchronously — call
+    /// directly from init for the first paint, otherwise route via
+    /// `scheduleHighlights()`.
+    private func recomputeHighlights() {
+        let language = state.language
+        guard language != .plain else {
+            if !state.highlights.isEmpty {
+                state.highlights = [:]
+                bumpEpoch()
+            }
+            return
+        }
+        let spans = SyntaxHighlighter.tokenize(state.text, language: language)
+        var grouped: [Int: [HighlightSpan]] = [:]
+        for span in spans {
+            grouped[span.line, default: []].append(span)
+        }
+        state.highlights = grouped
+        bumpEpoch()
+    }
+
     // MARK: - Utilities
 
     private func refreshText() {
@@ -660,6 +707,7 @@ final class EditorController {
         } catch {
             NSLog("EditorController.refreshText failed: \(error)")
         }
+        scheduleHighlights()
     }
 
     private func bumpEpoch() {
