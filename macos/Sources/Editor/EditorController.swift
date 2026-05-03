@@ -24,6 +24,22 @@ enum EditorIntent {
     case redo
 }
 
+extension EditorIntent {
+    /// True when applying this intent would produce a CRDT op that
+    /// mutates the document. Movement and selection intents are not
+    /// considered mutations.
+    var isMutating: Bool {
+        switch self {
+        case .insert, .paste, .backspace, .deleteForward, .undo, .redo:
+            return true
+        case .moveLeft, .moveRight, .moveUp, .moveDown,
+             .moveLineStart, .moveLineEnd, .moveDocStart, .moveDocEnd,
+             .clearSelection, .selectExtend:
+            return false
+        }
+    }
+}
+
 /// Drives the RGA CRDT on behalf of the local user and fans local ops
 /// out via the `sendOp` closure. Presence (caret-anchor broadcasts) is
 /// debounced 50 ms so that running the caret across a line doesn't
@@ -37,6 +53,12 @@ final class EditorController {
 
     /// CRDT replica. Owned exclusively by this controller.
     private let core: EditorCore
+
+    /// When true, mutating intents (insert / delete / paste / undo / redo)
+    /// from the local user are dropped. Movement and selection intents are
+    /// still honoured so the user can scroll a caret around to read.
+    /// Set by `TerminalModel` from the host's broadcast access mode.
+    var isReadOnly: Bool = false
 
     /// Egress for local CRDT ops. Step 5 wires this to
     /// `SessionManager.sendEditorOp`.
@@ -223,8 +245,10 @@ final class EditorController {
 
     /// Entry point for every local user action. Movement intents only
     /// shift the caret (and maybe selection); mutation intents generate
-    /// and broadcast CRDT ops.
+    /// and broadcast CRDT ops. View-only peers silently drop all
+    /// mutating intents.
     func apply(_ intent: EditorIntent) {
+        if isReadOnly && intent.isMutating { return }
         switch intent {
         case .insert(let s):
             insertText(s)
