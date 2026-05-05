@@ -99,9 +99,8 @@ fragment float4 text_fragment(TextVertexOut in [[stage_in]],
 }
 
 //------------------------------------------------------------------ CURSOR
-// Sub-cell-positioned filled rect. Used to draw peer cursor borders as four
-// thin strips around a cell (top, bottom, left, right). Blends over the text
-// pass so borders read clearly without occluding the glyph.
+// Sub-cell-positioned filled rect. Used for collaborator block cursors,
+// selections, and other cell-relative overlays.
 
 struct CursorInstance {
     ushort2 gridPos;

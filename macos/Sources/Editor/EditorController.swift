@@ -24,6 +24,22 @@ enum EditorIntent {
     case redo
 }
 
+extension EditorIntent {
+    /// True when applying this intent would produce a CRDT op that
+    /// mutates the document. Movement and selection intents are not
+    /// considered mutations.
+    var isMutating: Bool {
+        switch self {
+        case .insert, .paste, .backspace, .deleteForward, .undo, .redo:
+            return true
+        case .moveLeft, .moveRight, .moveUp, .moveDown,
+             .moveLineStart, .moveLineEnd, .moveDocStart, .moveDocEnd,
+             .clearSelection, .selectExtend:
+            return false
+        }
+    }
+}
+
 /// Drives the RGA CRDT on behalf of the local user and fans local ops
 /// out via the `sendOp` closure. Presence (caret-anchor broadcasts) is
 /// debounced 50 ms so that running the caret across a line doesn't
@@ -37,6 +53,12 @@ final class EditorController {
 
     /// CRDT replica. Owned exclusively by this controller.
     private let core: EditorCore
+
+    /// When true, mutating intents (insert / delete / paste / undo / redo)
+    /// from the local user are dropped. Movement and selection intents are
+    /// still honoured so the user can scroll a caret around to read.
+    /// Set by `TerminalModel` from the host's broadcast access mode.
+    var isReadOnly: Bool = false
 
     /// Egress for local CRDT ops. Step 5 wires this to
     /// `SessionManager.sendEditorOp`.
@@ -56,31 +78,17 @@ final class EditorController {
 
     // MARK: Autocomplete
 
-    /// Autocomplete state (suggestions + selection) shared with the
-    /// SwiftUI overlay. Updated reactively as the caret moves and as
-    /// text mutates (locally or remotely).
     let autocomplete = AutocompleteState()
-
-    /// Incremental word index sourced from the current document. The
-    /// editor rebuilds the index on every text refresh and queries it
-    /// for prefix matches as the user types.
     let wordIndex = EditorWordIndex()
-
-    /// Minimum prefix length before we surface autocomplete. Spec
-    /// requires >= 2 visible characters at the caret.
     private static let autocompleteMinPrefixLength = 2
-
-    /// Cap on the number of suggestions surfaced at once.
     private static let autocompleteMaxItems = 8
 
     // MARK: Display projection
 
-    /// Shared display-side projection of the document, owned by the
-    /// controller so SwiftUI overlays (e.g. the autocomplete popover)
-    /// can position themselves above the local caret without tunneling
-    /// through the NSViewRepresentable. Lazy because it captures
-    /// `self`.
     lazy var gridModel: EditorGridModel = EditorGridModel(controller: self)
+
+    /// Debounce token for syntax-highlight recomputation.
+    private var highlightWork: DispatchWorkItem?
 
     // MARK: Undo/redo
 
@@ -146,7 +154,11 @@ final class EditorController {
                 NSLog("EditorController: loadSnapshot failed: \(error)")
             }
         }
+        // Detect language up-front from the path so the first frame
+        // already has the right palette ready.
+        self.state.language = SyntaxHighlighter.detectLanguage(forPath: path)
         refreshText()
+        recomputeHighlights()
     }
 
     // MARK: Public helpers
@@ -251,8 +263,10 @@ final class EditorController {
 
     /// Entry point for every local user action. Movement intents only
     /// shift the caret (and maybe selection); mutation intents generate
-    /// and broadcast CRDT ops.
+    /// and broadcast CRDT ops. View-only peers silently drop all
+    /// mutating intents.
     func apply(_ intent: EditorIntent) {
+        if isReadOnly && intent.isMutating { return }
         switch intent {
         case .insert(let s):
             insertText(s)
@@ -660,6 +674,44 @@ final class EditorController {
         sendPresence(caretId, selId)
     }
 
+    // MARK: - Syntax highlighting
+
+    /// Coalesce highlight passes 50 ms after the last edit. The pass
+    /// itself runs on the main actor (it touches `@Published` state),
+    /// but the tokenizer is pure CPU work and finishes fast on the
+    /// sub-500KB documents we accept.
+    private func scheduleHighlights() {
+        highlightWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in self?.recomputeHighlights() }
+        }
+        highlightWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50),
+                                      execute: work)
+    }
+
+    /// Tokenize the current document and replace `state.highlights`
+    /// with a line-grouped dictionary. Runs synchronously — call
+    /// directly from init for the first paint, otherwise route via
+    /// `scheduleHighlights()`.
+    private func recomputeHighlights() {
+        let language = state.language
+        guard language != .plain else {
+            if !state.highlights.isEmpty {
+                state.highlights = [:]
+                bumpEpoch()
+            }
+            return
+        }
+        let spans = SyntaxHighlighter.tokenize(state.text, language: language)
+        var grouped: [Int: [HighlightSpan]] = [:]
+        for span in spans {
+            grouped[span.line, default: []].append(span)
+        }
+        state.highlights = grouped
+        bumpEpoch()
+    }
+
     // MARK: - Utilities
 
     private func refreshText() {
@@ -670,18 +722,14 @@ final class EditorController {
         }
         wordIndex.setText(state.text)
         recomputeAutocomplete()
+        scheduleHighlights()
     }
 
     // MARK: Autocomplete pipeline
 
-    /// Recompute the autocomplete suggestion list from the current
-    /// caret + word index. Called after every local intent and after
-    /// every remote op via `refreshText`.
     private func recomputeAutocomplete() {
         let scalars = scalarArray
         let caret = state.localCaret
-        // Only show when caret sits at the end of a word — i.e. the
-        // user is typing an identifier — and there is no live selection.
         guard state.localSelectionAnchor == nil,
               let word = EditorWordIndex.wordEndingAt(scalars: scalars, caret: caret),
               word.count >= Self.autocompleteMinPrefixLength
@@ -690,9 +738,6 @@ final class EditorController {
             return
         }
 
-        // Only suggest if the *next* scalar is also a non-word scalar
-        // (or end of doc): this keeps the popover hidden while the
-        // caret is in the middle of an existing word.
         if caret < scalars.count, EditorWordIndex.isWordScalar(scalars[caret]) {
             autocomplete.dismiss()
             return
@@ -709,9 +754,6 @@ final class EditorController {
         autocomplete.update(items: matches, prefix: word)
     }
 
-    /// Accept the currently-selected autocomplete suggestion. Inserts
-    /// the suggestion's suffix at the caret (so the user's typed
-    /// prefix is preserved). Dismisses the popover.
     func acceptAutocompleteSuggestion() {
         guard let suggestion = autocomplete.currentSelection else { return }
         let prefix = autocomplete.prefix

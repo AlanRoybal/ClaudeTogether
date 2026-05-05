@@ -49,6 +49,16 @@ final class EditorState: ObservableObject {
     /// Last rev announced via `editorSaved`. Step 6 wires the increment.
     @Published var lastSavedRev: UInt32 = 0
 
+    /// Detected source language for the document. Set on init from the
+    /// document path; the controller never changes it after that. Used
+    /// by the syntax-highlighting pipeline.
+    @Published var language: Language = .plain
+
+    /// Per-source-line highlight spans produced by `SyntaxHighlighter`.
+    /// The renderer applies each span's foreground colour to the matching
+    /// glyphs; a missing entry means "use the default theme colour".
+    @Published var highlights: [Int: [HighlightSpan]] = [:]
+
     /// Stable document id assigned by whoever opened the editor. Used
     /// to route `editorOp`/`editorPresence` frames to the right doc.
     let docId: UInt64

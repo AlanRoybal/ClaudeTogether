@@ -5,18 +5,19 @@ import simd
 /// Metal state; this module only decides *what* to draw.
 ///
 /// Rendering model:
-///   - Every participant gets a colored block rendered in the cursor pass.
-///   - If multiple users land on the same cell, later blocks inset slightly so
-///     they remain distinct instead of collapsing into a single fill.
+///   - Every participant gets a fully colored block cursor rendered in the
+///     cursor pass.
+///   - Each cursor fills the entire terminal cell, matching a normal terminal
+///     block cursor.
 ///
 /// All coordinates returned are grid cells; the renderer converts to pixels
 /// via the existing `BgInstance` pipeline.
 struct CursorOverlay {
-    /// Blink period in seconds. Only the local block cursor blinks; peer
-    /// blocks stay solid so remote activity is always visible.
+    /// Blink period in seconds. Only the local block blinks; peer blocks stay
+    /// solid so remote activity is always visible.
     static let blinkPeriod: Double = 1.0
 
-    struct BlockRect {
+    struct Rect {
         var col: UInt16
         var row: UInt16
         /// Fractional cell offset and size, in (0..1) cell units. The renderer
@@ -26,64 +27,47 @@ struct CursorOverlay {
         var color: SIMD4<UInt8>
     }
 
-    let blocks: [BlockRect]
+    let rects: [Rect]
 
     /// Build the overlay for the current frame.
     /// - Parameters:
     ///   - cursors: ordered list from `GridModel.cursors`.
     ///   - time: `CACurrentMediaTime()` for blink phase.
-    ///   - blinkOn: caller-controlled override (false disables local blink).
+    ///   - cursorVisible: caller-controlled override for the local block.
     static func build(
         cursors: [UserCursor],
         time: Double,
         blinkStart: Double,
         cursorVisible: Bool
     ) -> CursorOverlay {
-        struct CellKey: Hashable {
-            var col: UInt16
-            var row: UInt16
-        }
-
         let phase = fmod(time - blinkStart, blinkPeriod)
         let blinkOn = phase < blinkPeriod * 0.5
-        var blocks: [BlockRect] = []
-        var lanes: [CellKey: Int] = [:]
+        var rects: [Rect] = []
 
         for c in cursors {
             if c.isLocal && (!cursorVisible || !blinkOn) {
                 continue
             }
-            let key = CellKey(col: c.col, row: c.row)
-            let lane = lanes[key, default: 0]
-            lanes[key] = lane + 1
-            blocks.append(blockRect(
+            rects.append(blockRect(
                 col: c.col,
                 row: c.row,
-                color: unpackRGBA(c.color),
-                lane: lane))
+                color: unpackRGBA(c.color)))
         }
-        return CursorOverlay(blocks: blocks)
+        return CursorOverlay(rects: rects)
     }
 
     // MARK: - Block geometry
 
-    private static let baseAlpha: UInt8 = 235
-    private static let laneInsetStep: Float = 0.12
-    private static let maxInset: Float = 0.30
-
-    private static func blockRect(
-        col: UInt16,
-        row: UInt16,
-        color: SIMD4<UInt8>,
-        lane: Int
-    ) -> BlockRect {
-        let inset = min(Float(lane) * laneInsetStep, maxInset)
-        return BlockRect(
+    private static func blockRect(col: UInt16,
+                                  row: UInt16,
+                                  color: SIMD4<UInt8>) -> Rect
+    {
+        Rect(
             col: col,
             row: row,
-            originFrac: SIMD2<Float>(repeating: inset),
-            sizeFrac: SIMD2<Float>(repeating: max(0.0, 1.0 - inset * 2.0)),
-            color: SIMD4<UInt8>(color.x, color.y, color.z, baseAlpha))
+            originFrac: SIMD2<Float>(0, 0),
+            sizeFrac: SIMD2<Float>(1, 1),
+            color: color)
     }
 
     private static func unpackRGBA(_ packed: UInt32) -> SIMD4<UInt8> {

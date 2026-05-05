@@ -84,6 +84,7 @@ final class EditorGridModel: ObservableObject {
         let colCount = max(Int(cols), 1)
         let rowCount = max(Int(rows), 1)
         let previousScrollRow = scrollRow
+        let highlights = state.highlights
 
         var positions: [(row: Int, col: Int)] = []
         positions.reserveCapacity(scalarView.count + 1)
@@ -97,11 +98,18 @@ final class EditorGridModel: ObservableObject {
 
         var row = 0
         var col = 0
+        // Source-coordinate trackers run in parallel with the wrapped
+        // grid `row`/`col` so we can look up syntax-highlight spans (which
+        // are stored in source-line, source-column space).
+        var sourceLine = 0
+        var sourceCol = 0
 
         for scalar in scalarView {
             if scalar == "\n" {
                 row += 1
                 col = 0
+                sourceLine += 1
+                sourceCol = 0
                 positions.append((row, col))
                 continue
             }
@@ -116,10 +124,16 @@ final class EditorGridModel: ObservableObject {
                 let index = visibleRow * colCount + col
                 if index >= 0, index < nextCells.count {
                     nextCells[index].codepoint = scalar.value
+                    nextCells[index].fg = Self.highlightedFg(
+                        highlights: highlights,
+                        sourceLine: sourceLine,
+                        sourceCol: sourceCol,
+                        defaultFg: Theme.foreground)
                 }
             }
 
             col += 1
+            sourceCol += 1
             if col >= colCount {
                 row += 1
                 col = 0
@@ -146,10 +160,14 @@ final class EditorGridModel: ObservableObject {
                 bg: Theme.background)
             row = 0
             col = 0
+            sourceLine = 0
+            sourceCol = 0
             for scalar in scalarView {
                 if scalar == "\n" {
                     row += 1
                     col = 0
+                    sourceLine += 1
+                    sourceCol = 0
                     continue
                 }
                 if col >= colCount {
@@ -161,9 +179,15 @@ final class EditorGridModel: ObservableObject {
                     let index = visibleRow * colCount + col
                     if index >= 0, index < nextCells.count {
                         nextCells[index].codepoint = scalar.value
+                        nextCells[index].fg = Self.highlightedFg(
+                            highlights: highlights,
+                            sourceLine: sourceLine,
+                            sourceCol: sourceCol,
+                            defaultFg: Theme.foreground)
                     }
                 }
                 col += 1
+                sourceCol += 1
                 if col >= colCount {
                     row += 1
                     col = 0
@@ -175,6 +199,29 @@ final class EditorGridModel: ObservableObject {
         selections = buildSelections()
         cursors = buildCursors()
         epoch &+= 1
+    }
+
+    /// Look up the foreground colour for a glyph at `(sourceLine,
+    /// sourceCol)` in source-coordinate space. Spans in `highlights`
+    /// are emitted in scan order, so first match wins. Identifier and
+    /// plain spans return nil from the palette and we keep `defaultFg`.
+    private static func highlightedFg(highlights: [Int: [HighlightSpan]],
+                                      sourceLine: Int,
+                                      sourceCol: Int,
+                                      defaultFg: UInt32) -> UInt32
+    {
+        guard let lineSpans = highlights[sourceLine] else { return defaultFg }
+        for span in lineSpans {
+            if sourceCol >= span.startColumn,
+               sourceCol < span.startColumn + span.length
+            {
+                if let color = SyntaxPalette.color(for: span.kind) {
+                    return color
+                }
+                return defaultFg
+            }
+        }
+        return defaultFg
     }
 
     private func ensureLocalCaretVisible() {
