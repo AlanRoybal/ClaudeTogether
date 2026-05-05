@@ -49,6 +49,15 @@ final class SessionManager: ObservableObject {
     /// `.line` so a fresh peer allows input until it hears otherwise.
     @Published private(set) var remoteMode: TermMode = .line
 
+    /// Active access policy.
+    /// * Host: source of truth, persisted via UserDefaults
+    ///   (`accessModeDefaultsKey`). Toggling it broadcasts an
+    ///   `accessMode` frame so peers see the change immediately.
+    /// * Peer: shadow copy, updated whenever the host broadcasts
+    ///   `accessMode`. Defaults to `.full` so a fresh peer allows
+    ///   input until it hears otherwise (matching `remoteMode`).
+    @Published private(set) var accessMode: AccessMode = .full
+
     let localIdentity: UserIdentity
     @Published var localName: String {
         didSet {
@@ -97,6 +106,7 @@ final class SessionManager: ObservableObject {
     func startHost(port: UInt16 = 0) {
         guard handle == nil else { return }
         role = .host
+        accessMode = Self.savedAccessMode()
         state = .starting
         guard let h = ct_session_new_host(port) else {
             state = .failed(Self.readLastError()
@@ -119,6 +129,7 @@ final class SessionManager: ObservableObject {
     func joinPeer(host: String, port: UInt16) {
         guard handle == nil else { return }
         role = .peer
+        accessMode = .full
         state = .starting
         let h = host.withCString { cstr in
             ct_session_new_peer(cstr, port)
@@ -304,14 +315,39 @@ final class SessionManager: ObservableObject {
     /// them only into the matching PTY, so tabs do not share input state.
     func sendTabInput(tabId: UInt32, data: Data) {
         guard role == .peer, state == .running, !data.isEmpty else { return }
+        guard accessMode == .full else { return }
         broadcast(.tabInput(tabId: tabId, data: data))
+    }
+
+    /// Host only: change the access policy and announce it to all peers.
+    /// Persisted via `UserDefaults` so subsequent sessions remember the
+    /// last preference. Safe to call before any peer has connected — the
+    /// stored value is sent automatically when peers say Hello.
+    func setAccessMode(_ mode: AccessMode) {
+        guard role == .host else { return }
+        accessMode = mode
+        Self.persistAccessMode(mode)
+        if state == .running {
+            broadcast(.accessMode(mode))
+        }
+    }
+
+    /// Host only: announce the current access mode unconditionally. Used
+    /// after a peer Hello so a fresh joiner learns the policy without
+    /// waiting for the next toggle.
+    func broadcastAccessMode() {
+        guard role == .host, state == .running else { return }
+        broadcast(.accessMode(accessMode))
     }
 
     /// Peer only: ship keystroke bytes to the host as an opaque `inputOp`
     /// payload. (Full CRDT merge is a future step; Phase 3 uses this as a
-    /// "raw-bytes passthrough" so end-to-end shared typing works.)
+    /// "raw-bytes passthrough" so end-to-end shared typing works.) In
+    /// view-only mode this is a no-op so a misbehaving caller can't bypass
+    /// the UI gate.
     func sendInputBytes(_ bytes: Data) {
         guard role == .peer, state == .running, !bytes.isEmpty else { return }
+        guard accessMode == .full else { return }
         broadcast(.inputOp(bytes))
     }
 
@@ -541,6 +577,8 @@ final class SessionManager: ObservableObject {
             }
         case .modeChange(let m):
             if role == .peer { remoteMode = m }
+        case .accessMode(let m):
+            if role == .peer { accessMode = m }
         case .heartbeat:
             break
         default:
@@ -613,6 +651,22 @@ final class SessionManager: ObservableObject {
     // MARK: persisted name
 
     static let nameDefaultsKey = "ClaudeTogether.displayName"
+
+    /// UserDefaults key for the host-side access policy. Mirrors the
+    /// shape used for `nameDefaultsKey`; the sidebar Picker writes this.
+    static let accessModeDefaultsKey = "ClaudeTogether.accessMode"
+
+    nonisolated static func savedAccessMode() -> AccessMode {
+        let raw = UserDefaults.standard.integer(forKey: accessModeDefaultsKey)
+        guard let mode = AccessMode(rawValue: UInt8(clamping: raw)) else {
+            return .full
+        }
+        return mode
+    }
+
+    nonisolated static func persistAccessMode(_ mode: AccessMode) {
+        UserDefaults.standard.set(Int(mode.rawValue), forKey: accessModeDefaultsKey)
+    }
 
     /// Read the last-error slot populated by the Zig C ABI. Returns nil
     /// if empty.

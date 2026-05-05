@@ -14,21 +14,22 @@ enum FrameTag: UInt8 {
     case modeChange  = 0x08
     case roster      = 0x09
     case heartbeat   = 0x0A
-    // Multi-tab frames. Each session can host N concurrent PTY shells; these
-    // tags carry per-tab lifecycle, per-tab output, and per-tab peer input.
-    case tabInput     = 0x0B
-    case tabOpen      = 0x0C
-    case tabClose     = 0x0D
-    case tabFocus     = 0x0E
-    case tabPtyOutput = 0x0F
-    // Collaborative editor frames (0x10..0x15). Tags start at 0x10 to leave
-    // room above the core session frames; must match `Tag` in frame.zig.
+    case accessMode  = 0x0B
+    // Collaborative editor frames (0x10..0x15). Must match `Tag` in
+    // `core/src/frame.zig`.
     case editorOpen      = 0x10
     case editorOp        = 0x11
     case editorPresence  = 0x12
     case editorSave      = 0x13
     case editorSaved     = 0x14
     case editorClose     = 0x15
+    // Multi-tab frames moved above the editor/access-mode range so they do
+    // not collide with newer protocol additions already on `main`.
+    case tabInput     = 0x16
+    case tabOpen      = 0x17
+    case tabClose     = 0x18
+    case tabFocus     = 0x19
+    case tabPtyOutput = 0x1A
 }
 
 enum SessionRole: UInt8 {
@@ -39,6 +40,14 @@ enum SessionRole: UInt8 {
 enum TermMode: UInt8 {
     case line = 0
     case raw  = 1
+}
+
+/// Host-controlled session access policy. Peers consult this to decide
+/// whether their input (terminal keystrokes, shared input, editor ops)
+/// should be allowed to leave the box. The host is always full-access.
+enum AccessMode: UInt8 {
+    case full     = 0
+    case viewOnly = 1
 }
 
 typealias UserID = (UInt8, UInt8, UInt8, UInt8,
@@ -109,11 +118,7 @@ enum Frame {
     case modeChange(TermMode)
     case roster([RosterEntry])
     case heartbeat
-    case tabOpen(tabId: UInt32, title: String)
-    case tabClose(tabId: UInt32)
-    case tabFocus(tabId: UInt32)
-    case tabPtyOutput(tabId: UInt32, data: Data)
-    case tabInput(tabId: UInt32, data: Data)
+    case accessMode(AccessMode)
     case editorOpen(docId: UInt64, path: String, snapshot: Data)
     case editorOp(docId: UInt64, opBytes: Data)
     case editorPresence(docId: UInt64, userId: UInt32,
@@ -121,6 +126,11 @@ enum Frame {
     case editorSave(docId: UInt64)
     case editorSaved(docId: UInt64, rev: UInt32)
     case editorClose(docId: UInt64)
+    case tabOpen(tabId: UInt32, title: String)
+    case tabClose(tabId: UInt32)
+    case tabFocus(tabId: UInt32)
+    case tabPtyOutput(tabId: UInt32, data: Data)
+    case tabInput(tabId: UInt32, data: Data)
 }
 
 enum FrameCodecError: Error {
@@ -193,28 +203,9 @@ enum FrameCodec {
             }
         case .heartbeat:
             out.append(FrameTag.heartbeat.rawValue)
-        case .tabOpen(let tabId, let title):
-            out.append(FrameTag.tabOpen.rawValue)
-            appendU32(&out, tabId)
-            let utf8 = Array(title.utf8)
-            appendU16(&out, UInt16(min(utf8.count, Int(UInt16.max))))
-            out.append(contentsOf: utf8.prefix(Int(UInt16.max)))
-        case .tabClose(let tabId):
-            out.append(FrameTag.tabClose.rawValue)
-            appendU32(&out, tabId)
-        case .tabFocus(let tabId):
-            out.append(FrameTag.tabFocus.rawValue)
-            appendU32(&out, tabId)
-        case .tabPtyOutput(let tabId, let data):
-            out.append(FrameTag.tabPtyOutput.rawValue)
-            appendU32(&out, tabId)
-            appendU32(&out, UInt32(data.count))
-            out.append(data)
-        case .tabInput(let tabId, let data):
-            out.append(FrameTag.tabInput.rawValue)
-            appendU32(&out, tabId)
-            appendU32(&out, UInt32(data.count))
-            out.append(data)
+        case .accessMode(let mode):
+            out.append(FrameTag.accessMode.rawValue)
+            out.append(mode.rawValue)
         case .editorOpen(let docId, let path, let snapshot):
             out.append(FrameTag.editorOpen.rawValue)
             appendU64(&out, docId)
@@ -244,6 +235,28 @@ enum FrameCodec {
         case .editorClose(let docId):
             out.append(FrameTag.editorClose.rawValue)
             appendU64(&out, docId)
+        case .tabOpen(let tabId, let title):
+            out.append(FrameTag.tabOpen.rawValue)
+            appendU32(&out, tabId)
+            let utf8 = Array(title.utf8)
+            appendU16(&out, UInt16(min(utf8.count, Int(UInt16.max))))
+            out.append(contentsOf: utf8.prefix(Int(UInt16.max)))
+        case .tabClose(let tabId):
+            out.append(FrameTag.tabClose.rawValue)
+            appendU32(&out, tabId)
+        case .tabFocus(let tabId):
+            out.append(FrameTag.tabFocus.rawValue)
+            appendU32(&out, tabId)
+        case .tabPtyOutput(let tabId, let data):
+            out.append(FrameTag.tabPtyOutput.rawValue)
+            appendU32(&out, tabId)
+            appendU32(&out, UInt32(data.count))
+            out.append(data)
+        case .tabInput(let tabId, let data):
+            out.append(FrameTag.tabInput.rawValue)
+            appendU32(&out, tabId)
+            appendU32(&out, UInt32(data.count))
+            out.append(data)
         }
         return out
     }
@@ -336,28 +349,12 @@ enum FrameCodec {
             return .roster(entries)
         case .heartbeat:
             return .heartbeat
-        case .tabOpen:
-            let tabId = try r.readU32()
-            let titleLen = try r.readU16()
-            let titleBytes = try r.readBytes(Int(titleLen))
-            let title = String(data: titleBytes, encoding: .utf8) ?? ""
-            return .tabOpen(tabId: tabId, title: title)
-        case .tabClose:
-            let tabId = try r.readU32()
-            return .tabClose(tabId: tabId)
-        case .tabFocus:
-            let tabId = try r.readU32()
-            return .tabFocus(tabId: tabId)
-        case .tabPtyOutput:
-            let tabId = try r.readU32()
-            let n = try r.readU32()
-            let payload = try r.readBytes(Int(n))
-            return .tabPtyOutput(tabId: tabId, data: payload)
-        case .tabInput:
-            let tabId = try r.readU32()
-            let n = try r.readU32()
-            let payload = try r.readBytes(Int(n))
-            return .tabInput(tabId: tabId, data: payload)
+        case .accessMode:
+            let mByte = try r.readU8()
+            guard let mode = AccessMode(rawValue: mByte) else {
+                throw FrameCodecError.invalidEnum
+            }
+            return .accessMode(mode)
         case .editorOpen:
             let docId = try r.readU64()
             let pathLen = try r.readU16()
@@ -388,6 +385,28 @@ enum FrameCodec {
         case .editorClose:
             let docId = try r.readU64()
             return .editorClose(docId: docId)
+        case .tabOpen:
+            let tabId = try r.readU32()
+            let titleLen = try r.readU16()
+            let titleBytes = try r.readBytes(Int(titleLen))
+            let title = String(data: titleBytes, encoding: .utf8) ?? ""
+            return .tabOpen(tabId: tabId, title: title)
+        case .tabClose:
+            let tabId = try r.readU32()
+            return .tabClose(tabId: tabId)
+        case .tabFocus:
+            let tabId = try r.readU32()
+            return .tabFocus(tabId: tabId)
+        case .tabPtyOutput:
+            let tabId = try r.readU32()
+            let n = try r.readU32()
+            let payload = try r.readBytes(Int(n))
+            return .tabPtyOutput(tabId: tabId, data: payload)
+        case .tabInput:
+            let tabId = try r.readU32()
+            let n = try r.readU32()
+            let payload = try r.readBytes(Int(n))
+            return .tabInput(tabId: tabId, data: payload)
         }
     }
 

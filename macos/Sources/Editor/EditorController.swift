@@ -24,6 +24,22 @@ enum EditorIntent {
     case redo
 }
 
+extension EditorIntent {
+    /// True when applying this intent would produce a CRDT op that
+    /// mutates the document. Movement and selection intents are not
+    /// considered mutations.
+    var isMutating: Bool {
+        switch self {
+        case .insert, .paste, .backspace, .deleteForward, .undo, .redo:
+            return true
+        case .moveLeft, .moveRight, .moveUp, .moveDown,
+             .moveLineStart, .moveLineEnd, .moveDocStart, .moveDocEnd,
+             .clearSelection, .selectExtend:
+            return false
+        }
+    }
+}
+
 /// Drives the RGA CRDT on behalf of the local user and fans local ops
 /// out via the `sendOp` closure. Presence (caret-anchor broadcasts) is
 /// debounced 50 ms so that running the caret across a line doesn't
@@ -37,6 +53,12 @@ final class EditorController {
 
     /// CRDT replica. Owned exclusively by this controller.
     private let core: EditorCore
+
+    /// When true, mutating intents (insert / delete / paste / undo / redo)
+    /// from the local user are dropped. Movement and selection intents are
+    /// still honoured so the user can scroll a caret around to read.
+    /// Set by `TerminalModel` from the host's broadcast access mode.
+    var isReadOnly: Bool = false
 
     /// Egress for local CRDT ops. Step 5 wires this to
     /// `SessionManager.sendEditorOp`.
@@ -53,6 +75,11 @@ final class EditorController {
 
     /// Debounce token for presence broadcasts.
     private var presenceWork: DispatchWorkItem?
+
+    /// Debounce token for syntax-highlight recomputation. Tokenizing
+    /// every keystroke is wasteful — coalesce 50 ms of edits into one
+    /// pass, same window we use for presence.
+    private var highlightWork: DispatchWorkItem?
 
     // MARK: Undo/redo
 
@@ -118,7 +145,11 @@ final class EditorController {
                 NSLog("EditorController: loadSnapshot failed: \(error)")
             }
         }
+        // Detect language up-front from the path so the first frame
+        // already has the right palette ready.
+        self.state.language = SyntaxHighlighter.detectLanguage(forPath: path)
         refreshText()
+        recomputeHighlights()
     }
 
     // MARK: Public helpers
@@ -223,8 +254,10 @@ final class EditorController {
 
     /// Entry point for every local user action. Movement intents only
     /// shift the caret (and maybe selection); mutation intents generate
-    /// and broadcast CRDT ops.
+    /// and broadcast CRDT ops. View-only peers silently drop all
+    /// mutating intents.
     func apply(_ intent: EditorIntent) {
+        if isReadOnly && intent.isMutating { return }
         switch intent {
         case .insert(let s):
             insertText(s)
@@ -628,6 +661,44 @@ final class EditorController {
         sendPresence(caretId, selId)
     }
 
+    // MARK: - Syntax highlighting
+
+    /// Coalesce highlight passes 50 ms after the last edit. The pass
+    /// itself runs on the main actor (it touches `@Published` state),
+    /// but the tokenizer is pure CPU work and finishes fast on the
+    /// sub-500KB documents we accept.
+    private func scheduleHighlights() {
+        highlightWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            Task { @MainActor in self?.recomputeHighlights() }
+        }
+        highlightWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50),
+                                      execute: work)
+    }
+
+    /// Tokenize the current document and replace `state.highlights`
+    /// with a line-grouped dictionary. Runs synchronously — call
+    /// directly from init for the first paint, otherwise route via
+    /// `scheduleHighlights()`.
+    private func recomputeHighlights() {
+        let language = state.language
+        guard language != .plain else {
+            if !state.highlights.isEmpty {
+                state.highlights = [:]
+                bumpEpoch()
+            }
+            return
+        }
+        let spans = SyntaxHighlighter.tokenize(state.text, language: language)
+        var grouped: [Int: [HighlightSpan]] = [:]
+        for span in spans {
+            grouped[span.line, default: []].append(span)
+        }
+        state.highlights = grouped
+        bumpEpoch()
+    }
+
     // MARK: - Utilities
 
     private func refreshText() {
@@ -636,6 +707,7 @@ final class EditorController {
         } catch {
             NSLog("EditorController.refreshText failed: \(error)")
         }
+        scheduleHighlights()
     }
 
     private func bumpEpoch() {

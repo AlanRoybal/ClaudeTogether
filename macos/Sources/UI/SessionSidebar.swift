@@ -109,6 +109,42 @@ struct SessionSidebar: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            if model.sessionManager.role == .host
+                && model.sessionManager.state == .running
+            {
+                GroupBox("Access") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Picker(
+                            "Mode",
+                            selection: Binding(
+                                get: { model.sessionManager.accessMode },
+                                set: { model.sessionManager.setAccessMode($0) })
+                        ) {
+                            Text("Full access").tag(AccessMode.full)
+                            Text("View only").tag(AccessMode.viewOnly)
+                        }
+                        .pickerStyle(.segmented)
+                        .controlSize(.small)
+                        Text(accessHostHelp)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            } else if model.sessionManager.role == .peer
+                && model.sessionManager.state == .running
+            {
+                GroupBox("Access") {
+                    HStack {
+                        Text(accessPeerLabel)
+                            .font(.caption)
+                            .foregroundStyle(accessPeerLabelColor)
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+
             Divider()
 
             GroupBox("Diagnostics") {
@@ -136,5 +172,33 @@ struct SessionSidebar: View {
             Spacer()
         }
         .padding(12)
+    }
+
+    /// Per-mode helper text shown beneath the host's access Picker.
+    private var accessHostHelp: String {
+        switch model.sessionManager.accessMode {
+        case .full:
+            return "Peers can type, edit, and use shared input."
+        case .viewOnly:
+            return "Peers observe only — input is dropped."
+        }
+    }
+
+    private var accessPeerLabel: String {
+        switch model.sessionManager.accessMode {
+        case .full:
+            return "Full access"
+        case .viewOnly:
+            return "View only"
+        }
+    }
+
+    private var accessPeerLabelColor: Color {
+        switch model.sessionManager.accessMode {
+        case .full:
+            return .secondary
+        case .viewOnly:
+            return .orange
+        }
     }
 }
