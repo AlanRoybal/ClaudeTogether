@@ -120,6 +120,7 @@ final class TerminalModel: ObservableObject {
     private var titleTimer: Timer?
     private var sharedInputs: [UInt32: SharedInputState] = [:]
     private var sharedInputPromptTimers: [UInt32: Timer] = [:]
+    private var sharedInputTransientOutputTimers: [UInt32: Timer] = [:]
     private var participantFocusedTab: [UserIdentity: UInt32] = [:]
     private var editorSavedRevisions: [UInt64: UInt32] = [:]
     private var fileSyncWatcher: FSSyncWatcher?
@@ -208,6 +209,9 @@ final class TerminalModel: ObservableObject {
         for timer in sharedInputPromptTimers.values {
             timer.invalidate()
         }
+        for timer in sharedInputTransientOutputTimers.values {
+            timer.invalidate()
+        }
         fileSyncTimer?.invalidate()
     }
 
@@ -266,6 +270,10 @@ final class TerminalModel: ObservableObject {
         activeTabId = nil
         nextTabId = 1
         participantFocusedTab.removeAll()
+        for timer in sharedInputTransientOutputTimers.values {
+            timer.invalidate()
+        }
+        sharedInputTransientOutputTimers.removeAll()
         rootPath = nil
         activeEditor = nil
         editorSavedRevisions.removeAll()
@@ -342,6 +350,7 @@ final class TerminalModel: ObservableObject {
         tabs.remove(at: idx)
         sharedInputs.removeValue(forKey: id)
         sharedInputPromptTimers.removeValue(forKey: id)?.invalidate()
+        sharedInputTransientOutputTimers.removeValue(forKey: id)?.invalidate()
         participantFocusedTab = participantFocusedTab.filter { $0.value != id }
         pendingHostTabInitialSnapshots.remove(id)
         pendingHostTabStartCwds.removeValue(forKey: id)
@@ -740,8 +749,10 @@ final class TerminalModel: ObservableObject {
     func handleResize(cols: UInt16, rows: UInt16) {
         lastKnownTerminalGridSize = (cols, rows)
         for tab in tabs {
+            preserveSharedInputAcrossTransientOutput(tabId: tab.id)
             tab.pty?.resize(cols: cols, rows: rows)
             tab.grid.resize(cols: cols, rows: rows, preserveTop: true)
+            reanchorSharedInputToGridCursor(tabId: tab.id)
         }
         schedulePendingHostTabStarts(cols: cols, rows: rows)
     }
@@ -798,6 +809,7 @@ final class TerminalModel: ObservableObject {
             }
         case .hello:
             if sessionManager.role == .host, sessionManager.state == .running {
+                preserveActiveSharedInputsAcrossTransientOutput()
                 syncSharedInputParticipants(broadcast: false)
                 sessionManager.sendMode(lastLocalCreatorOnlyMode ? .raw : .line)
                 sessionManager.broadcastAccessMode()
@@ -1155,7 +1167,21 @@ final class TerminalModel: ObservableObject {
         case .snapshot(let tabId, let snapshot):
             guard sessionManager.role == .peer else { return }
             var state = sharedInputs[tabId] ?? SharedInputState()
+            let wasActive = state.isActive
+            let preservedAnchor = (state.anchorCol, state.anchorRow)
+            let localAnchor = tabs.first(where: { $0.id == tabId })?.grid.term.cursor()
             state.apply(snapshot)
+            if snapshot.isActive {
+                if wasActive {
+                    state.overrideAnchor(
+                        anchorCol: preservedAnchor.0,
+                        anchorRow: preservedAnchor.1)
+                } else if let localAnchor {
+                    state.overrideAnchor(
+                        anchorCol: localAnchor.x,
+                        anchorRow: localAnchor.y)
+                }
+            }
             sharedInputs[tabId] = state
             syncGridSharedInputOverlay(tabId: tabId)
         }
@@ -1232,6 +1258,11 @@ final class TerminalModel: ObservableObject {
             return
         }
         if sharedInputs[tabId]?.isActive == true {
+            if sharedInputTransientOutputTimers[tabId] != nil {
+                reanchorSharedInputToGridCursor(tabId: tabId)
+                broadcastSharedInputSnapshot(tabId: tabId)
+                return
+            }
             deactivateSharedInput(tabId: tabId, bumpRevision: true)
             syncGridSharedInputOverlay(tabId: tabId)
             broadcastSharedInputSnapshot(tabId: tabId)
@@ -1318,9 +1349,42 @@ final class TerminalModel: ObservableObject {
 
     private func deactivateSharedInput(tabId: UInt32,
                                        bumpRevision: Bool) {
+        sharedInputTransientOutputTimers.removeValue(forKey: tabId)?.invalidate()
         var state = sharedInputs[tabId] ?? SharedInputState()
         _ = state.deactivate(bumpRevision: bumpRevision)
         sharedInputs[tabId] = state
+    }
+
+    private func preserveActiveSharedInputsAcrossTransientOutput() {
+        for tab in tabs where sharedInputs[tab.id]?.isActive == true {
+            preserveSharedInputAcrossTransientOutput(tabId: tab.id)
+        }
+    }
+
+    private func preserveSharedInputAcrossTransientOutput(tabId: UInt32) {
+        guard sharedInputs[tabId]?.isActive == true else { return }
+        sharedInputTransientOutputTimers.removeValue(forKey: tabId)?.invalidate()
+        sharedInputTransientOutputTimers[tabId] = Timer.scheduledTimer(
+            withTimeInterval: 0.75,
+            repeats: false
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.sharedInputTransientOutputTimers.removeValue(forKey: tabId)
+            }
+        }
+    }
+
+    private func reanchorSharedInputToGridCursor(tabId: UInt32) {
+        guard var state = sharedInputs[tabId],
+              state.isActive,
+              let grid = tabs.first(where: { $0.id == tabId })?.grid
+        else {
+            return
+        }
+        let cursor = grid.term.cursor()
+        state.overrideAnchor(anchorCol: cursor.x, anchorRow: cursor.y)
+        sharedInputs[tabId] = state
+        syncGridSharedInputOverlay(tabId: tabId)
     }
 
     private func broadcastTerminalSnapshot() {
@@ -1493,7 +1557,11 @@ final class TerminalModel: ObservableObject {
         for timer in sharedInputPromptTimers.values {
             timer.invalidate()
         }
+        for timer in sharedInputTransientOutputTimers.values {
+            timer.invalidate()
+        }
         sharedInputPromptTimers.removeAll()
+        sharedInputTransientOutputTimers.removeAll()
         sharedInputs.removeAll()
         syncAllGridSharedInputOverlays()
     }
