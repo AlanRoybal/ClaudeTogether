@@ -96,6 +96,27 @@ export fn ct_term_snapshot(t: ?*Term, out: [*]grid_mod.Cell, capacity: usize) us
     return 0;
 }
 
+export fn ct_term_scrollback_len(t: ?*Term) u32 {
+    if (t) |p| return p.grid.scrollbackLen();
+    return 0;
+}
+
+export fn ct_term_scrollback_snapshot(
+    t: ?*Term,
+    start_row: u32,
+    num_rows: u32,
+    out: [*]grid_mod.Cell,
+    capacity: usize,
+) u32 {
+    if (t) |p| {
+        return p.grid.copyScrollback(
+            start_row,
+            num_rows,
+            out[0..capacity]);
+    }
+    return 0;
+}
+
 export fn ct_term_size(t: ?*Term, out_cols: *u16, out_rows: *u16) void {
     if (t) |p| {
         out_cols.* = p.grid.cols;
@@ -130,4 +151,24 @@ export fn ct_term_dirty_epoch(t: ?*Term) u32 {
 export fn ct_term_mouse_mode(t: ?*Term) u32 {
     if (t) |p| return p.grid.mouse_mode;
     return 0;
+}
+
+test "C ABI exposes terminal scrollback rows" {
+    const testing = std.testing;
+    var term = try Term.init(testing.allocator, 4, 2);
+    defer term.deinit(testing.allocator);
+
+    const bytes = "A\r\nB\r\nC\r\n";
+    ct_term_feed(term, bytes.ptr, bytes.len);
+    try testing.expect(ct_term_scrollback_len(term) >= 1);
+
+    var row: [4]grid_mod.Cell = undefined;
+    const copied = ct_term_scrollback_snapshot(
+        term,
+        0,
+        1,
+        row[0..].ptr,
+        row.len);
+    try testing.expectEqual(@as(u32, 1), copied);
+    try testing.expectEqual(@as(u32, 'A'), row[0].codepoint);
 }

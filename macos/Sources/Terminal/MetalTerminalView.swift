@@ -139,6 +139,7 @@ final class MetalTerminalNSView: NSView {
     // MARK: keyboard -> closure
 
     override func keyDown(with event: NSEvent) {
+        if handleScrollbackKey(event) { return }
         // Any keystroke clears an active selection (matches standard terminal UX).
         if selectionAnchor != nil { clearSelection() }
         guard inputEnabled else {
@@ -151,6 +152,7 @@ final class MetalTerminalNSView: NSView {
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if handleScrollbackKey(event) { return true }
         guard event.modifierFlags.contains(.command) else {
             return super.performKeyEquivalent(with: event)
         }
@@ -311,20 +313,43 @@ final class MetalTerminalNSView: NSView {
     }
 
     override func scrollWheel(with event: NSEvent) {
-        guard shouldReportMouse else {
-            super.scrollWheel(with: event)
+        if shouldReportMouse {
+            let dy = event.scrollingDeltaY
+            guard abs(dy) >= 0.1 else { return }
+            let cell = gridCell(for: event)
+            emitSGR(
+                button: dy > 0 ? SGRButton.scrollUp : SGRButton.scrollDown,
+                col: cell.col,
+                row: cell.row,
+                pressed: true,
+                motion: false,
+                flags: event.modifierFlags)
             return
         }
         let dy = event.scrollingDeltaY
         guard abs(dy) >= 0.1 else { return }
-        let cell = gridCell(for: event)
-        emitSGR(
-            button: dy > 0 ? SGRButton.scrollUp : SGRButton.scrollDown,
-            col: cell.col,
-            row: cell.row,
-            pressed: true,
-            motion: false,
-            flags: event.modifierFlags)
+        let magnitude = max(1, Int(abs(dy) / 12.0))
+        if grid.scroll(byRows: dy > 0 ? magnitude : -magnitude) {
+            clearSelection()
+        }
+    }
+
+    private func handleScrollbackKey(_ event: NSEvent) -> Bool {
+        guard event.modifierFlags.contains(.shift) else { return false }
+        let page = max(1, Int(renderer.rows) - 1)
+        switch Int(event.keyCode) {
+        case kVK_PageUp:
+            return grid.scroll(byRows: page)
+        case kVK_PageDown:
+            return grid.scroll(byRows: -page)
+        case kVK_Home:
+            return grid.scroll(byRows: Int.max / 4)
+        case kVK_End:
+            grid.scrollToBottom()
+            return true
+        default:
+            return false
+        }
     }
 
     private func reportSharedInputMouse(event: NSEvent) -> Bool {

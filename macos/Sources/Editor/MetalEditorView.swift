@@ -214,6 +214,12 @@ final class MetalEditorNSView: NSView {
 
         let intent: EditorIntent?
         switch Int(event.keyCode) {
+        case kVK_PageUp:
+            grid.scroll(byRows: -max(1, Int(grid.rows) - 1))
+            return true
+        case kVK_PageDown:
+            grid.scroll(byRows: max(1, Int(grid.rows) - 1))
+            return true
         case kVK_LeftArrow:
             intent = command ? .moveLineStart : .moveLeft(byWord: option)
         case kVK_RightArrow:

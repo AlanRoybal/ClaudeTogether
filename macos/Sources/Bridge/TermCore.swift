@@ -59,6 +59,32 @@ final class TermCore {
         return buf.withUnsafeBufferPointer { $0 }
     }
 
+    var scrollbackLength: Int {
+        guard let h = handle else { return 0 }
+        return Int(ct_term_scrollback_len(h))
+    }
+
+    func copyScrollback(startRow: Int,
+                        rowCount: Int,
+                        into out: inout [ct_cell]) -> Int
+    {
+        guard let h = handle,
+              startRow >= 0,
+              rowCount > 0,
+              !out.isEmpty
+        else {
+            return 0
+        }
+        return out.withUnsafeMutableBufferPointer { p in
+            Int(ct_term_scrollback_snapshot(
+                h,
+                UInt32(min(startRow, Int(UInt32.max))),
+                UInt32(min(rowCount, Int(UInt32.max))),
+                p.baseAddress,
+                p.count))
+        }
+    }
+
     func cursor() -> (x: UInt16, y: UInt16) {
         guard let h = handle else { return (0, 0) }
         var x: UInt16 = 0
