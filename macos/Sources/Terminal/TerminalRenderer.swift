@@ -4,11 +4,13 @@ import MetalKit
 import simd
 import CollabTermC
 
-/// Matches `BgInstance` in Shaders.metal. 2 + 4 = 8 bytes, round to 16.
+/// Matches `BgInstance` in Shaders.metal exactly: ushort2 + uchar4 = 8 bytes.
+/// The struct MUST stay 8 bytes — Metal reads instanced buffers at sizeof(BgInstance)
+/// strides on the GPU side, so any extra padding here would misalign every instance
+/// after the first and produce a checkerboard artefact.
 struct BgInstance {
     var gridPos: SIMD2<UInt16> = .zero
     var color: SIMD4<UInt8> = .zero
-    var _pad: (UInt16, UInt16, UInt16, UInt16, UInt16) = (0, 0, 0, 0, 0)
 }
 
 /// Matches `CursorInstance` in Shaders.metal.
@@ -71,6 +73,10 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
 
     var cursorVisible = true
     private var blinkStart = CACurrentMediaTime()
+
+    /// Normalized selection range set by the view layer. Both endpoints are
+    /// inclusive and `start` is always <= `end` (row-major order).
+    var selection: (start: (col: Int, row: Int), end: (col: Int, row: Int))? = nil
 
     init?(view: MTKView, pointSize: CGFloat = 13) {
         guard let device = view.device ?? MTLCreateSystemDefaultDevice() else {
@@ -229,13 +235,19 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         textInstances.reserveCapacity(cellCount)
         cursorTextInstances.reserveCapacity(overlay.blocks.count)
 
+        let selectionSnapshot = selection   // snapshot so rendering is consistent
+        let selectionColor = SIMD4<UInt8>(70, 130, 200, 255)  // #4682C8
+
         if snap.count >= cellCount {
             let atlasW = Float(atlas.atlasWidthPx)
             let atlasH = Float(atlas.atlasHeightPx)
             for y in 0..<rows {
                 for x in 0..<cols {
                     let c = snap[y * cols + x]
-                    if c.width == 0 { continue } // trailing half of wide glyph
+                    // width==0 marks the trailing half of a CJK wide glyph.
+                    // We still emit a BG quad for every cell so selection
+                    // highlighting is solid; only the text glyph pass skips
+                    // trailing halves.
                     let fg = unpack(c.fg)
                     let bg = unpack(c.bg)
 
@@ -243,10 +255,11 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                     // collaborator blocks are composited in the cursor pass.
                     var bi = BgInstance()
                     bi.gridPos = SIMD2<UInt16>(UInt16(x), UInt16(y))
-                    bi.color = bg
+                    bi.color = selectionSnapshot.map { isCellSelected(col: x, row: y, sel: $0) ? selectionColor : bg } ?? bg
                     bgInstances.append(bi)
 
-                    // TEXT: skip blanks.
+                    // TEXT: skip wide-glyph trailing halves and blanks.
+                    if c.width == 0 { continue }
                     if let ti = makeTextInstance(
                         cell: c,
                         col: UInt16(x),
@@ -468,6 +481,18 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             Float(entry.pixelH) / atlasH)
         ti.fg = color
         return ti
+    }
+
+    private func isCellSelected(
+        col: Int, row: Int,
+        sel: (start: (col: Int, row: Int), end: (col: Int, row: Int))
+    ) -> Bool {
+        let s = sel.start, e = sel.end
+        if row < s.row || row > e.row { return false }
+        if s.row == e.row { return col >= s.col && col <= e.col }
+        if row == s.row { return col >= s.col }
+        if row == e.row { return col <= e.col }
+        return true
     }
 
     private func cursorTextColor(on cursorColor: SIMD4<UInt8>) -> SIMD4<UInt8> {
