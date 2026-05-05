@@ -19,16 +19,21 @@ struct ContentView: View {
                     VStack(spacing: 0) {
                         TabStripView(model: model)
                         if let tab = model.activeTabForView {
-                            MetalTerminalView(
-                                grid: tab.grid,
-                                onKey: { bytes in
-                                    model.handleKey(bytes, forTabId: tab.id)
-                                },
-                                onResize: { cols, rows in
-                                    model.handleResize(cols: cols, rows: rows)
-                                },
-                                inputEnabled: model.inputEnabled)
-                                .frame(minWidth: 500, minHeight: 300)
+                            ZStack(alignment: .topLeading) {
+                                MetalTerminalView(
+                                    grid: tab.grid,
+                                    onKey: { bytes in
+                                        model.handleKey(bytes, forTabId: tab.id)
+                                    },
+                                    onResize: { cols, rows in
+                                        model.handleResize(cols: cols, rows: rows)
+                                    },
+                                    inputEnabled: model.inputEnabled)
+                                SharedInputAutocompleteOverlay(
+                                    grid: tab.grid,
+                                    autocomplete: model.inputAutocomplete)
+                            }
+                            .frame(minWidth: 500, minHeight: 300)
                         }
                     }
                 } else {
@@ -91,6 +96,17 @@ final class TerminalModel: ObservableObject {
     @Published var boreBundlePath: String?
     @Published var coreVersion: Int32 = 0
     @Published var activeEditor: EditorController?
+
+    /// Persisted command history feeding the shared-input autocomplete.
+    /// Captured from `inputCommit` whenever a line dispatches to the PTY.
+    let commandHistory = CommandHistory()
+
+    /// Autocomplete state for the shared input line. Updated as the
+    /// shared input mutates; consumed by ContentView's overlay.
+    let inputAutocomplete = AutocompleteState()
+
+    /// Cap on the number of history suggestions surfaced at once.
+    private static let inputAutocompleteMaxItems = 5
 
     let sessionManager = SessionManager()
 
@@ -1093,6 +1109,32 @@ final class TerminalModel: ObservableObject {
     }
 
     private func handleSharedInputKey(_ bytes: [UInt8], tabId: UInt32) -> Bool {
+        if (canUseHostSharedInput(tabId: tabId) || canUsePeerSharedInput(tabId: tabId)),
+           inputAutocomplete.visible
+        {
+            switch bytes {
+            case [0x09]:
+                acceptInputAutocompleteSelection(tabId: tabId)
+                return true
+            case [0x1B]:
+                inputAutocomplete.dismiss()
+                return true
+            case Array("\u{1B}[A".utf8):
+                inputAutocomplete.moveSelection(by: -1)
+                return true
+            case Array("\u{1B}[B".utf8):
+                inputAutocomplete.moveSelection(by: +1)
+                return true
+            case [0x0D]:
+                if inputAutocomplete.userHasNavigated {
+                    acceptInputAutocompleteSelection(tabId: tabId)
+                }
+            default:
+                break
+            }
+        }
+
+
         let actor = sessionManager.localIdentity
         guard let request = sharedInputRequest(for: bytes, actor: actor) else {
             return false
@@ -1184,6 +1226,7 @@ final class TerminalModel: ObservableObject {
             }
             sharedInputs[tabId] = state
             syncGridSharedInputOverlay(tabId: tabId)
+            refreshInputAutocomplete()
         }
     }
 
@@ -1202,6 +1245,7 @@ final class TerminalModel: ObservableObject {
         syncGridSharedInputOverlay(tabId: tabId)
         broadcastSharedInputSnapshot(tabId: tabId)
         handleSharedInputEffect(tabId: tabId, effect)
+        refreshInputAutocomplete()
     }
 
     private func applyOptimisticSharedInputRequest(tabId: UInt32,
@@ -1212,6 +1256,7 @@ final class TerminalModel: ObservableObject {
         let effect = state.apply(request, bumpRevision: false)
         sharedInputs[tabId] = state
         syncGridSharedInputOverlay(tabId: tabId)
+        refreshInputAutocomplete()
         if case .none = effect {
             return
         }
@@ -1226,6 +1271,8 @@ final class TerminalModel: ObservableObject {
             return
         case .commit(let line):
             syncGridSharedInputOverlay(tabId: tabId)
+            commandHistory.record(line)
+            inputAutocomplete.dismiss()
             if sessionManager.role == .host,
                interceptEditorCommand(line, fromTabId: tabId)
             {
@@ -1240,6 +1287,7 @@ final class TerminalModel: ObservableObject {
             }
         case .interrupt:
             syncGridSharedInputOverlay(tabId: tabId)
+            inputAutocomplete.dismiss()
             if sessionManager.role == .host,
                let pty = tabs.first(where: { $0.id == tabId })?.pty
             {
@@ -1547,6 +1595,88 @@ final class TerminalModel: ObservableObject {
         }
     }
 
+    // MARK: shared-input autocomplete
+
+    private func refreshInputAutocomplete() {
+        guard let tabId = activeTabId,
+              (isHostSharedLineSession(tabId: tabId) || isPeerSharedLineSession(tabId: tabId)),
+              sharedInputs[tabId]?.isActive == true
+        else {
+            inputAutocomplete.dismiss()
+            return
+        }
+        let text = sharedInputs[tabId]?.text ?? ""
+        guard !text.isEmpty else {
+            inputAutocomplete.dismiss()
+            return
+        }
+        let matches = FuzzyMatcher.rank(
+            candidates: commandHistory.entries,
+            needle: text,
+            recencyRank: commandHistory.recencyRank,
+            limit: Self.inputAutocompleteMaxItems)
+        let filtered = matches.filter { $0 != text }
+        if filtered.isEmpty {
+            inputAutocomplete.dismiss()
+            return
+        }
+        inputAutocomplete.update(items: filtered, prefix: text)
+    }
+
+    private func acceptInputAutocompleteSelection(tabId: UInt32) {
+        guard let suggestion = inputAutocomplete.currentSelection else { return }
+        replaceSharedInputLine(tabId: tabId, with: suggestion)
+        inputAutocomplete.dismiss()
+    }
+
+    private func replaceSharedInputLine(tabId: UInt32, with text: String) {
+        guard sharedInputs[tabId]?.isActive == true else { return }
+        let actor = sessionManager.localIdentity
+        if canUseHostSharedInput(tabId: tabId) {
+            var state = sharedInputs[tabId]!
+            _ = state.apply(SharedInputRequest(actor: actor, kind: .moveEnd), bumpRevision: false)
+            let count = state.textScalars.count
+            for _ in 0..<count {
+                _ = state.apply(SharedInputRequest(actor: actor, kind: .backspace), bumpRevision: false)
+            }
+            _ = state.apply(SharedInputRequest(actor: actor, kind: .insertText, text: text), bumpRevision: true)
+            sharedInputs[tabId] = state
+            syncGridSharedInputOverlay(tabId: tabId)
+            broadcastSharedInputSnapshot(tabId: tabId)
+        } else if canUsePeerSharedInput(tabId: tabId) {
+            var state = sharedInputs[tabId]!
+            let moveEnd = SharedInputRequest(actor: actor, kind: .moveEnd)
+            _ = state.apply(moveEnd, bumpRevision: false)
+            let moveEndPayload = SharedInputCodec.encode(.request(tabId: tabId, moveEnd))
+            if tabId == TerminalModel.placeholderTabId {
+                sessionManager.sendInputBytes(moveEndPayload)
+            } else {
+                sessionManager.sendTabInput(tabId: tabId, data: moveEndPayload)
+            }
+            let count = state.textScalars.count
+            for _ in 0..<count {
+                let bs = SharedInputRequest(actor: actor, kind: .backspace)
+                _ = state.apply(bs, bumpRevision: false)
+                let bsPayload = SharedInputCodec.encode(.request(tabId: tabId, bs))
+                if tabId == TerminalModel.placeholderTabId {
+                    sessionManager.sendInputBytes(bsPayload)
+                } else {
+                    sessionManager.sendTabInput(tabId: tabId, data: bsPayload)
+                }
+            }
+            let ins = SharedInputRequest(actor: actor, kind: .insertText, text: text)
+            _ = state.apply(ins, bumpRevision: false)
+            let insPayload = SharedInputCodec.encode(.request(tabId: tabId, ins))
+            if tabId == TerminalModel.placeholderTabId {
+                sessionManager.sendInputBytes(insPayload)
+            } else {
+                sessionManager.sendTabInput(tabId: tabId, data: insPayload)
+            }
+            sharedInputs[tabId] = state
+            syncGridSharedInputOverlay(tabId: tabId)
+        }
+    }
+
     private func syncAllGridSharedInputOverlays() {
         for tab in tabs {
             syncGridSharedInputOverlay(tabId: tab.id)
@@ -1564,6 +1694,7 @@ final class TerminalModel: ObservableObject {
         sharedInputTransientOutputTimers.removeAll()
         sharedInputs.removeAll()
         syncAllGridSharedInputOverlays()
+        inputAutocomplete.dismiss()
     }
 
     private func interceptEditorCommand(_ line: String,
@@ -2015,5 +2146,53 @@ private struct SnapshotStyle: Equatable {
         parts.append("38;2;\((fg >> 16) & 0xFF);\((fg >> 8) & 0xFF);\(fg & 0xFF)")
         parts.append("48;2;\((bg >> 16) & 0xFF);\((bg >> 8) & 0xFF);\(bg & 0xFF)")
         return "\u{1B}[\(parts.joined(separator: ";"))m"
+    }
+}
+
+
+/// Floats the autocomplete popover above (or below) the local user's
+/// cursor cell in the terminal grid. Reads cursor position from
+/// `GridModel.cursors` and infers cell size from the live SwiftUI
+/// bounds so it tracks the renderer at any window size.
+struct SharedInputAutocompleteOverlay: View {
+    @ObservedObject var grid: GridModel
+    @ObservedObject var autocomplete: AutocompleteState
+
+    private let estItemHeight: CGFloat = 22
+    private let estPadding: CGFloat = 8
+    private let estWidth: CGFloat = 320
+
+    var body: some View {
+        GeometryReader { geo in
+            if autocomplete.visible,
+               !autocomplete.items.isEmpty,
+               let local = grid.cursors.first(where: { $0.isLocal })
+            {
+                let position = computePosition(geo: geo, local: local)
+                AutocompletePopover(state: autocomplete)
+                    .frame(width: estWidth, alignment: .leading)
+                    .offset(x: position.x, y: position.y)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func computePosition(geo: GeometryProxy,
+                                 local: UserCursor) -> CGPoint
+    {
+        let cols = max(CGFloat(grid.cols), 1)
+        let rows = max(CGFloat(grid.rows), 1)
+        let cellW = geo.size.width / cols
+        let cellH = geo.size.height / rows
+        let caretX = CGFloat(local.col) * cellW
+        let caretY = CGFloat(local.row) * cellH
+
+        let estHeight = max(1, CGFloat(autocomplete.items.count)
+                            * estItemHeight + estPadding)
+        let preferredAbove = caretY - estHeight - 4
+        let py = preferredAbove >= 0 ? preferredAbove : caretY + cellH + 4
+        let px = min(max(0, caretX),
+                     max(0, geo.size.width - estWidth))
+        return CGPoint(x: px, y: py)
     }
 }

@@ -15,7 +15,7 @@ final class MetalEditorNSView: NSView {
         let view = MTKView(frame: .zero)
         self.mtkView = view
         self.controller = controller
-        self.grid = EditorGridModel(controller: controller)
+        self.grid = controller.gridModel
         guard let renderer = EditorRenderer(view: view) else { return nil }
         self.renderer = renderer
 
@@ -41,7 +41,7 @@ final class MetalEditorNSView: NSView {
     func updateController(_ controller: EditorController) {
         guard self.controller !== controller else { return }
         self.controller = controller
-        self.grid = EditorGridModel(controller: controller)
+        self.grid = controller.gridModel
         renderer.grid = grid
         grid.resize(cols: renderer.cols, rows: renderer.rows)
     }
@@ -54,12 +54,43 @@ final class MetalEditorNSView: NSView {
     }
 
     override func keyDown(with event: NSEvent) {
+        if handleAutocompleteKey(event) { return }
         if handleSpecialKey(event) { return }
         if let text = plainText(from: event) {
             controller.apply(.insert(text))
             return
         }
         super.keyDown(with: event)
+    }
+
+    /// Intercept autocomplete navigation/accept keys when the popover
+    /// is visible. Returns true when the event has been consumed.
+    /// Tab always accepts; Up/Down navigate; Esc dismisses; Enter
+    /// auto-accepts only when the user has explicitly navigated.
+    private func handleAutocompleteKey(_ event: NSEvent) -> Bool {
+        guard controller.autocomplete.visible else { return false }
+        switch Int(event.keyCode) {
+        case kVK_Tab:
+            controller.acceptAutocompleteSuggestion()
+            return true
+        case kVK_Escape:
+            controller.autocomplete.dismiss()
+            return true
+        case kVK_UpArrow:
+            controller.autocomplete.moveSelection(by: -1)
+            return true
+        case kVK_DownArrow:
+            controller.autocomplete.moveSelection(by: +1)
+            return true
+        case kVK_Return:
+            if controller.autocomplete.userHasNavigated {
+                controller.acceptAutocompleteSuggestion()
+                return true
+            }
+            return false
+        default:
+            return false
+        }
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {

@@ -76,9 +76,18 @@ final class EditorController {
     /// Debounce token for presence broadcasts.
     private var presenceWork: DispatchWorkItem?
 
-    /// Debounce token for syntax-highlight recomputation. Tokenizing
-    /// every keystroke is wasteful — coalesce 50 ms of edits into one
-    /// pass, same window we use for presence.
+    // MARK: Autocomplete
+
+    let autocomplete = AutocompleteState()
+    let wordIndex = EditorWordIndex()
+    private static let autocompleteMinPrefixLength = 2
+    private static let autocompleteMaxItems = 8
+
+    // MARK: Display projection
+
+    lazy var gridModel: EditorGridModel = EditorGridModel(controller: self)
+
+    /// Debounce token for syntax-highlight recomputation.
     private var highlightWork: DispatchWorkItem?
 
     // MARK: Undo/redo
@@ -269,6 +278,7 @@ final class EditorController {
             deleteForward()
         case .clearSelection:
             state.localSelectionAnchor = nil
+            autocomplete.dismiss()
             bumpEpoch()
         case .selectExtend(let movement):
             if state.localSelectionAnchor == nil {
@@ -277,6 +287,7 @@ final class EditorController {
             applyMovement(movement)
             bumpEpoch()
             schedulePresence()
+            recomputeAutocomplete()
             return
         case .undo:
             performUndo()
@@ -291,10 +302,12 @@ final class EditorController {
             applyMovement(intent)
             bumpEpoch()
             schedulePresence()
+            recomputeAutocomplete()
             return
         }
         bumpEpoch()
         schedulePresence()
+        recomputeAutocomplete()
     }
 
     // MARK: - Mutation
@@ -707,7 +720,48 @@ final class EditorController {
         } catch {
             NSLog("EditorController.refreshText failed: \(error)")
         }
+        wordIndex.setText(state.text)
+        recomputeAutocomplete()
         scheduleHighlights()
+    }
+
+    // MARK: Autocomplete pipeline
+
+    private func recomputeAutocomplete() {
+        let scalars = scalarArray
+        let caret = state.localCaret
+        guard state.localSelectionAnchor == nil,
+              let word = EditorWordIndex.wordEndingAt(scalars: scalars, caret: caret),
+              word.count >= Self.autocompleteMinPrefixLength
+        else {
+            autocomplete.dismiss()
+            return
+        }
+
+        if caret < scalars.count, EditorWordIndex.isWordScalar(scalars[caret]) {
+            autocomplete.dismiss()
+            return
+        }
+
+        let matches = wordIndex.prefixMatches(
+            prefix: word,
+            limit: Self.autocompleteMaxItems,
+            excluding: word)
+        if matches.isEmpty {
+            autocomplete.dismiss()
+            return
+        }
+        autocomplete.update(items: matches, prefix: word)
+    }
+
+    func acceptAutocompleteSuggestion() {
+        guard let suggestion = autocomplete.currentSelection else { return }
+        let prefix = autocomplete.prefix
+        autocomplete.dismiss()
+        guard suggestion.hasPrefix(prefix) else { return }
+        let suffix = String(suggestion.dropFirst(prefix.count))
+        guard !suffix.isEmpty else { return }
+        apply(.insert(suffix))
     }
 
     private func bumpEpoch() {
