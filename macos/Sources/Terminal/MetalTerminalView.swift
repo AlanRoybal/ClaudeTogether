@@ -14,9 +14,29 @@ final class MetalTerminalNSView: NSView {
     private(set) var grid: GridModel
     private var onKey: ([UInt8]) -> Void
     private var onResize: (UInt16, UInt16) -> Void
+    private var onMouseCell: (UInt16, UInt16) -> Bool
     private var lastPropagatedGridSize: (cols: UInt16, rows: UInt16)?
     /// When true, keystrokes are dropped (peer in raw mode: creator-only input).
     var inputEnabled: Bool = true
+    /// Tracks the user-visible "Mouse mode" toggle in the sidebar. When false,
+    /// every mouse event falls through to default NSView behavior (focus on
+    /// click, no PTY traffic) regardless of what the running app has DECSET.
+    var mouseModeEnabled: Bool = false {
+        didSet { refreshTrackingArea() }
+    }
+
+    /// Bookkeeping for SGR mouse encoding.
+    private var mouseTrackingArea: NSTrackingArea?
+    private var lastMotionCol: Int = -1
+    private var lastMotionRow: Int = -1
+    private var lastMotionTime: CFTimeInterval = 0
+    /// 30Hz cap on mouseMoved reporting (1003 fires every motion event,
+    /// which can swamp the PTY at trackpad rates).
+    private static let motionMinInterval: CFTimeInterval = 1.0 / 30.0
+    /// Track whether the last reportable mouse position was inside the
+    /// grid. We don't want to spam clamped (col=0,row=0) reports when the
+    /// pointer leaves the cell area.
+    private var lastMotionInside: Bool = false
 
     // MARK: selection
     private var selectionAnchor: (col: Int, row: Int)? = nil
@@ -25,6 +45,7 @@ final class MetalTerminalNSView: NSView {
     init?(grid: GridModel,
           onKey: @escaping ([UInt8]) -> Void,
           onResize: @escaping (UInt16, UInt16) -> Void,
+          onMouseCell: @escaping (UInt16, UInt16) -> Bool = { _, _ in false },
           pointSize: CGFloat = 13)
     {
         let view = MTKView(frame: .zero)
@@ -36,6 +57,7 @@ final class MetalTerminalNSView: NSView {
         self.renderer = renderer
         self.onKey = onKey
         self.onResize = onResize
+        self.onMouseCell = onMouseCell
         super.init(frame: .zero)
 
         renderer.grid = grid
@@ -75,10 +97,12 @@ final class MetalTerminalNSView: NSView {
     }
 
     func updateHandlers(onKey: @escaping ([UInt8]) -> Void,
-                        onResize: @escaping (UInt16, UInt16) -> Void)
+                        onResize: @escaping (UInt16, UInt16) -> Void,
+                        onMouseCell: @escaping (UInt16, UInt16) -> Bool)
     {
         self.onKey = onKey
         self.onResize = onResize
+        self.onMouseCell = onMouseCell
     }
 
     /// Rebuilds the renderer's glyph atlas if the requested point size has
@@ -95,15 +119,21 @@ final class MetalTerminalNSView: NSView {
         bounds.contains(point) ? self : nil
     }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.makeFirstResponder(self)
         syncRendererGridSize()
+        refreshTrackingArea()
     }
 
     override func layout() {
         super.layout()
         syncRendererGridSize()
+        refreshTrackingArea()
     }
 
     // MARK: keyboard -> closure
@@ -157,26 +187,221 @@ final class MetalTerminalNSView: NSView {
         return super.performKeyEquivalent(with: event)
     }
 
-    // MARK: mouse -> selection
+    // MARK: mouse -> terminal / selection
+
+    private enum SGRButton {
+        static let left: Int = 0
+        static let middle: Int = 1
+        static let right: Int = 2
+        static let scrollUp: Int = 64
+        static let scrollDown: Int = 65
+        static let motionFlag: Int = 32
+        static let shiftFlag: Int = 4
+        static let altFlag: Int = 8
+        static let ctrlFlag: Int = 16
+    }
+
+    private var shouldReportMouse: Bool {
+        guard mouseModeEnabled else { return false }
+        let term = grid.term
+        guard term.x10Mouse || term.dragMouse || term.anyMotionMouse else {
+            return false
+        }
+        return term.sgrMouse
+    }
 
     override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        if shouldReportMouse {
+            clearSelection()
+            reportClick(event: event, button: SGRButton.left, pressed: true)
+            return
+        }
+        if reportSharedInputMouse(event: event) {
+            clearSelection()
+            return
+        }
         let loc = convert(event.locationInWindow, from: nil)
         selectionAnchor = cellAt(point: loc)
         selectionHead = selectionAnchor
-        renderer.selection = nil   // clear visual until drag starts
-        window?.makeFirstResponder(self)
+        renderer.selection = nil
     }
 
     override func mouseDragged(with event: NSEvent) {
+        if shouldReportMouse {
+            guard grid.term.dragMouse || grid.term.anyMotionMouse else { return }
+            reportMotion(event: event, button: SGRButton.left)
+            return
+        }
+        if reportSharedInputMouse(event: event) {
+            clearSelection()
+            return
+        }
         let loc = convert(event.locationInWindow, from: nil)
         selectionHead = cellAt(point: loc)
         updateRendererSelection()
     }
 
     override func mouseUp(with event: NSEvent) {
-        // Click without drag: clear any nascent selection.
+        if shouldReportMouse {
+            reportClick(event: event, button: SGRButton.left, pressed: false)
+            return
+        }
         guard let a = selectionAnchor, let h = selectionHead else { return }
         if a.col == h.col && a.row == h.row { clearSelection() }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        guard shouldReportMouse else {
+            super.rightMouseDown(with: event)
+            return
+        }
+        reportClick(event: event, button: SGRButton.right, pressed: true)
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        guard shouldReportMouse else {
+            super.rightMouseUp(with: event)
+            return
+        }
+        reportClick(event: event, button: SGRButton.right, pressed: false)
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        guard shouldReportMouse else {
+            super.otherMouseDown(with: event)
+            return
+        }
+        reportClick(event: event, button: SGRButton.middle, pressed: true)
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        guard shouldReportMouse else {
+            super.otherMouseUp(with: event)
+            return
+        }
+        reportClick(event: event, button: SGRButton.middle, pressed: false)
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        guard shouldReportMouse else {
+            super.rightMouseDragged(with: event)
+            return
+        }
+        guard grid.term.dragMouse || grid.term.anyMotionMouse else { return }
+        reportMotion(event: event, button: SGRButton.right)
+    }
+
+    override func otherMouseDragged(with event: NSEvent) {
+        guard shouldReportMouse else {
+            super.otherMouseDragged(with: event)
+            return
+        }
+        guard grid.term.dragMouse || grid.term.anyMotionMouse else { return }
+        reportMotion(event: event, button: SGRButton.middle)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard shouldReportMouse else {
+            super.mouseMoved(with: event)
+            return
+        }
+        guard grid.term.anyMotionMouse else { return }
+        reportMotion(event: event, button: 3)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard shouldReportMouse else {
+            super.scrollWheel(with: event)
+            return
+        }
+        let dy = event.scrollingDeltaY
+        guard abs(dy) >= 0.1 else { return }
+        let cell = gridCell(for: event)
+        emitSGR(
+            button: dy > 0 ? SGRButton.scrollUp : SGRButton.scrollDown,
+            col: cell.col,
+            row: cell.row,
+            pressed: true,
+            motion: false,
+            flags: event.modifierFlags)
+    }
+
+    private func reportSharedInputMouse(event: NSEvent) -> Bool {
+        guard mouseModeEnabled else { return false }
+        let cell = gridCell(for: event)
+        guard cell.inside else { return false }
+        return onMouseCell(UInt16(cell.col), UInt16(cell.row))
+    }
+
+    private func reportClick(event: NSEvent, button: Int, pressed: Bool) {
+        let cell = gridCell(for: event)
+        emitSGR(
+            button: button,
+            col: cell.col,
+            row: cell.row,
+            pressed: pressed,
+            motion: false,
+            flags: event.modifierFlags)
+        if pressed {
+            lastMotionCol = cell.col
+            lastMotionRow = cell.row
+            lastMotionInside = cell.inside
+        }
+    }
+
+    private func reportMotion(event: NSEvent, button: Int) {
+        let cell = gridCell(for: event)
+        if cell.inside,
+           cell.col == lastMotionCol,
+           cell.row == lastMotionRow,
+           lastMotionInside
+        {
+            return
+        }
+        if !cell.inside, !lastMotionInside { return }
+
+        let now = CACurrentMediaTime()
+        guard now - lastMotionTime >= Self.motionMinInterval else { return }
+        lastMotionTime = now
+
+        emitSGR(
+            button: button,
+            col: cell.col,
+            row: cell.row,
+            pressed: true,
+            motion: true,
+            flags: event.modifierFlags)
+        lastMotionCol = cell.col
+        lastMotionRow = cell.row
+        lastMotionInside = cell.inside
+    }
+
+    private func emitSGR(button: Int,
+                         col: Int,
+                         row: Int,
+                         pressed: Bool,
+                         motion: Bool,
+                         flags: NSEvent.ModifierFlags)
+    {
+        let cb = button | sgrModifierBits(flags) | (motion ? SGRButton.motionFlag : 0)
+        let terminator: UInt8 = pressed ? 0x4D : 0x6D
+        var bytes: [UInt8] = [0x1B, 0x5B, 0x3C]
+        bytes.append(contentsOf: Array(String(cb).utf8))
+        bytes.append(0x3B)
+        bytes.append(contentsOf: Array(String(col + 1).utf8))
+        bytes.append(0x3B)
+        bytes.append(contentsOf: Array(String(row + 1).utf8))
+        bytes.append(terminator)
+        onKey(bytes)
+    }
+
+    private func sgrModifierBits(_ flags: NSEvent.ModifierFlags) -> Int {
+        var b = 0
+        if flags.contains(.shift) { b |= SGRButton.shiftFlag }
+        if flags.contains(.option) { b |= SGRButton.altFlag }
+        if flags.contains(.control) { b |= SGRButton.ctrlFlag }
+        return b
     }
 
     // MARK: selection helpers
@@ -193,6 +418,22 @@ final class MetalTerminalNSView: NSView {
             max(0, min(col, Int(renderer.cols) - 1)),
             max(0, min(row, Int(renderer.rows) - 1))
         )
+    }
+
+    private func gridCell(for event: NSEvent) -> (col: Int, row: Int, inside: Bool) {
+        let p = convert(event.locationInWindow, from: nil)
+        let cell = renderer.cellSize
+        let cw = max(cell.width, 0.5)
+        let ch = max(cell.height, 0.5)
+        let yTopDown = bounds.height - p.y
+        let rawCol = Int(floor(p.x / cw))
+        let rawRow = Int(floor(yTopDown / ch))
+        let cols = Int(renderer.cols)
+        let rows = Int(renderer.rows)
+        let inside = rawCol >= 0 && rawCol < cols && rawRow >= 0 && rawRow < rows
+        let col = min(max(rawCol, 0), max(cols - 1, 0))
+        let row = min(max(rawRow, 0), max(rows - 1, 0))
+        return (col, row, inside)
     }
 
     private func clearSelection() {
@@ -313,6 +554,30 @@ final class MetalTerminalNSView: NSView {
         return nil
     }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        refreshTrackingArea()
+    }
+
+    func refreshTrackingArea() {
+        if mouseModeEnabled {
+            if let area = mouseTrackingArea, trackingAreas.contains(area) {
+                return
+            }
+            let area = NSTrackingArea(
+                rect: bounds,
+                options: [.mouseMoved, .activeAlways, .inVisibleRect],
+                owner: self,
+                userInfo: nil)
+            addTrackingArea(area)
+            mouseTrackingArea = area
+            window?.acceptsMouseMovedEvents = true
+        } else if let area = mouseTrackingArea {
+            removeTrackingArea(area)
+            mouseTrackingArea = nil
+        }
+    }
+
     private func syncRendererGridSize() {
         guard let size = currentDrawableSizeForSync() else { return }
         renderer.recomputeGrid(for: size)
@@ -427,23 +692,32 @@ struct MetalTerminalView: NSViewRepresentable {
     let grid: GridModel
     let onKey: ([UInt8]) -> Void
     let onResize: (UInt16, UInt16) -> Void
+    let onMouseCell: (UInt16, UInt16) -> Bool
     let inputEnabled: Bool
     let isActive: Bool
     let fontSize: CGFloat
+    /// Master switch for SGR mouse-reporting (the "Mouse mode" sidebar
+    /// toggle). When false, mouse events fall through to default NSView
+    /// behavior even if the running app has DECSET 1000/1002/1003.
+    let mouseModeEnabled: Bool
 
     init(grid: GridModel,
          onKey: @escaping ([UInt8]) -> Void,
          onResize: @escaping (UInt16, UInt16) -> Void = { _, _ in },
+         onMouseCell: @escaping (UInt16, UInt16) -> Bool = { _, _ in false },
          inputEnabled: Bool = true,
          isActive: Bool = true,
-         fontSize: CGFloat = 13)
+         fontSize: CGFloat = 13,
+         mouseModeEnabled: Bool = false)
     {
         self.grid = grid
         self.onKey = onKey
         self.onResize = onResize
+        self.onMouseCell = onMouseCell
         self.inputEnabled = inputEnabled
         self.isActive = isActive
         self.fontSize = fontSize
+        self.mouseModeEnabled = mouseModeEnabled
     }
 
     func makeNSView(context: Context) -> MetalTerminalNSView {
@@ -451,24 +725,34 @@ struct MetalTerminalView: NSViewRepresentable {
             grid: grid,
             onKey: onKey,
             onResize: onResize,
+            onMouseCell: onMouseCell,
             pointSize: fontSize)
         else {
             NSLog("MetalTerminalNSView init failed — Metal unavailable")
             return MetalTerminalNSView(
-                grid: grid, onKey: { _ in }, onResize: { _, _ in },
+                grid: grid,
+                onKey: { _ in },
+                onResize: { _, _ in },
+                onMouseCell: { _, _ in false },
                 pointSize: fontSize)!
         }
         v.inputEnabled = inputEnabled
         v.mtkView.isPaused = !isActive
+        v.mouseModeEnabled = mouseModeEnabled
         return v
     }
 
     func updateNSView(_ nsView: MetalTerminalNSView, context: Context) {
         nsView.updateGrid(grid)
-        nsView.updateHandlers(onKey: onKey, onResize: onResize)
+        nsView.updateHandlers(
+            onKey: onKey,
+            onResize: onResize,
+            onMouseCell: onMouseCell)
         nsView.inputEnabled = inputEnabled
         nsView.updatePointSize(fontSize)
         nsView.mtkView.isPaused = !isActive
+        nsView.mouseModeEnabled = mouseModeEnabled
+        nsView.refreshTrackingArea()
     }
 
     static func dismantleNSView(_ nsView: MetalTerminalNSView, coordinator: ()) {

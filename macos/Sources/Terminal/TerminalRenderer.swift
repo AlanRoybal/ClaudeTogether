@@ -69,6 +69,25 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     /// at runtime — the atlas is rebuilt and the grid is re-measured.
     private(set) var pointSize: CGFloat = 13
 
+    /// Cell size in view points (NOT pixels). MetalTerminalNSView uses this
+    /// to translate `event.locationInWindow` → grid (col, row) for mouse
+    /// reporting. Returns the atlas pixel size divided by the view's backing
+    /// scale; falls back to 1.0 scale when no view/window is attached.
+    var cellSize: CGSize {
+        let scale: CGFloat
+        if let v = view {
+            scale = v.window?.backingScaleFactor
+                ?? v.window?.screen?.backingScaleFactor
+                ?? atlas.scale
+        } else {
+            scale = atlas.scale
+        }
+        let denom = max(scale, 0.0001)
+        return CGSize(
+            width: CGFloat(atlas.cellWidthPx) / denom,
+            height: CGFloat(atlas.cellHeightPx) / denom)
+    }
+
     var onResize: ((UInt16, UInt16) -> Void)?
 
     var cursorVisible = true

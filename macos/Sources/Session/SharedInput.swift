@@ -13,12 +13,14 @@ enum SharedInputRequestKind: UInt8 {
     case moveNextWord = 10
     case deleteToStart = 11
     case deletePreviousWord = 12
+    case moveTo = 13
 }
 
 struct SharedInputRequest {
     var actor: UserIdentity
     var kind: SharedInputRequestKind
     var text: String = ""
+    var offset: Int = 0
 }
 
 struct SharedInputCursorState {
@@ -70,6 +72,8 @@ enum SharedInputCodec {
                 let utf8 = Array(req.text.utf8)
                 appendU16(&out, UInt16(min(utf8.count, Int(UInt16.max))))
                 out.append(contentsOf: utf8.prefix(Int(UInt16.max)))
+            } else if req.kind == .moveTo {
+                appendU16(&out, UInt16(min(max(0, req.offset), Int(UInt16.max))))
             }
         case .snapshot(let tabId, let snap):
             out.append(snapshotTag)
@@ -107,14 +111,21 @@ enum SharedInputCodec {
                 throw SharedInputCodecError.invalidEnum
             }
             var text = ""
+            var offset = 0
             if kind == .insertText {
                 let textLen = try r.readU16()
                 text = String(data: try r.readBytes(Int(textLen)),
                               encoding: .utf8) ?? ""
+            } else if kind == .moveTo {
+                offset = Int(try r.readU16())
             }
             return .request(
                 tabId: tabId,
-                SharedInputRequest(actor: actor, kind: kind, text: text))
+                SharedInputRequest(
+                    actor: actor,
+                    kind: kind,
+                    text: text,
+                    offset: offset))
         case snapshotTag:
             let tabId = try r.readU32()
             let revision = try r.readU32()
@@ -286,6 +297,8 @@ struct SharedInputState {
             textScalars.removeSubrange(start..<cursor)
             shiftOtherCursors(deleting: start..<cursor, except: request.actor)
             cursors[request.actor] = start
+        case .moveTo:
+            cursors[request.actor] = clamp(request.offset, max: textScalars.count)
         case .commit:
             let committed = text
             _ = deactivate(bumpRevision: bumpRevision)

@@ -2,10 +2,12 @@ import SwiftUI
 
 struct EditorHost: View {
     let controller: EditorController
+    let mouseModeEnabled: Bool
     @ObservedObject private var state: EditorState
 
-    init(controller: EditorController) {
+    init(controller: EditorController, mouseModeEnabled: Bool = false) {
         self.controller = controller
+        self.mouseModeEnabled = mouseModeEnabled
         self._state = ObservedObject(wrappedValue: controller.state)
     }
 
@@ -34,7 +36,9 @@ struct EditorHost: View {
             Divider()
 
             ZStack(alignment: .topLeading) {
-                MetalEditorView(controller: controller)
+                MetalEditorView(
+                    controller: controller,
+                    mouseModeEnabled: mouseModeEnabled)
                 EditorAutocompleteOverlay(
                     autocomplete: controller.autocomplete,
                     gridModel: controller.gridModel)

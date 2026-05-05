@@ -15,7 +15,9 @@ struct ContentView: View {
 
             ZStack(alignment: .top) {
                 if let controller = model.activeEditor {
-                    EditorHost(controller: controller)
+                    EditorHost(
+                        controller: controller,
+                        mouseModeEnabled: model.mouseMode)
                         .frame(minWidth: 500, minHeight: 300)
                 } else if !model.tabs.isEmpty {
                     VStack(spacing: 0) {
@@ -30,8 +32,15 @@ struct ContentView: View {
                                     onResize: { cols, rows in
                                         model.handleResize(cols: cols, rows: rows)
                                     },
+                                    onMouseCell: { col, row in
+                                        model.handleTerminalMouseCell(
+                                            col: col,
+                                            row: row,
+                                            forTabId: tab.id)
+                                    },
                                     inputEnabled: model.inputEnabled,
-                                    fontSize: model.fontSize)
+                                    fontSize: model.fontSize,
+                                    mouseModeEnabled: model.mouseMode)
                                 SharedInputAutocompleteOverlay(
                                     grid: tab.grid,
                                     autocomplete: model.inputAutocomplete)
@@ -99,6 +108,10 @@ final class TerminalModel: ObservableObject {
     @Published var boreBundlePath: String?
     @Published var coreVersion: Int32 = 0
     @Published var activeEditor: EditorController?
+    /// User-visible "Mouse mode" toggle. When false, MetalTerminalView drops
+    /// mouse events on the floor (no SGR encoding, no PTY traffic, no editor
+    /// or shared-input cursor moves) until the user opts in.
+    @Published var mouseMode: Bool = false
 
     /// Persisted command history feeding the shared-input autocomplete.
     /// Captured from `inputCommit` whenever a line dispatches to the PTY.
@@ -977,6 +990,32 @@ final class TerminalModel: ObservableObject {
                 sessionManager.sendTabInput(tabId: tabId, data: payload)
             }
         }
+    }
+
+    func handleTerminalMouseCell(col: UInt16, row: UInt16, forTabId tabId: UInt32) -> Bool {
+        guard mouseMode,
+              tabId == activeTabId,
+              let tab = tabs.first(where: { $0.id == tabId }),
+              let offset = tab.grid.inputOverlayOffset(atCol: col, row: row)
+        else {
+            return false
+        }
+        let request = SharedInputRequest(
+            actor: sessionManager.localIdentity,
+            kind: .moveTo,
+            offset: offset)
+
+        if canUseHostSharedInput(tabId: tabId) {
+            applyAuthoritativeSharedInputRequest(tabId: tabId, request)
+            return true
+        }
+        if canUsePeerSharedInput(tabId: tabId) {
+            applyOptimisticSharedInputRequest(tabId: tabId, request)
+            sessionManager.sendInputBytes(
+                SharedInputCodec.encode(.request(tabId: tabId, request)))
+            return true
+        }
+        return false
     }
 
     /// Called when the Metal renderer re-measures the terminal grid. We
