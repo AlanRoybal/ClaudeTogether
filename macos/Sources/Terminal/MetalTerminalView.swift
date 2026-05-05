@@ -18,14 +18,21 @@ final class MetalTerminalNSView: NSView {
     /// When true, keystrokes are dropped (peer in raw mode: creator-only input).
     var inputEnabled: Bool = true
 
+    // MARK: selection
+    private var selectionAnchor: (col: Int, row: Int)? = nil
+    private var selectionHead: (col: Int, row: Int)? = nil
+
     init?(grid: GridModel,
           onKey: @escaping ([UInt8]) -> Void,
-          onResize: @escaping (UInt16, UInt16) -> Void)
+          onResize: @escaping (UInt16, UInt16) -> Void,
+          pointSize: CGFloat = 13)
     {
         let view = MTKView(frame: .zero)
         self.mtkView = view
         self.grid = grid
-        guard let renderer = TerminalRenderer(view: view) else { return nil }
+        guard let renderer = TerminalRenderer(view: view, pointSize: pointSize) else {
+            return nil
+        }
         self.renderer = renderer
         self.onKey = onKey
         self.onResize = onResize
@@ -74,7 +81,19 @@ final class MetalTerminalNSView: NSView {
         self.onResize = onResize
     }
 
+    /// Rebuilds the renderer's glyph atlas if the requested point size has
+    /// changed. Triggers an immediate grid re-measure so PTY and view stay
+    /// in sync.
+    func updatePointSize(_ pointSize: CGFloat) {
+        renderer.setPointSize(pointSize)
+    }
+
     override var acceptsFirstResponder: Bool { true }
+
+    // Absorb all hit-tests so the MTKView subview doesn't swallow mouse events.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        bounds.contains(point) ? self : nil
+    }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
@@ -90,6 +109,8 @@ final class MetalTerminalNSView: NSView {
     // MARK: keyboard -> closure
 
     override func keyDown(with event: NSEvent) {
+        // Any keystroke clears an active selection (matches standard terminal UX).
+        if selectionAnchor != nil { clearSelection() }
         guard inputEnabled else {
             NSSound.beep()
             return
@@ -100,20 +121,124 @@ final class MetalTerminalNSView: NSView {
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        // Let Cmd-V paste into the terminal instead of menu handling it.
-        if event.modifierFlags.contains(.command),
-           event.charactersIgnoringModifiers == "v"
-        {
-            guard inputEnabled else {
-                NSSound.beep()
+        guard event.modifierFlags.contains(.command) else {
+            return super.performKeyEquivalent(with: event)
+        }
+        switch event.charactersIgnoringModifiers {
+        case "c":
+            // Selection copy takes priority over the menu's full-terminal copy.
+            if let text = selectedText() {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(text, forType: .string)
                 return true
             }
+            // Fall through to let the menu's ⌘C → menuCopy() handle it.
+        case "v":
+            guard inputEnabled else { NSSound.beep(); return true }
             if let s = NSPasteboard.general.string(forType: .string) {
                 onKey(Array(s.utf8))
                 return true
             }
+        default: break
         }
         return super.performKeyEquivalent(with: event)
+    }
+
+    // MARK: mouse -> selection
+
+    override func mouseDown(with event: NSEvent) {
+        let loc = convert(event.locationInWindow, from: nil)
+        selectionAnchor = cellAt(point: loc)
+        selectionHead = selectionAnchor
+        renderer.selection = nil   // clear visual until drag starts
+        window?.makeFirstResponder(self)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let loc = convert(event.locationInWindow, from: nil)
+        selectionHead = cellAt(point: loc)
+        updateRendererSelection()
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        // Click without drag: clear any nascent selection.
+        guard let a = selectionAnchor, let h = selectionHead else { return }
+        if a.col == h.col && a.row == h.row { clearSelection() }
+    }
+
+    // MARK: selection helpers
+
+    private func cellAt(point: NSPoint) -> (col: Int, row: Int) {
+        let scale = window?.backingScaleFactor ?? 1.0
+        let cellWPt = CGFloat(renderer.atlas.cellWidthPx) / scale
+        let cellHPt = CGFloat(renderer.atlas.cellHeightPx) / scale
+        // NSView y=0 is at the bottom; terminal row 0 is at the top.
+        let flippedY = bounds.height - point.y
+        let col = Int(point.x / cellWPt)
+        let row = Int(flippedY / cellHPt)
+        return (
+            max(0, min(col, Int(renderer.cols) - 1)),
+            max(0, min(row, Int(renderer.rows) - 1))
+        )
+    }
+
+    private func clearSelection() {
+        selectionAnchor = nil
+        selectionHead = nil
+        renderer.selection = nil
+    }
+
+    private func updateRendererSelection() {
+        guard let a = selectionAnchor, let h = selectionHead else {
+            renderer.selection = nil
+            return
+        }
+        let startsBefore = a.row < h.row || (a.row == h.row && a.col <= h.col)
+        renderer.selection = startsBefore
+            ? (start: a, end: h)
+            : (start: h, end: a)
+    }
+
+    /// Returns the text covered by the current selection, or nil if nothing
+    /// is selected. Uses the grid snapshot so it reads live terminal content.
+    private func selectedText() -> String? {
+        guard let a = selectionAnchor, let h = selectionHead else { return nil }
+        let startsBefore = a.row < h.row || (a.row == h.row && a.col <= h.col)
+        let start = startsBefore ? a : h
+        let end   = startsBefore ? h : a
+        if start.col == end.col && start.row == end.row { return nil }
+
+        let snap = grid.snapshot()
+        let cols = Int(grid.cols)
+        let rows = Int(grid.rows)
+        guard cols > 0, rows > 0, snap.count >= cols * rows else { return nil }
+
+        var result = ""
+        for r in start.row...end.row {
+            let colStart = r == start.row ? start.col : 0
+            let colEnd   = r == end.row   ? end.col   : cols - 1
+            var line = ""
+            for c in colStart...colEnd {
+                guard c < cols && r < rows else { break }
+                let cell = snap[r * cols + c]
+                if cell.width == 0 { continue }
+                let cp = cell.codepoint
+                if cp == 0 {
+                    line.append(" ")
+                } else if let scalar = UnicodeScalar(cp) {
+                    line.append(Character(scalar))
+                } else {
+                    line.append(" ")
+                }
+            }
+            if r != end.row {
+                while let last = line.last, last == " " { line.removeLast() }
+                result += line + "\n"
+            } else {
+                result += line
+            }
+        }
+        return result.isEmpty ? nil : result
     }
 
     private func encodeKey(_ event: NSEvent) -> [UInt8]? {
@@ -227,29 +352,34 @@ struct MetalTerminalView: NSViewRepresentable {
     let onResize: (UInt16, UInt16) -> Void
     let inputEnabled: Bool
     let isActive: Bool
+    let fontSize: CGFloat
 
     init(grid: GridModel,
          onKey: @escaping ([UInt8]) -> Void,
          onResize: @escaping (UInt16, UInt16) -> Void = { _, _ in },
          inputEnabled: Bool = true,
-         isActive: Bool = true)
+         isActive: Bool = true,
+         fontSize: CGFloat = 13)
     {
         self.grid = grid
         self.onKey = onKey
         self.onResize = onResize
         self.inputEnabled = inputEnabled
         self.isActive = isActive
+        self.fontSize = fontSize
     }
 
     func makeNSView(context: Context) -> MetalTerminalNSView {
         guard let v = MetalTerminalNSView(
             grid: grid,
             onKey: onKey,
-            onResize: onResize)
+            onResize: onResize,
+            pointSize: fontSize)
         else {
             NSLog("MetalTerminalNSView init failed — Metal unavailable")
             return MetalTerminalNSView(
-                grid: grid, onKey: { _ in }, onResize: { _, _ in })!
+                grid: grid, onKey: { _ in }, onResize: { _, _ in },
+                pointSize: fontSize)!
         }
         v.inputEnabled = inputEnabled
         v.mtkView.isPaused = !isActive
@@ -260,6 +390,7 @@ struct MetalTerminalView: NSViewRepresentable {
         nsView.updateGrid(grid)
         nsView.updateHandlers(onKey: onKey, onResize: onResize)
         nsView.inputEnabled = inputEnabled
+        nsView.updatePointSize(fontSize)
         nsView.mtkView.isPaused = !isActive
     }
 
