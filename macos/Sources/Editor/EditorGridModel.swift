@@ -79,6 +79,44 @@ final class EditorGridModel: ObservableObject {
         rebuild(preserveScroll: true)
     }
 
+    func offsetForVisibleCell(col: Int, row: Int) -> Int {
+        let targetRow = scrollRow + max(0, row)
+        let targetCol = max(0, col)
+        guard !offsetPositions.isEmpty else { return 0 }
+
+        var firstInRow: Int?
+        var bestInRow: Int?
+        var lastBeforeRow = 0
+
+        for (offset, position) in offsetPositions.enumerated() {
+            if position.row < targetRow {
+                lastBeforeRow = offset
+                continue
+            }
+            if position.row > targetRow {
+                break
+            }
+            if firstInRow == nil {
+                firstInRow = offset
+            }
+            if position.col <= targetCol {
+                bestInRow = offset
+            } else {
+                break
+            }
+        }
+
+        if let bestInRow {
+            return bestInRow
+        }
+        if let firstInRow {
+            return firstInRow
+        }
+        return targetRow <= 0
+            ? 0
+            : min(lastBeforeRow, max(0, offsetPositions.count - 1))
+    }
+
     private func rebuild(preserveScroll: Bool) {
         let scalarView = Array(state.text.unicodeScalars)
         let colCount = max(Int(cols), 1)

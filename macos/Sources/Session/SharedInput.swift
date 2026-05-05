@@ -9,12 +9,14 @@ enum SharedInputRequestKind: UInt8 {
     case moveEnd    = 6
     case commit     = 7
     case interrupt  = 8
+    case moveTo     = 9
 }
 
 struct SharedInputRequest {
     var actor: UserIdentity
     var kind: SharedInputRequestKind
     var text: String = ""
+    var offset: Int = 0
 }
 
 struct SharedInputCursorState {
@@ -65,6 +67,8 @@ enum SharedInputCodec {
                 let utf8 = Array(req.text.utf8)
                 appendU16(&out, UInt16(min(utf8.count, Int(UInt16.max))))
                 out.append(contentsOf: utf8.prefix(Int(UInt16.max)))
+            } else if req.kind == .moveTo {
+                appendU16(&out, UInt16(min(max(0, req.offset), Int(UInt16.max))))
             }
         case .snapshot(let snap):
             out.append(snapshotTag)
@@ -100,12 +104,19 @@ enum SharedInputCodec {
                 throw SharedInputCodecError.invalidEnum
             }
             var text = ""
+            var offset = 0
             if kind == .insertText {
                 let textLen = try r.readU16()
                 text = String(data: try r.readBytes(Int(textLen)),
                               encoding: .utf8) ?? ""
+            } else if kind == .moveTo {
+                offset = Int(try r.readU16())
             }
-            return .request(SharedInputRequest(actor: actor, kind: kind, text: text))
+            return .request(SharedInputRequest(
+                actor: actor,
+                kind: kind,
+                text: text,
+                offset: offset))
         case snapshotTag:
             let revision = try r.readU32()
             let isActive = try r.readU8() != 0
@@ -246,6 +257,8 @@ struct SharedInputState {
             cursors[request.actor] = 0
         case .moveEnd:
             cursors[request.actor] = textScalars.count
+        case .moveTo:
+            cursors[request.actor] = clamp(request.offset, max: textScalars.count)
         case .commit:
             let committed = text
             _ = deactivate(bumpRevision: bumpRevision)

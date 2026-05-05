@@ -35,7 +35,7 @@ struct SessionSidebar: View {
             // through to default NSView behavior. TUIs that DECSET 1000/
             // 1002/1003 will still work the moment this is flipped back on.
             Toggle("Mouse mode", isOn: $model.mouseMode)
-                .help("Forward mouse clicks, drags, scroll, and motion to apps that have requested xterm-style mouse reporting (DECSET 1000/1002/1003 + 1006).")
+                .help("Enable terminal mouse reporting and click/drag cursor control in the shared terminal input line and /edit editor.")
 
             Divider()
 

@@ -31,6 +31,21 @@ final class EditorRenderer: NSObject, MTKViewDelegate {
     private(set) var cols: UInt16 = 80
     private(set) var rows: UInt16 = 24
 
+    var cellSize: CGSize {
+        let scale: CGFloat
+        if let v = view {
+            scale = v.window?.backingScaleFactor
+                ?? v.window?.screen?.backingScaleFactor
+                ?? atlas.scale
+        } else {
+            scale = atlas.scale
+        }
+        let denom = max(scale, 0.0001)
+        return CGSize(
+            width: CGFloat(atlas.cellWidthPx) / denom,
+            height: CGFloat(atlas.cellHeightPx) / denom)
+    }
+
     var onResize: ((UInt16, UInt16) -> Void)?
 
     private var blinkStart = CACurrentMediaTime()

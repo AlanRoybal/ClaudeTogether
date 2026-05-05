@@ -137,6 +137,47 @@ final class EditorController {
         firePresence()
     }
 
+    func moveCaret(to offset: Int, extendingSelection: Bool = false) {
+        let clamped = min(max(0, offset), scalarCount)
+        let oldCaret = state.localCaret
+        let oldSelectionAnchor = state.localSelectionAnchor
+
+        if extendingSelection {
+            if state.localSelectionAnchor == nil {
+                state.localSelectionAnchor = oldCaret
+            }
+        } else {
+            state.localSelectionAnchor = nil
+        }
+        state.localCaret = clamped
+
+        guard oldCaret != state.localCaret ||
+              oldSelectionAnchor != state.localSelectionAnchor
+        else {
+            return
+        }
+        bumpEpoch()
+        schedulePresence()
+    }
+
+    func selectRange(anchor: Int, head: Int) {
+        let clampedAnchor = min(max(0, anchor), scalarCount)
+        let clampedHead = min(max(0, head), scalarCount)
+        let oldCaret = state.localCaret
+        let oldSelectionAnchor = state.localSelectionAnchor
+
+        state.localSelectionAnchor = clampedAnchor
+        state.localCaret = clampedHead
+
+        guard oldCaret != state.localCaret ||
+              oldSelectionAnchor != state.localSelectionAnchor
+        else {
+            return
+        }
+        bumpEpoch()
+        schedulePresence()
+    }
+
     /// Convert an anchor ("caret sits after this item") into a visible
     /// caret offset.
     func visibleOffset(for anchor: CrdtId?) -> Int {

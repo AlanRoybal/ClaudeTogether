@@ -10,6 +10,8 @@ final class MetalEditorNSView: NSView {
 
     private(set) var controller: EditorController
     private(set) var grid: EditorGridModel
+    var mouseModeEnabled: Bool = false
+    private var dragSelectionAnchor: Int?
 
     init?(controller: EditorController) {
         let view = MTKView(frame: .zero)
@@ -44,6 +46,17 @@ final class MetalEditorNSView: NSView {
         self.grid = EditorGridModel(controller: controller)
         renderer.grid = grid
         grid.resize(cols: renderer.cols, rows: renderer.rows)
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if bounds.contains(point) {
+            return self
+        }
+        return super.hitTest(point)
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        true
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -101,6 +114,65 @@ final class MetalEditorNSView: NSView {
         let magnitude = max(1, Int(abs(event.scrollingDeltaY) / 12.0))
         let delta = event.scrollingDeltaY > 0 ? -magnitude : magnitude
         grid.scroll(byRows: delta)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if window?.firstResponder !== self {
+            window?.makeFirstResponder(self)
+        }
+        guard mouseModeEnabled,
+              let offset = editorOffset(for: event)
+        else {
+            super.mouseDown(with: event)
+            return
+        }
+
+        if event.modifierFlags.contains(.shift) {
+            let anchor = controller.state.localSelectionAnchor
+                ?? controller.state.localCaret
+            controller.moveCaret(to: offset, extendingSelection: true)
+            dragSelectionAnchor = anchor
+        } else {
+            controller.moveCaret(to: offset, extendingSelection: false)
+            dragSelectionAnchor = offset
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard mouseModeEnabled,
+              let offset = editorOffset(for: event)
+        else {
+            super.mouseDragged(with: event)
+            return
+        }
+        let anchor = dragSelectionAnchor
+            ?? controller.state.localSelectionAnchor
+            ?? controller.state.localCaret
+        dragSelectionAnchor = anchor
+        controller.selectRange(anchor: anchor, head: offset)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard mouseModeEnabled else {
+            super.mouseUp(with: event)
+            return
+        }
+        dragSelectionAnchor = nil
+        controller.broadcastPresenceNow()
+    }
+
+    private func editorOffset(for event: NSEvent) -> Int? {
+        let p = convert(event.locationInWindow, from: nil)
+        guard bounds.contains(p) else { return nil }
+        let cell = renderer.cellSize
+        let cw = max(cell.width, 0.5)
+        let ch = max(cell.height, 0.5)
+        let col = Int((p.x / cw).rounded(.toNearestOrAwayFromZero))
+        let row = Int(floor((bounds.height - p.y) / ch))
+        guard row >= 0, row < Int(grid.rows) else { return nil }
+        return grid.offsetForVisibleCell(
+            col: min(max(0, col), Int(grid.cols)),
+            row: row)
     }
 
     private func handleSpecialKey(_ event: NSEvent) -> Bool {
@@ -170,15 +242,23 @@ final class MetalEditorNSView: NSView {
 
 struct MetalEditorView: NSViewRepresentable {
     let controller: EditorController
+    let mouseModeEnabled: Bool
+
+    init(controller: EditorController, mouseModeEnabled: Bool = false) {
+        self.controller = controller
+        self.mouseModeEnabled = mouseModeEnabled
+    }
 
     func makeNSView(context: Context) -> MetalEditorNSView {
         guard let view = MetalEditorNSView(controller: controller) else {
             fatalError("MetalEditorNSView init failed")
         }
+        view.mouseModeEnabled = mouseModeEnabled
         return view
     }
 
     func updateNSView(_ nsView: MetalEditorNSView, context: Context) {
         nsView.updateController(controller)
+        nsView.mouseModeEnabled = mouseModeEnabled
     }
 }

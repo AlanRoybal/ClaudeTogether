@@ -150,6 +150,17 @@ final class GridModel: ObservableObject {
         epoch &+= 1
     }
 
+    func inputOverlayOffset(atCol col: UInt16, row: UInt16) -> Int? {
+        guard let overlay else { return nil }
+        let cols = max(Int(self.cols), 1)
+        let start = Int(overlay.anchorRow) * cols + Int(overlay.anchorCol)
+        let target = Int(row) * cols + Int(col)
+        let end = start + overlay.textScalars.count
+        guard target >= start else { return nil }
+        guard target <= end || Int(row) == end / cols else { return nil }
+        return min(max(0, target - start), overlay.textScalars.count)
+    }
+
     /// Updates or inserts a peer cursor. Called by session code when a
     /// `CursorPos` frame arrives from a peer.
     func upsertPeerCursor(id: UUID, col: UInt16, row: UInt16, color: UInt32) {

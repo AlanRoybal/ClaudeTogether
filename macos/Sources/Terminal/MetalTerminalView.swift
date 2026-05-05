@@ -14,12 +14,13 @@ final class MetalTerminalNSView: NSView {
     private(set) var grid: GridModel
     private let onKey: ([UInt8]) -> Void
     private let onResize: (UInt16, UInt16) -> Void
+    private let onMouseCell: (UInt16, UInt16) -> Bool
     /// When true, keystrokes are dropped (peer in raw mode: creator-only input).
     var inputEnabled: Bool = true
     /// Tracks the user-visible "Mouse mode" toggle in the sidebar. When false,
     /// every mouse event falls through to default NSView behavior (focus on
     /// click, no PTY traffic) regardless of what the running app has DECSET.
-    var mouseModeEnabled: Bool = true {
+    var mouseModeEnabled: Bool = false {
         didSet { refreshTrackingArea() }
     }
 
@@ -38,7 +39,8 @@ final class MetalTerminalNSView: NSView {
 
     init?(grid: GridModel,
           onKey: @escaping ([UInt8]) -> Void,
-          onResize: @escaping (UInt16, UInt16) -> Void)
+          onResize: @escaping (UInt16, UInt16) -> Void,
+          onMouseCell: @escaping (UInt16, UInt16) -> Bool)
     {
         let view = MTKView(frame: .zero)
         self.mtkView = view
@@ -47,6 +49,7 @@ final class MetalTerminalNSView: NSView {
         self.renderer = renderer
         self.onKey = onKey
         self.onResize = onResize
+        self.onMouseCell = onMouseCell
         super.init(frame: .zero)
 
         renderer.grid = grid
@@ -79,7 +82,7 @@ final class MetalTerminalNSView: NSView {
     // gymnastics.
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        if bounds.contains(convert(point, from: superview)) {
+        if bounds.contains(point) {
             return self
         }
         return super.hitTest(point)
@@ -296,6 +299,13 @@ final class MetalTerminalNSView: NSView {
         onKey(bytes)
     }
 
+    private func reportSharedInputMouse(event: NSEvent) -> Bool {
+        guard mouseModeEnabled else { return false }
+        let cell = gridCell(for: event)
+        guard cell.inside else { return false }
+        return onMouseCell(UInt16(cell.col), UInt16(cell.row))
+    }
+
     private func reportClick(event: NSEvent, button: Int, pressed: Bool) {
         let cell = gridCell(for: event)
         // Press/release outside the grid are still useful (e.g. a release
@@ -366,6 +376,9 @@ final class MetalTerminalNSView: NSView {
             window?.makeFirstResponder(self)
         }
         guard shouldReportMouse else {
+            if reportSharedInputMouse(event: event) {
+                return
+            }
             super.mouseDown(with: event)
             return
         }
@@ -417,6 +430,9 @@ final class MetalTerminalNSView: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         guard shouldReportMouse else {
+            if reportSharedInputMouse(event: event) {
+                return
+            }
             super.mouseDragged(with: event)
             return
         }
@@ -521,6 +537,7 @@ struct MetalTerminalView: NSViewRepresentable {
     let grid: GridModel
     let onKey: ([UInt8]) -> Void
     let onResize: (UInt16, UInt16) -> Void
+    let onMouseCell: (UInt16, UInt16) -> Bool
     let inputEnabled: Bool
     /// Master switch for SGR mouse-reporting (the "Mouse mode" sidebar
     /// toggle). When false, mouse events fall through to default NSView
@@ -530,24 +547,32 @@ struct MetalTerminalView: NSViewRepresentable {
     init(grid: GridModel,
          onKey: @escaping ([UInt8]) -> Void,
          onResize: @escaping (UInt16, UInt16) -> Void = { _, _ in },
+         onMouseCell: @escaping (UInt16, UInt16) -> Bool = { _, _ in false },
          inputEnabled: Bool = true,
-         mouseModeEnabled: Bool = true)
+         mouseModeEnabled: Bool = false)
     {
         self.grid = grid
         self.onKey = onKey
         self.onResize = onResize
+        self.onMouseCell = onMouseCell
         self.inputEnabled = inputEnabled
         self.mouseModeEnabled = mouseModeEnabled
     }
 
     func makeNSView(context: Context) -> MetalTerminalNSView {
         guard let v = MetalTerminalNSView(
-            grid: grid, onKey: onKey, onResize: onResize)
+            grid: grid,
+            onKey: onKey,
+            onResize: onResize,
+            onMouseCell: onMouseCell)
         else {
             NSLog("MetalTerminalNSView init failed — Metal unavailable")
             // Return an empty placeholder view rather than crash.
             return MetalTerminalNSView(
-                grid: grid, onKey: { _ in }, onResize: { _, _ in })!
+                grid: grid,
+                onKey: { _ in },
+                onResize: { _, _ in },
+                onMouseCell: { _, _ in false })!
         }
         v.inputEnabled = inputEnabled
         v.mouseModeEnabled = mouseModeEnabled

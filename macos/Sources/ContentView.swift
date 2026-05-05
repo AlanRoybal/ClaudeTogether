@@ -12,7 +12,9 @@ struct ContentView: View {
 
             ZStack(alignment: .top) {
                 if let controller = model.activeEditor {
-                    EditorHost(controller: controller)
+                    EditorHost(
+                        controller: controller,
+                        mouseModeEnabled: model.mouseMode)
                         .frame(minWidth: 500, minHeight: 300)
                 } else if let grid = model.grid {
                     MetalTerminalView(
@@ -20,6 +22,9 @@ struct ContentView: View {
                         onKey: { model.handleKey($0) },
                         onResize: { cols, rows in
                             model.handleResize(cols: cols, rows: rows)
+                        },
+                        onMouseCell: { col, row in
+                            model.handleTerminalMouseCell(col: col, row: row)
                         },
                         inputEnabled: model.inputEnabled,
                         mouseModeEnabled: model.mouseMode)
@@ -64,10 +69,9 @@ final class TerminalModel: ObservableObject {
     @Published var coreVersion: Int32 = 0
     @Published var activeEditor: EditorController?
     /// User-visible "Mouse mode" toggle. When false, MetalTerminalView drops
-    /// mouse events on the floor (no SGR encoding, no PTY traffic) regardless
-    /// of what the running app has DECSET. Default ON because most TUIs that
-    /// request mouse reporting expect it to just work.
-    @Published var mouseMode: Bool = true
+    /// mouse events on the floor (no SGR encoding, no PTY traffic, no editor
+    /// or shared-input cursor moves) until the user opts in.
+    @Published var mouseMode: Bool = false
 
     let sessionManager = SessionManager()
 
@@ -291,6 +295,30 @@ final class TerminalModel: ObservableObject {
         if sessionManager.role == .peer, sessionManager.state == .running {
             sessionManager.sendInputBytes(Data(bytes))
         }
+    }
+
+    func handleTerminalMouseCell(col: UInt16, row: UInt16) -> Bool {
+        guard mouseMode,
+              let offset = grid?.inputOverlayOffset(atCol: col, row: row)
+        else {
+            return false
+        }
+        let request = SharedInputRequest(
+            actor: sessionManager.localIdentity,
+            kind: .moveTo,
+            offset: offset)
+
+        if canUseHostSharedInput {
+            applyAuthoritativeSharedInputRequest(request)
+            return true
+        }
+        if canUsePeerSharedInput {
+            applyOptimisticSharedInputRequest(request)
+            sessionManager.sendInputBytes(
+                SharedInputCodec.encode(.request(request)))
+            return true
+        }
+        return false
     }
 
     /// Called when the Metal renderer re-measures the terminal grid.
