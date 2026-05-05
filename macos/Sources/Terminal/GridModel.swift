@@ -71,8 +71,8 @@ final class GridModel: ObservableObject {
         }
     }
 
-    func resize(cols: UInt16, rows: UInt16) {
-        term.resize(cols: cols, rows: rows)
+    func resize(cols: UInt16, rows: UInt16, preserveTop: Bool = false) {
+        term.resize(cols: cols, rows: rows, preserveTop: preserveTop)
         if overlay == nil {
             syncLocalCursor()
         } else {

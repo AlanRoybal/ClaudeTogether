@@ -284,12 +284,13 @@ final class SessionManager: ObservableObject {
         broadcast(.tabClose(tabId: tabId))
     }
 
-    /// Host only: announce which tab is currently focused (broadcast or
-    /// directed). Peers use this to align their active grid with the host.
+    /// Announce which tab the local user is currently focused on. Hosts use
+    /// this for initial focus hints; peers use it so the host can keep
+    /// per-user tab cursor state separate.
     func sendTabFocus(tabId: UInt32,
                       toTransportPeerID peerID: UInt32? = nil)
     {
-        guard role == .host, state == .running else { return }
+        guard state == .running else { return }
         let frame = Frame.tabFocus(tabId: tabId)
         if let peerID {
             send(frame, toTransportPeerID: peerID)
@@ -722,6 +723,13 @@ final class SessionManager: ObservableObject {
 
     func participant(forEditorUserID editorUserID: UInt32) -> Participant? {
         participants.first { Self.editorUserID(for: $0.identity) == editorUserID }
+    }
+
+    func identity(forTransportPeerID peerID: UInt32) -> UserIdentity? {
+        if role == .host {
+            return transportToIdentity[peerID]
+        }
+        return nil
     }
 
     nonisolated private static func colorHash(for identity: UserIdentity) -> UInt32 {

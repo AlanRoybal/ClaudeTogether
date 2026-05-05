@@ -17,9 +17,7 @@ struct ContentView: View {
                         .frame(minWidth: 500, minHeight: 300)
                 } else if !model.tabs.isEmpty {
                     VStack(spacing: 0) {
-                        if model.shouldShowTabStrip {
-                            TabStripView(model: model)
-                        }
+                        TabStripView(model: model)
                         if let tab = model.activeTabForView {
                             MetalTerminalView(
                                 grid: tab.grid,
@@ -109,9 +107,10 @@ final class TerminalModel: ObservableObject {
     var activeTabForView: TabState? { activeTab }
     private var nextTabId: UInt32 = 1
 
-    /// Hide the tab strip when a session has at most one tab so the
-    /// single-tab UX is identical to the pre-tabs implementation.
-    var shouldShowTabStrip: Bool { tabs.count > 1 }
+    /// Keep the tab strip visible from the first tab onward so adding the
+    /// second tab does not shrink the terminal viewport and drop visible
+    /// history lines out of the grid.
+    var shouldShowTabStrip: Bool { !tabs.isEmpty }
 
     /// Host only: edge-detector for creator-only mode. We currently treat the
     /// terminal alternate screen as the signal for "a full-screen app owns the
@@ -119,11 +118,28 @@ final class TerminalModel: ObservableObject {
     private var lastLocalCreatorOnlyMode: Bool = false
     private var modeTimer: Timer?
     private var titleTimer: Timer?
-    private var sharedInput = SharedInputState()
-    private var sharedInputPromptTimer: Timer?
+    private var sharedInputs: [UInt32: SharedInputState] = [:]
+    private var sharedInputPromptTimers: [UInt32: Timer] = [:]
+    private var participantFocusedTab: [UserIdentity: UInt32] = [:]
     private var editorSavedRevisions: [UInt64: UInt32] = [:]
     private var fileSyncWatcher: FSSyncWatcher?
     private var fileSyncTimer: Timer?
+    /// Host-only: newly opened shared tabs request one full snapshot after
+    /// their first live PTY output chunk so peers see the initial prompt even
+    /// if tab-open/focus beats the shell's first paint.
+    private var pendingHostTabInitialSnapshots = Set<UInt32>()
+    /// Peer-only: TabPtyOutput can arrive before TabOpen during join-time
+    /// catch-up, so buffer it until the mirrored tab exists locally.
+    private var pendingPeerTabOutput: [UInt32: [Data]] = [:]
+    /// Peer-only: same idea for focus announcements during join-time catch-up.
+    private var pendingPeerFocusedTabId: UInt32?
+    /// Last terminal viewport measured by the renderer. Reused when a new tab
+    /// is created before SwiftUI has had a chance to lay out its Metal view.
+    private var lastKnownTerminalGridSize: (cols: UInt16, rows: UInt16)?
+    /// Host-only: first tab PTYs are started after the Metal view reports its
+    /// real size so zsh does not render prompts during startup resizes.
+    private var pendingHostTabStartCwds: [UInt32: String] = [:]
+    private var pendingHostTabStartWorkItems: [UInt32: DispatchWorkItem] = [:]
     private let fileSyncApplier = FSSyncApplier()
 
     init() {
@@ -138,7 +154,7 @@ final class TerminalModel: ObservableObject {
             guard let self = self else { return }
             self.syncSharedInputParticipants(
                 broadcast: self.sessionManager.role == .host)
-            self.syncGridSharedInputOverlay()
+            self.syncAllGridSharedInputOverlays()
             self.syncEditorParticipants()
         }.store(in: &cancellables)
         sessionManager.$accessMode.sink { [weak self] _ in
@@ -189,7 +205,9 @@ final class TerminalModel: ObservableObject {
     deinit {
         modeTimer?.invalidate()
         titleTimer?.invalidate()
-        sharedInputPromptTimer?.invalidate()
+        for timer in sharedInputPromptTimers.values {
+            timer.invalidate()
+        }
         fileSyncTimer?.invalidate()
     }
 
@@ -237,7 +255,7 @@ final class TerminalModel: ObservableObject {
         openNewTab()
         startTitlePolling()
         startModeProbe()
-        syncGridSharedInputOverlay()
+        syncAllGridSharedInputOverlays()
     }
 
     func endSession() {
@@ -247,9 +265,16 @@ final class TerminalModel: ObservableObject {
         tabs.removeAll()
         activeTabId = nil
         nextTabId = 1
+        participantFocusedTab.removeAll()
         rootPath = nil
         activeEditor = nil
         editorSavedRevisions.removeAll()
+        pendingHostTabInitialSnapshots.removeAll()
+        pendingPeerTabOutput.removeAll()
+        pendingPeerFocusedTabId = nil
+        lastKnownTerminalGridSize = nil
+        cancelPendingHostTabStarts()
+        pendingHostTabStartCwds.removeAll()
         stopSharing()
         stopTitlePolling()
         stopModeProbe()
@@ -274,34 +299,35 @@ final class TerminalModel: ObservableObject {
         let title = TabTitleResolver.initialTitle(
             cwd: folder,
             sessionRootPath: rootPath)
-        guard let tab = makeHostTab(id: tabId, title: title, cwd: folder) else {
+        let shouldDeferSpawn = tabs.isEmpty && lastKnownTerminalGridSize == nil
+        guard let tab = makeHostTab(
+            id: tabId,
+            title: title,
+            cwd: folder,
+            spawnImmediately: !shouldDeferSpawn)
+        else {
             return
         }
-        if let prevId = activeTabId,
-           let prevGrid = tabs.first(where: { $0.id == prevId })?.grid
-        {
-            prevGrid.clearInputOverlay()
-        }
-        let wasInputActive = sharedInput.isActive
-        if wasInputActive {
-            _ = sharedInput.deactivate(bumpRevision: true)
-        }
         tabs.append(tab)
+        if shouldDeferSpawn {
+            pendingHostTabStartCwds[tabId] = folder
+        }
         activeTabId = tabId
+        recordLocalTabFocus(tabId, broadcast: false)
         refreshTabTitle(forTabID: tabId)
         let currentTitle = tabs.first(where: { $0.id == tabId })?.title ?? title
         if sessionManager.state == .running {
+            pendingHostTabInitialSnapshots.insert(tabId)
             sessionManager.sendTabOpen(tabId: tabId, title: currentTitle)
             sessionManager.sendTabFocus(tabId: tabId)
-            if wasInputActive {
-                broadcastSharedInputSnapshot()
-            }
+            broadcastSharedInputSnapshot(tabId: tabId)
         }
-        syncGridSharedInputOverlay()
+        syncGridSharedInputOverlay(tabId: tabId)
+        probeLocalMode(force: true)
         if sessionManager.role == .host, sessionManager.state == .running,
            !lastLocalCreatorOnlyMode
         {
-            activateSharedInputAtCurrentCursor(broadcast: true)
+            activateSharedInputAtCurrentCursor(tabId: tabId, broadcast: true)
         }
     }
 
@@ -314,6 +340,12 @@ final class TerminalModel: ObservableObject {
         let tab = tabs[idx]
         tab.pty?.terminate()
         tabs.remove(at: idx)
+        sharedInputs.removeValue(forKey: id)
+        sharedInputPromptTimers.removeValue(forKey: id)?.invalidate()
+        participantFocusedTab = participantFocusedTab.filter { $0.value != id }
+        pendingHostTabInitialSnapshots.remove(id)
+        pendingHostTabStartCwds.removeValue(forKey: id)
+        pendingHostTabStartWorkItems.removeValue(forKey: id)?.cancel()
         if sessionManager.state == .running {
             sessionManager.sendTabClose(tabId: id)
         }
@@ -333,34 +365,29 @@ final class TerminalModel: ObservableObject {
         closeTab(id: id)
     }
 
-    /// Update which tab is focused. On the host this is the source of truth
-    /// and is broadcast via TabFocus; on the peer this is also called from
-    /// inbound TabFocus frames (without re-broadcasting).
+    /// Update which tab this local user is focused on. Focus is local to
+    /// each participant; peers are not forced to follow the host.
     func focusTab(id: UInt32) {
         guard tabs.contains(where: { $0.id == id }) else { return }
-        if let prevId = activeTabId, prevId != id,
-           let prevGrid = tabs.first(where: { $0.id == prevId })?.grid
-        {
-            prevGrid.clearInputOverlay()
-        }
-        let wasInputActive = sharedInput.isActive
-        if wasInputActive {
-            _ = sharedInput.deactivate(bumpRevision: true)
-        }
+        let previousId = activeTabId
         activeTabId = id
+        recordLocalTabFocus(id, broadcast: sessionManager.state == .running)
         if sessionManager.role == .host, sessionManager.state == .running {
-            sessionManager.sendTabFocus(tabId: id)
-            broadcastTerminalSnapshot()
-            if wasInputActive {
-                broadcastSharedInputSnapshot()
+            sendTabSnapshot(tabId: id)
+            if let previousId, previousId != id {
+                syncSharedInputParticipants(tabId: previousId, broadcast: true)
             }
+            syncSharedInputParticipants(tabId: id, broadcast: true)
         }
-        syncGridSharedInputOverlay()
+        if let previousId, previousId != id {
+            syncGridSharedInputOverlay(tabId: previousId)
+        }
+        syncGridSharedInputOverlay(tabId: id)
         probeLocalMode(force: true)
         if sessionManager.role == .host, sessionManager.state == .running,
            !lastLocalCreatorOnlyMode
         {
-            activateSharedInputAtCurrentCursor(broadcast: true)
+            activateSharedInputAtCurrentCursor(tabId: id, broadcast: true)
         }
     }
 
@@ -389,27 +416,25 @@ final class TerminalModel: ObservableObject {
         focusTab(id: prev.id)
     }
 
-    private func makeHostTab(id: UInt32, title: String, cwd: String) -> TabState? {
+    private func makeHostTab(id: UInt32,
+                             title: String,
+                             cwd: String,
+                             spawnImmediately: Bool = true) -> TabState?
+    {
         // Match the user's current viewport so the new tab's PTY and grid
         // come up at the same size the renderer is about to lay them out at,
         // not the default 80x24.
-        let cols = activeTab?.grid.cols ?? 80
-        let rows = activeTab?.grid.rows ?? 24
+        let cols = activeTab?.grid.cols ?? lastKnownTerminalGridSize?.cols ?? 80
+        let rows = activeTab?.grid.rows ?? lastKnownTerminalGridSize?.rows ?? 24
         let pty = PTYSession()
-        guard pty.spawn(cwd: cwd, cols: cols, rows: rows) else {
-            NSLog("PTY spawn failed for tab %u", id)
-            return nil
-        }
         guard let grid = GridModel(cols: cols, rows: rows) else {
             NSLog("GridModel init failed for tab %u", id)
-            pty.terminate()
             return nil
         }
         // Host: PTY output → feed this tab's grid AND fan out to peers.
         pty.onOutput = { [weak self] bytes in
             guard let self = self else { return }
-            guard let tab = self.tabs.first(where: { $0.id == id }) else { return }
-            tab.grid.feed(bytes)
+            grid.feed(bytes)
             let shouldShare = self.sessionManager.role == .host
                 && self.sessionManager.state == .running
             NSLog("[ct] pty->out tab=%u bytes=%d share=%@",
@@ -417,6 +442,12 @@ final class TerminalModel: ObservableObject {
             if shouldShare {
                 let payload = Data(bytes)
                 self.sessionManager.sendTabPtyOutput(tabId: id, data: payload)
+                if self.pendingHostTabInitialSnapshots.contains(id),
+                   self.tabs.contains(where: { $0.id == id })
+                {
+                    self.sendTabSnapshot(tabId: id)
+                    self.pendingHostTabInitialSnapshots.remove(id)
+                }
                 // Backward compat for single-tab peers only. In multi-tab
                 // sessions, bare PtyOutput is session-wide and can repaint
                 // unrelated peer tabs with this tab's escape stream.
@@ -428,20 +459,110 @@ final class TerminalModel: ObservableObject {
             // output landed on the active tab.
             if id == self.activeTabId {
                 self.probeLocalMode()
-                if shouldShare {
-                    self.handleHostPtyOutput()
-                }
+            }
+            if shouldShare {
+                self.handleHostPtyOutput(tabId: id)
             }
         }
         pty.onExit = { [weak self] in
             let msg: [UInt8] = Array("\r\n[process exited]\r\n".utf8)
-            self?.tabs.first(where: { $0.id == id })?.grid.feed(msg)
+            grid.feed(msg)
+            self?.pendingHostTabInitialSnapshots.remove(id)
+        }
+        if spawnImmediately {
+            guard pty.spawn(cwd: cwd, cols: cols, rows: rows) else {
+                NSLog("PTY spawn failed for tab %u", id)
+                return nil
+            }
         }
         return TabState(id: id, title: title, pty: pty, grid: grid)
     }
 
-    private func makePeerTab(id: UInt32, title: String) -> TabState? {
-        guard let grid = GridModel(cols: 80, rows: 24) else {
+    private func startPendingHostTabIfNeeded(tabId: UInt32,
+                                             cols: UInt16? = nil,
+                                             rows: UInt16? = nil)
+    {
+        guard let cwd = pendingHostTabStartCwds[tabId],
+              let tab = tabs.first(where: { $0.id == tabId }),
+              let pty = tab.pty
+        else {
+            return
+        }
+        pendingHostTabStartWorkItems.removeValue(forKey: tabId)?.cancel()
+        let fallbackSize = currentTerminalGridSize()
+        let spawnCols = cols ?? fallbackSize.cols
+        let spawnRows = rows ?? fallbackSize.rows
+        tab.grid.resize(cols: spawnCols, rows: spawnRows, preserveTop: true)
+        guard pty.spawn(cwd: cwd, cols: spawnCols, rows: spawnRows) else {
+            NSLog("PTY spawn failed for deferred tab %u", tabId)
+            pendingHostTabStartCwds.removeValue(forKey: tabId)
+            return
+        }
+        pendingHostTabStartCwds.removeValue(forKey: tabId)
+        refreshTabTitle(forTabID: tabId)
+    }
+
+    private func startPendingHostTabs(cols: UInt16, rows: UInt16) {
+        for tab in tabs {
+            startPendingHostTabIfNeeded(
+                tabId: tab.id,
+                cols: cols,
+                rows: rows)
+        }
+    }
+
+    private func schedulePendingHostTabStart(tabId: UInt32,
+                                             cols: UInt16,
+                                             rows: UInt16)
+    {
+        guard pendingHostTabStartCwds[tabId] != nil else { return }
+        pendingHostTabStartWorkItems.removeValue(forKey: tabId)?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.pendingHostTabStartWorkItems.removeValue(forKey: tabId)
+                self?.startPendingHostTabIfNeeded(
+                    tabId: tabId,
+                    cols: cols,
+                    rows: rows)
+            }
+        }
+        pendingHostTabStartWorkItems[tabId] = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: workItem)
+    }
+
+    private func schedulePendingHostTabStarts(cols: UInt16, rows: UInt16) {
+        for tab in tabs {
+            schedulePendingHostTabStart(
+                tabId: tab.id,
+                cols: cols,
+                rows: rows)
+        }
+    }
+
+    private func cancelPendingHostTabStarts() {
+        for workItem in pendingHostTabStartWorkItems.values {
+            workItem.cancel()
+        }
+        pendingHostTabStartWorkItems.removeAll()
+    }
+
+    private func currentTerminalGridSize() -> (cols: UInt16, rows: UInt16) {
+        if let lastKnownTerminalGridSize {
+            return lastKnownTerminalGridSize
+        }
+        if let activeTab {
+            return (cols: activeTab.grid.cols, rows: activeTab.grid.rows)
+        }
+        return (cols: 80, rows: 24)
+    }
+
+    private func makePeerTab(id: UInt32, title: String,
+                             preferredSize: (cols: UInt16, rows: UInt16)? = nil)
+    -> TabState?
+    {
+        let cols = preferredSize?.cols ?? lastKnownTerminalGridSize?.cols ?? 80
+        let rows = preferredSize?.rows ?? lastKnownTerminalGridSize?.rows ?? 24
+        guard let grid = GridModel(cols: cols, rows: rows) else {
             NSLog("GridModel init failed for peer tab %u", id)
             return nil
         }
@@ -498,6 +619,8 @@ final class TerminalModel: ObservableObject {
     // MARK: sharing
 
     func startSharing() {
+        let size = currentTerminalGridSize()
+        startPendingHostTabs(cols: size.cols, rows: size.rows)
         sessionManager.startHost()
         restartFileSyncWatcher()
         startFileSyncPolling()
@@ -507,8 +630,13 @@ final class TerminalModel: ObservableObject {
         // Immediately publish our current mode so fresh joiners aren't stuck
         // on the default (.line) assumption.
         probeLocalMode(force: true)
+        if let activeTabId {
+            recordLocalTabFocus(activeTabId, broadcast: true)
+        }
         if sessionManager.state == .running, !lastLocalCreatorOnlyMode {
-            activateSharedInputAtCurrentCursor(broadcast: true)
+            for tab in tabs {
+                activateSharedInputAtCurrentCursor(tabId: tab.id, broadcast: true)
+            }
         }
     }
 
@@ -565,7 +693,9 @@ final class TerminalModel: ObservableObject {
         rootPath = peerRoot
         fileSyncApplier.configure(rootPath: peerRoot)
         resetSharedInputState()
-        sessionManager.joinPeer(host: host, port: port)
+        DispatchQueue.main.async { [weak self] in
+            self?.sessionManager.joinPeer(host: host, port: port)
+        }
     }
 
     /// Sentinel id used for the peer-side placeholder tab created on join.
@@ -579,6 +709,7 @@ final class TerminalModel: ObservableObject {
     /// "active session" lookup that could leak keystrokes across tabs.
     func handleKey(_ bytes: [UInt8], forTabId tabId: UInt32) {
         guard tabId == activeTabId else { return }
+        startPendingHostTabIfNeeded(tabId: tabId)
         // View-only enforcement: the MetalTerminalNSView already gates via
         // `inputEnabled`, but defend in depth so a programmatic call site
         // can't bypass the policy. The host always types locally.
@@ -586,11 +717,7 @@ final class TerminalModel: ObservableObject {
             NSSound.beep()
             return
         }
-        if isHostSharedLineSession || isPeerSharedLineSession {
-            _ = handleSharedInputKey(bytes)
-            return
-        }
-        if handleSharedInputKey(bytes) {
+        if handleSharedInputKey(bytes, tabId: tabId) {
             return
         }
         if let pty = tabs.first(where: { $0.id == tabId })?.pty {
@@ -611,13 +738,30 @@ final class TerminalModel: ObservableObject {
     /// resize every tab's grid (and host PTY) so output streamed while a
     /// tab is inactive still renders correctly when the user switches to it.
     func handleResize(cols: UInt16, rows: UInt16) {
+        lastKnownTerminalGridSize = (cols, rows)
         for tab in tabs {
             tab.pty?.resize(cols: cols, rows: rows)
-            tab.grid.resize(cols: cols, rows: rows)
+            tab.grid.resize(cols: cols, rows: rows, preserveTop: true)
         }
+        schedulePendingHostTabStarts(cols: cols, rows: rows)
     }
 
     // MARK: inbound frames
+
+    private func applyPeerTabFocus(_ tabId: UInt32) {
+        guard tabs.contains(where: { $0.id == tabId }) else {
+            pendingPeerFocusedTabId = tabId
+            return
+        }
+        if activeTabId == nil ||
+            activeTabId == TerminalModel.placeholderTabId ||
+            activeTabId == tabId
+        {
+            activeTabId = tabId
+            recordLocalTabFocus(tabId, broadcast: sessionManager.state == .running)
+            syncGridSharedInputOverlay(tabId: tabId)
+        }
+    }
 
     private func handleInbound(_ frame: Frame, from peerID: UInt32) {
         switch frame {
@@ -662,7 +806,7 @@ final class TerminalModel: ObservableObject {
                 sendTabSnapshots(toTransportPeerID: peerID)
                 // Legacy bare-PtyOutput snapshot for backward compat.
                 broadcastTerminalSnapshot()
-                broadcastSharedInputSnapshot()
+                broadcastSharedInputSnapshots()
                 if let editor = activeEditor {
                     sessionManager.sendEditorOpen(
                         docId: editor.state.docId,
@@ -676,12 +820,21 @@ final class TerminalModel: ObservableObject {
             }
         case .tabOpen(let tabId, let title):
             guard sessionManager.role == .peer else { return }
+            var preferredGridSize = lastKnownTerminalGridSize
+            if let activeTab {
+                preferredGridSize = (
+                    cols: activeTab.grid.cols,
+                    rows: activeTab.grid.rows)
+            }
             // Replace the placeholder once a real tab announces itself so we
             // don't leave a phantom "Shell" entry around.
             if tabId != TerminalModel.placeholderTabId,
                tabs.count == 1,
                tabs[0].id == TerminalModel.placeholderTabId
             {
+                preferredGridSize = (
+                    cols: tabs[0].grid.cols,
+                    rows: tabs[0].grid.rows)
                 let placeholder = tabs.removeFirst()
                 if activeTabId == placeholder.id {
                     activeTabId = nil
@@ -689,19 +842,34 @@ final class TerminalModel: ObservableObject {
             }
             if let idx = tabs.firstIndex(where: { $0.id == tabId }) {
                 tabs[idx].title = title
-            } else if let tab = makePeerTab(id: tabId, title: title) {
-                // Match the live grid size so output streamed in via
-                // TabPtyOutput renders at the user's viewport size.
-                if let template = activeTab?.grid {
-                    tab.grid.resize(cols: template.cols, rows: template.rows)
-                }
+            } else if let tab = makePeerTab(
+                id: tabId,
+                title: title,
+                preferredSize: preferredGridSize)
+            {
                 tabs.append(tab)
                 if activeTabId == nil {
                     activeTabId = tabId
+                    recordLocalTabFocus(tabId, broadcast: sessionManager.state == .running)
+                }
+                if let pendingFrames = pendingPeerTabOutput.removeValue(forKey: tabId) {
+                    for frame in pendingFrames {
+                        tabs.first(where: { $0.id == tabId })?.grid.feed(Array(frame))
+                    }
+                }
+                if pendingPeerFocusedTabId == tabId {
+                    pendingPeerFocusedTabId = nil
+                    applyPeerTabFocus(tabId)
+                } else {
+                    syncGridSharedInputOverlay(tabId: tabId)
                 }
             }
         case .tabClose(let tabId):
             guard sessionManager.role == .peer else { return }
+            pendingPeerTabOutput.removeValue(forKey: tabId)
+            if pendingPeerFocusedTabId == tabId {
+                pendingPeerFocusedTabId = nil
+            }
             if let idx = tabs.firstIndex(where: { $0.id == tabId }) {
                 tabs.remove(at: idx)
             }
@@ -709,30 +877,47 @@ final class TerminalModel: ObservableObject {
                 activeTabId = tabs.first?.id
             }
         case .tabFocus(let tabId):
-            guard sessionManager.role == .peer else { return }
-            if tabs.contains(where: { $0.id == tabId }) {
-                if let prevId = activeTabId, prevId != tabId,
-                   let prevGrid = tabs.first(where: { $0.id == prevId })?.grid
-                {
-                    prevGrid.clearInputOverlay()
+            if sessionManager.role == .host {
+                guard tabs.contains(where: { $0.id == tabId }),
+                      let identity = sessionManager.identity(forTransportPeerID: peerID)
+                else {
+                    return
                 }
-                activeTabId = tabId
-                if tabs.count > 1 {
-                    _ = sharedInput.deactivate(bumpRevision: false)
+                let previousId = participantFocusedTab[identity]
+                participantFocusedTab[identity] = tabId
+                if let previousId, previousId != tabId {
+                    syncSharedInputParticipants(tabId: previousId, broadcast: true)
                 }
-                syncGridSharedInputOverlay()
+                syncSharedInputParticipants(tabId: tabId, broadcast: true)
+                if sharedInputs[tabId]?.isActive != true {
+                    activateSharedInputAtCurrentCursor(tabId: tabId, broadcast: true)
+                }
+            } else if sessionManager.role == .peer {
+                if activeTabId == nil || activeTabId == TerminalModel.placeholderTabId {
+                    applyPeerTabFocus(tabId)
+                } else if !tabs.contains(where: { $0.id == tabId }) {
+                    pendingPeerFocusedTabId = tabId
+                }
             }
         case .tabPtyOutput(let tabId, let data):
             guard sessionManager.role == .peer else { return }
-            tabs.first(where: { $0.id == tabId })?.grid.feed(Array(data))
+            if let tab = tabs.first(where: { $0.id == tabId }) {
+                tab.grid.feed(Array(data))
+            } else {
+                pendingPeerTabOutput[tabId, default: []].append(data)
+            }
         case .tabInput(let tabId, let data):
-            guard sessionManager.role == .host,
-                  !data.isEmpty,
-                  let tab = tabs.first(where: { $0.id == tabId }),
-                  let pty = tab.pty
+            guard sessionManager.role == .host, !data.isEmpty
             else {
                 return
             }
+            if let packet = try? SharedInputCodec.decode(data) {
+                handleSharedInputPacket(packet)
+                return
+            }
+            guard let tab = tabs.first(where: { $0.id == tabId }),
+                  let pty = tab.pty
+            else { return }
             pty.send(Array(data))
         case .fsDelta(let delta):
             guard sessionManager.role == .peer else { return }
@@ -742,12 +927,11 @@ final class TerminalModel: ObservableObject {
             fileSyncApplier.reconcile(snapshot: entries)
         case .roster:
             syncSharedInputParticipants(broadcast: false)
-            syncGridSharedInputOverlay()
+            syncAllGridSharedInputOverlays()
             syncEditorParticipants()
         case .modeChange(let mode):
             if sessionManager.role == .peer, mode == .raw {
-                _ = sharedInput.deactivate(bumpRevision: false)
-                syncGridSharedInputOverlay()
+                resetSharedInputState()
             }
         case .editorOpen(let docId, let path, let snapshot):
             if let editor = activeEditor, editor.state.docId == docId {
@@ -826,11 +1010,13 @@ final class TerminalModel: ObservableObject {
         if sessionManager.role == .host, sessionManager.state == .running {
             sessionManager.sendMode(creatorOnlyMode ? .raw : .line)
             if creatorOnlyMode {
-                _ = sharedInput.deactivate(bumpRevision: true)
-                syncGridSharedInputOverlay()
-                broadcastSharedInputSnapshot()
-            } else {
-                activateSharedInputAtCurrentCursor(broadcast: true)
+                if let activeTabId {
+                    deactivateSharedInput(tabId: activeTabId, bumpRevision: true)
+                    syncGridSharedInputOverlay(tabId: activeTabId)
+                    broadcastSharedInputSnapshot(tabId: activeTabId)
+                }
+            } else if let activeTabId {
+                activateSharedInputAtCurrentCursor(tabId: activeTabId, broadcast: true)
             }
         }
     }
@@ -845,45 +1031,73 @@ final class TerminalModel: ObservableObject {
         return ids
     }
 
-    private var isHostSharedLineSession: Bool {
-        sessionManager.role == .host &&
-        sessionManager.state == .running &&
-        !lastLocalCreatorOnlyMode &&
-        tabs.count <= 1
+    private func sharedInputParticipants(forTabId tabId: UInt32) -> [UserIdentity] {
+        sharedInputParticipants.filter { identity in
+            if let focused = participantFocusedTab[identity] {
+                return focused == tabId
+            }
+            return identity == sessionManager.localIdentity && activeTabId == tabId
+        }
     }
 
-    private var isPeerSharedLineSession: Bool {
+    private func recordLocalTabFocus(_ tabId: UInt32, broadcast: Bool) {
+        let previousId = participantFocusedTab[sessionManager.localIdentity]
+        participantFocusedTab[sessionManager.localIdentity] = tabId
+        if let previousId, previousId != tabId {
+            syncSharedInputParticipants(tabId: previousId, broadcast: sessionManager.role == .host)
+        }
+        syncSharedInputParticipants(tabId: tabId, broadcast: sessionManager.role == .host)
+        if broadcast, sessionManager.state == .running {
+            sessionManager.sendTabFocus(tabId: tabId)
+        }
+    }
+
+    private func isHostSharedLineSession(tabId: UInt32) -> Bool {
+        guard sessionManager.role == .host,
+              sessionManager.state == .running,
+              let tab = tabs.first(where: { $0.id == tabId })
+        else {
+            return false
+        }
+        return !tab.grid.isUsingAlternateScreen
+    }
+
+    private func isPeerSharedLineSession(tabId: UInt32) -> Bool {
         sessionManager.role == .peer &&
         sessionManager.state == .running &&
         sessionManager.remoteMode == .line &&
-        tabs.count <= 1
+        tabs.contains(where: { $0.id == tabId })
     }
 
-    private var canUseHostSharedInput: Bool {
-        isHostSharedLineSession &&
-        sharedInput.isActive
+    private func canUseHostSharedInput(tabId: UInt32) -> Bool {
+        isHostSharedLineSession(tabId: tabId) &&
+        (sharedInputs[tabId]?.isActive ?? false)
     }
 
-    private var canUsePeerSharedInput: Bool {
-        isPeerSharedLineSession &&
-        sharedInput.isActive &&
+    private func canUsePeerSharedInput(tabId: UInt32) -> Bool {
+        isPeerSharedLineSession(tabId: tabId) &&
+        (sharedInputs[tabId]?.isActive ?? false) &&
         sessionManager.accessMode == .full
     }
 
-    private func handleSharedInputKey(_ bytes: [UInt8]) -> Bool {
+    private func handleSharedInputKey(_ bytes: [UInt8], tabId: UInt32) -> Bool {
         let actor = sessionManager.localIdentity
         guard let request = sharedInputRequest(for: bytes, actor: actor) else {
             return false
         }
 
-        if canUseHostSharedInput {
-            applyAuthoritativeSharedInputRequest(request)
+        if canUseHostSharedInput(tabId: tabId) {
+            applyAuthoritativeSharedInputRequest(tabId: tabId, request)
             return true
         }
-        if canUsePeerSharedInput {
-            applyOptimisticSharedInputRequest(request)
-            sessionManager.sendInputBytes(
-                SharedInputCodec.encode(.request(request)))
+        if canUsePeerSharedInput(tabId: tabId) {
+            applyOptimisticSharedInputRequest(tabId: tabId, request)
+            let payload = SharedInputCodec.encode(.request(tabId: tabId, request))
+            if tabId == TerminalModel.placeholderTabId {
+                sessionManager.sendInputBytes(payload)
+            } else {
+                sessionManager.sendTabInput(tabId: tabId, data: payload)
+            }
             return true
         }
         return false
@@ -924,150 +1138,189 @@ final class TerminalModel: ObservableObject {
 
     private func handleSharedInputPacket(_ packet: SharedInputPacket) {
         switch packet {
-        case .request(let request):
-            guard sessionManager.role == .host, tabs.count <= 1 else { return }
-            applyAuthoritativeSharedInputRequest(request)
-        case .snapshot(let snapshot):
-            guard sessionManager.role == .peer else { return }
-            guard tabs.count <= 1 else {
-                _ = sharedInput.deactivate(bumpRevision: false)
-                syncGridSharedInputOverlay()
+        case .request(let tabId, let request):
+            guard sessionManager.role == .host,
+                  tabs.contains(where: { $0.id == tabId })
+            else {
                 return
             }
-            let wasActive = sharedInput.isActive
-            let preservedAnchor = (sharedInput.anchorCol, sharedInput.anchorRow)
-            let localAnchor = grid?.term.cursor()
-            sharedInput.apply(snapshot)
-            if snapshot.isActive {
-                if wasActive {
-                    sharedInput.overrideAnchor(
-                        anchorCol: preservedAnchor.0,
-                        anchorRow: preservedAnchor.1)
-                } else if let localAnchor {
-                    sharedInput.overrideAnchor(
-                        anchorCol: localAnchor.x,
-                        anchorRow: localAnchor.y)
+            if participantFocusedTab[request.actor] != tabId {
+                let previousId = participantFocusedTab[request.actor]
+                participantFocusedTab[request.actor] = tabId
+                if let previousId, previousId != tabId {
+                    syncSharedInputParticipants(tabId: previousId, broadcast: true)
                 }
             }
-            syncGridSharedInputOverlay()
+            applyAuthoritativeSharedInputRequest(tabId: tabId, request)
+        case .snapshot(let tabId, let snapshot):
+            guard sessionManager.role == .peer else { return }
+            var state = sharedInputs[tabId] ?? SharedInputState()
+            state.apply(snapshot)
+            sharedInputs[tabId] = state
+            syncGridSharedInputOverlay(tabId: tabId)
         }
     }
 
-    private func applyAuthoritativeSharedInputRequest(_ request: SharedInputRequest) {
-        syncSharedInputParticipants(broadcast: false)
-        let effect = sharedInput.apply(request, bumpRevision: true)
-        syncGridSharedInputOverlay()
-        broadcastSharedInputSnapshot()
-        handleSharedInputEffect(effect)
+    private func applyAuthoritativeSharedInputRequest(tabId: UInt32,
+                                                     _ request: SharedInputRequest)
+    {
+        syncSharedInputParticipants(tabId: tabId, broadcast: false)
+        var state = sharedInputs[tabId] ?? SharedInputState()
+        if !state.isActive {
+            sharedInputs[tabId] = state
+            return
+        }
+        _ = state.ensureParticipant(request.actor, bumpRevision: false)
+        let effect = state.apply(request, bumpRevision: true)
+        sharedInputs[tabId] = state
+        syncGridSharedInputOverlay(tabId: tabId)
+        broadcastSharedInputSnapshot(tabId: tabId)
+        handleSharedInputEffect(tabId: tabId, effect)
     }
 
-    private func applyOptimisticSharedInputRequest(_ request: SharedInputRequest) {
-        _ = sharedInput.syncParticipants(
-            sharedInputParticipants,
-            bumpRevision: false)
-        let effect = sharedInput.apply(request, bumpRevision: false)
-        syncGridSharedInputOverlay()
+    private func applyOptimisticSharedInputRequest(tabId: UInt32,
+                                                  _ request: SharedInputRequest)
+    {
+        var state = sharedInputs[tabId] ?? SharedInputState()
+        _ = state.ensureParticipant(request.actor, bumpRevision: false)
+        let effect = state.apply(request, bumpRevision: false)
+        sharedInputs[tabId] = state
+        syncGridSharedInputOverlay(tabId: tabId)
         if case .none = effect {
             return
         }
-        handleSharedInputEffect(effect)
+        handleSharedInputEffect(tabId: tabId, effect)
     }
 
-    private func handleSharedInputEffect(_ effect: SharedInputApplyEffect) {
+    private func handleSharedInputEffect(tabId: UInt32,
+                                         _ effect: SharedInputApplyEffect)
+    {
         switch effect {
         case .none:
             return
         case .commit(let line):
-            syncGridSharedInputOverlay()
+            syncGridSharedInputOverlay(tabId: tabId)
             if sessionManager.role == .host,
-               interceptEditorCommand(line)
+               interceptEditorCommand(line, fromTabId: tabId)
             {
                 return
             }
-            if sessionManager.role == .host, let pty = pty {
-                sharedInputPromptTimer?.invalidate()
+            if sessionManager.role == .host,
+               let pty = tabs.first(where: { $0.id == tabId })?.pty
+            {
+                sharedInputPromptTimers.removeValue(forKey: tabId)?.invalidate()
                 let payload = Array(line.utf8) + [0x0D]
                 pty.send(payload)
             }
         case .interrupt:
-            syncGridSharedInputOverlay()
-            if sessionManager.role == .host, let pty = pty {
-                sharedInputPromptTimer?.invalidate()
+            syncGridSharedInputOverlay(tabId: tabId)
+            if sessionManager.role == .host,
+               let pty = tabs.first(where: { $0.id == tabId })?.pty
+            {
+                sharedInputPromptTimers.removeValue(forKey: tabId)?.invalidate()
                 pty.send([0x03])
             }
         }
     }
 
-    private func handleHostPtyOutput() {
+    private func handleHostPtyOutput(tabId: UInt32) {
         guard sessionManager.role == .host,
               sessionManager.state == .running,
-              !lastLocalCreatorOnlyMode,
-              tabs.count <= 1
+              let tab = tabs.first(where: { $0.id == tabId }),
+              !tab.grid.isUsingAlternateScreen
         else {
             return
         }
-        let wasActive = sharedInput.isActive
-        if wasActive {
-            _ = sharedInput.deactivate(bumpRevision: true)
-            syncGridSharedInputOverlay()
-            broadcastSharedInputSnapshot()
+        if sharedInputs[tabId]?.isActive == true {
+            deactivateSharedInput(tabId: tabId, bumpRevision: true)
+            syncGridSharedInputOverlay(tabId: tabId)
+            broadcastSharedInputSnapshot(tabId: tabId)
         }
-        sharedInputPromptTimer?.invalidate()
-        sharedInputPromptTimer = Timer.scheduledTimer(
+        sharedInputPromptTimers.removeValue(forKey: tabId)?.invalidate()
+        sharedInputPromptTimers[tabId] = Timer.scheduledTimer(
             withTimeInterval: 0.35,
             repeats: false
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.activateSharedInputAtCurrentCursor(broadcast: true)
+                self?.activateSharedInputAtCurrentCursor(
+                    tabId: tabId,
+                    broadcast: true)
             }
         }
     }
 
-    private func activateSharedInputAtCurrentCursor(broadcast: Bool) {
+    private func activateSharedInputAtCurrentCursor(tabId: UInt32,
+                                                   broadcast: Bool)
+    {
         guard sessionManager.role == .host,
               sessionManager.state == .running,
-              !lastLocalCreatorOnlyMode,
-              tabs.count <= 1,
-              let grid
+              let grid = tabs.first(where: { $0.id == tabId })?.grid,
+              !grid.isUsingAlternateScreen
         else {
             return
         }
-        syncSharedInputParticipants(broadcast: false)
+        syncSharedInputParticipants(tabId: tabId, broadcast: false)
         let (col, row) = grid.term.cursor()
-        let changed = sharedInput.activate(
+        var state = sharedInputs[tabId] ?? SharedInputState()
+        let changed = state.activate(
             anchorCol: col,
             anchorRow: row,
-            participants: sharedInputParticipants,
+            participants: sharedInputParticipants(forTabId: tabId),
             bumpRevision: true)
-        syncGridSharedInputOverlay()
+        sharedInputs[tabId] = state
+        syncGridSharedInputOverlay(tabId: tabId)
         if broadcast && changed {
-            broadcastSharedInputSnapshot()
-        } else if broadcast && sharedInput.isActive {
-            broadcastSharedInputSnapshot()
+            broadcastSharedInputSnapshot(tabId: tabId)
+        } else if broadcast && state.isActive {
+            broadcastSharedInputSnapshot(tabId: tabId)
         }
     }
 
     private func syncSharedInputParticipants(broadcast: Bool) {
-        let changed = sharedInput.syncParticipants(
-            sharedInputParticipants,
-            bumpRevision: sessionManager.role == .host)
+        for tab in tabs {
+            syncSharedInputParticipants(tabId: tab.id, broadcast: broadcast)
+        }
+    }
+
+    private func syncSharedInputParticipants(tabId: UInt32, broadcast: Bool) {
+        guard sessionManager.role == .host else { return }
+        guard var state = sharedInputs[tabId] else { return }
+        let changed = state.syncParticipants(
+            sharedInputParticipants(forTabId: tabId),
+            bumpRevision: true)
         if changed {
-            syncGridSharedInputOverlay()
-            if broadcast && sessionManager.role == .host {
-                broadcastSharedInputSnapshot()
+            sharedInputs[tabId] = state
+            syncGridSharedInputOverlay(tabId: tabId)
+            if broadcast {
+                broadcastSharedInputSnapshot(tabId: tabId)
             }
         }
     }
 
-    private func broadcastSharedInputSnapshot() {
+    private func broadcastSharedInputSnapshot(tabId: UInt32) {
         guard sessionManager.role == .host,
               sessionManager.state == .running
         else {
             return
         }
-        let snapshot = sharedInput.snapshot(participants: sharedInputParticipants)
+        let state = sharedInputs[tabId] ?? SharedInputState()
+        let snapshot = state.snapshot(
+            participants: sharedInputParticipants(forTabId: tabId))
         sessionManager.broadcast(.inputOp(
-            SharedInputCodec.encode(.snapshot(snapshot))))
+            SharedInputCodec.encode(.snapshot(tabId: tabId, snapshot))))
+    }
+
+    private func broadcastSharedInputSnapshots() {
+        for tab in tabs {
+            broadcastSharedInputSnapshot(tabId: tab.id)
+        }
+    }
+
+    private func deactivateSharedInput(tabId: UInt32,
+                                       bumpRevision: Bool) {
+        var state = sharedInputs[tabId] ?? SharedInputState()
+        _ = state.deactivate(bumpRevision: bumpRevision)
+        sharedInputs[tabId] = state
     }
 
     private func broadcastTerminalSnapshot() {
@@ -1084,6 +1337,23 @@ final class TerminalModel: ObservableObject {
         sessionManager.sendPtyOutput(Data(bytes))
     }
 
+    private func sendTabSnapshot(tabId: UInt32,
+                                 toTransportPeerID peerID: UInt32? = nil)
+    {
+        guard sessionManager.role == .host,
+              sessionManager.state == .running,
+              let tab = tabs.first(where: { $0.id == tabId })
+        else {
+            return
+        }
+        let bytes = encodeTerminalSnapshot(from: tab.grid)
+        guard !bytes.isEmpty else { return }
+        sessionManager.sendTabPtyOutput(
+            tabId: tabId,
+            data: Data(bytes),
+            toTransportPeerID: peerID)
+    }
+
     /// Send a TabOpen + per-tab snapshot + TabFocus to a freshly-joined peer
     /// so its tab strip and grids match the host's state. Companion to the
     /// legacy bare-PtyOutput snapshot sent by `broadcastTerminalSnapshot()`.
@@ -1096,13 +1366,13 @@ final class TerminalModel: ObservableObject {
                 tabId: tab.id,
                 title: tab.title,
                 toTransportPeerID: peerID)
-            let bytes = encodeTerminalSnapshot(from: tab.grid)
-            if !bytes.isEmpty {
-                sessionManager.sendTabPtyOutput(
-                    tabId: tab.id,
-                    data: Data(bytes),
-                    toTransportPeerID: peerID)
-            }
+            sendTabSnapshot(tabId: tab.id, toTransportPeerID: peerID)
+            let sharedSnapshot = (sharedInputs[tab.id] ?? SharedInputState())
+                .snapshot(participants: sharedInputParticipants(forTabId: tab.id))
+            sessionManager.send(
+                .inputOp(SharedInputCodec.encode(
+                    .snapshot(tabId: tab.id, sharedSnapshot))),
+                toTransportPeerID: peerID)
         }
         if let activeId = activeTabId {
             sessionManager.sendTabFocus(
@@ -1172,13 +1442,21 @@ final class TerminalModel: ObservableObject {
     }
 
     private func syncGridSharedInputOverlay() {
-        guard let grid else { return }
-        guard sharedInput.isActive else {
+        guard let activeTabId else { return }
+        syncGridSharedInputOverlay(tabId: activeTabId)
+    }
+
+    private func syncGridSharedInputOverlay(tabId: UInt32) {
+        guard let grid = tabs.first(where: { $0.id == tabId })?.grid else { return }
+        guard let state = sharedInputs[tabId], state.isActive else {
             grid.clearInputOverlay()
             return
         }
 
-        let overlayCursors = sharedInput.snapshot(participants: sharedInputParticipants)
+        let participants = sessionManager.role == .host
+            ? sharedInputParticipants(forTabId: tabId)
+            : receivedSharedInputParticipants(in: state)
+        let overlayCursors = state.snapshot(participants: participants)
             .cursors
             .map { cursor -> GridModel.InputOverlayCursor in
                 let isLocal = cursor.identity == sessionManager.localIdentity
@@ -1190,20 +1468,38 @@ final class TerminalModel: ObservableObject {
             }
 
         grid.setInputOverlay(
-            anchorCol: sharedInput.anchorCol,
-            anchorRow: sharedInput.anchorRow,
-            text: sharedInput.text,
+            anchorCol: state.anchorCol,
+            anchorRow: state.anchorRow,
+            text: state.text,
             cursors: overlayCursors)
     }
 
-    private func resetSharedInputState() {
-        sharedInputPromptTimer?.invalidate()
-        sharedInputPromptTimer = nil
-        _ = sharedInput.deactivate(bumpRevision: false)
-        syncGridSharedInputOverlay()
+    private func receivedSharedInputParticipants(in state: SharedInputState) -> [UserIdentity] {
+        let localIdentity = sessionManager.localIdentity
+        return Array(state.cursors.keys).sorted { lhs, rhs in
+            if lhs == localIdentity { return true }
+            if rhs == localIdentity { return false }
+            return lhs.bytes.lexicographicallyPrecedes(rhs.bytes)
+        }
     }
 
-    private func interceptEditorCommand(_ line: String) -> Bool {
+    private func syncAllGridSharedInputOverlays() {
+        for tab in tabs {
+            syncGridSharedInputOverlay(tabId: tab.id)
+        }
+    }
+
+    private func resetSharedInputState() {
+        for timer in sharedInputPromptTimers.values {
+            timer.invalidate()
+        }
+        sharedInputPromptTimers.removeAll()
+        sharedInputs.removeAll()
+        syncAllGridSharedInputOverlays()
+    }
+
+    private func interceptEditorCommand(_ line: String,
+                                        fromTabId tabId: UInt32) -> Bool {
         let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.hasPrefix("/edit ") else { return false }
 
@@ -1231,12 +1527,12 @@ final class TerminalModel: ObservableObject {
             snapshot = Data()
         }
 
-        sharedInputPromptTimer?.invalidate()
-        if sharedInput.isActive {
-            _ = sharedInput.deactivate(bumpRevision: true)
-            syncGridSharedInputOverlay()
+        sharedInputPromptTimers.removeValue(forKey: tabId)?.invalidate()
+        if sharedInputs[tabId]?.isActive == true {
+            deactivateSharedInput(tabId: tabId, bumpRevision: true)
+            syncGridSharedInputOverlay(tabId: tabId)
             if sessionManager.role == .host, sessionManager.state == .running {
-                broadcastSharedInputSnapshot()
+                broadcastSharedInputSnapshot(tabId: tabId)
             }
         }
 
@@ -1358,9 +1654,10 @@ final class TerminalModel: ObservableObject {
         activeEditor = nil
         if sessionManager.role == .host,
            sessionManager.state == .running,
-           !lastLocalCreatorOnlyMode
+           !lastLocalCreatorOnlyMode,
+           let activeTabId
         {
-            activateSharedInputAtCurrentCursor(broadcast: true)
+            activateSharedInputAtCurrentCursor(tabId: activeTabId, broadcast: true)
         }
     }
 

@@ -32,8 +32,8 @@ struct SharedInputSnapshot {
 }
 
 enum SharedInputPacket {
-    case request(SharedInputRequest)
-    case snapshot(SharedInputSnapshot)
+    case request(tabId: UInt32, SharedInputRequest)
+    case snapshot(tabId: UInt32, SharedInputSnapshot)
 }
 
 enum SharedInputCodecError: Error {
@@ -57,8 +57,9 @@ enum SharedInputCodec {
     static func encode(_ packet: SharedInputPacket) -> Data {
         var out = Data(magic)
         switch packet {
-        case .request(let req):
+        case .request(let tabId, let req):
             out.append(requestTag)
+            appendU32(&out, tabId)
             out.append(contentsOf: req.actor.bytes)
             out.append(req.kind.rawValue)
             if req.kind == .insertText {
@@ -66,8 +67,9 @@ enum SharedInputCodec {
                 appendU16(&out, UInt16(min(utf8.count, Int(UInt16.max))))
                 out.append(contentsOf: utf8.prefix(Int(UInt16.max)))
             }
-        case .snapshot(let snap):
+        case .snapshot(let tabId, let snap):
             out.append(snapshotTag)
+            appendU32(&out, tabId)
             appendU32(&out, snap.revision)
             out.append(snap.isActive ? 1 : 0)
             appendU16(&out, snap.anchorCol)
@@ -93,6 +95,7 @@ enum SharedInputCodec {
         let tag = try r.readU8()
         switch tag {
         case requestTag:
+            let tabId = try r.readU32()
             let actor = try UserIdentity.sharedInputFrom(exactly16:
                 Array(try r.readBytes(16)))
             let kindByte = try r.readU8()
@@ -105,8 +108,11 @@ enum SharedInputCodec {
                 text = String(data: try r.readBytes(Int(textLen)),
                               encoding: .utf8) ?? ""
             }
-            return .request(SharedInputRequest(actor: actor, kind: kind, text: text))
+            return .request(
+                tabId: tabId,
+                SharedInputRequest(actor: actor, kind: kind, text: text))
         case snapshotTag:
+            let tabId = try r.readU32()
             let revision = try r.readU32()
             let isActive = try r.readU8() != 0
             let anchorCol = try r.readU16()
@@ -125,7 +131,7 @@ enum SharedInputCodec {
                     identity: identity,
                     offset: offset))
             }
-            return .snapshot(SharedInputSnapshot(
+            return .snapshot(tabId: tabId, SharedInputSnapshot(
                 revision: revision,
                 isActive: isActive,
                 anchorCol: anchorCol,
@@ -215,6 +221,17 @@ struct SharedInputState {
             }
         }
         return changed
+    }
+
+    mutating func ensureParticipant(_ identity: UserIdentity,
+                                    bumpRevision: Bool = true) -> Bool
+    {
+        guard cursors[identity] == nil else { return false }
+        cursors[identity] = textScalars.count
+        if bumpRevision {
+            revision &+= 1
+        }
+        return true
     }
 
     mutating func apply(_ request: SharedInputRequest,

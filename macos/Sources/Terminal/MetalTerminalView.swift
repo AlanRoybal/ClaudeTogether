@@ -14,6 +14,7 @@ final class MetalTerminalNSView: NSView {
     private(set) var grid: GridModel
     private var onKey: ([UInt8]) -> Void
     private var onResize: (UInt16, UInt16) -> Void
+    private var lastPropagatedGridSize: (cols: UInt16, rows: UInt16)?
     /// When true, keystrokes are dropped (peer in raw mode: creator-only input).
     var inputEnabled: Bool = true
 
@@ -43,8 +44,8 @@ final class MetalTerminalNSView: NSView {
 
         renderer.onResize = { [weak self] cols, rows in
             guard let self = self else { return }
-            self.grid.resize(cols: cols, rows: rows)
-            self.onResize(cols, rows)
+            self.grid.resize(cols: cols, rows: rows, preserveTop: true)
+            self.propagateResizeIfAuthoritative(cols: cols, rows: rows)
         }
     }
 
@@ -52,13 +53,18 @@ final class MetalTerminalNSView: NSView {
 
     func updateGrid(_ grid: GridModel) {
         guard self.grid !== grid else { return }
+        syncRendererGridSize()
         self.grid = grid
         renderer.grid = grid
 
         // A reused NSView does not get a fresh resize callback when the model
         // swaps grids, so bring the new grid up to the renderer's live size
         // immediately.
-        grid.resize(cols: renderer.cols, rows: renderer.rows)
+        if let size = currentAuthoritativeGridSize() {
+            grid.resize(cols: size.cols, rows: size.rows, preserveTop: true)
+        } else {
+            grid.resize(cols: renderer.cols, rows: renderer.rows, preserveTop: true)
+        }
     }
 
     func updateHandlers(onKey: @escaping ([UInt8]) -> Void,
@@ -73,6 +79,12 @@ final class MetalTerminalNSView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         window?.makeFirstResponder(self)
+        syncRendererGridSize()
+    }
+
+    override func layout() {
+        super.layout()
+        syncRendererGridSize()
     }
 
     // MARK: keyboard -> closure
@@ -149,6 +161,62 @@ final class MetalTerminalNSView: NSView {
         }
         return nil
     }
+
+    private func syncRendererGridSize() {
+        guard let size = currentDrawableSizeForSync() else { return }
+        renderer.recomputeGrid(for: size)
+        propagateResizeIfAuthoritative(cols: renderer.cols, rows: renderer.rows)
+    }
+
+    private func propagateResizeIfAuthoritative(cols: UInt16, rows: UInt16) {
+        guard let size = currentAuthoritativeGridSize() else { return }
+        guard size.cols == cols && size.rows == rows else { return }
+        if let last = lastPropagatedGridSize,
+           last.cols == cols,
+           last.rows == rows
+        {
+            return
+        }
+        lastPropagatedGridSize = (cols, rows)
+        onResize(cols, rows)
+    }
+
+    private func currentAuthoritativeGridSize() -> (cols: UInt16, rows: UInt16)? {
+        guard let size = currentLayoutDrawableSize() else { return nil }
+        let cellWidth = max(1, renderer.atlas.cellWidthPx)
+        let cellHeight = max(1, renderer.atlas.cellHeightPx)
+        let cols = max(1, Int(size.width) / cellWidth)
+        let rows = max(1, Int(size.height) / cellHeight)
+        return (
+            cols: UInt16(min(Int(UInt16.max), cols)),
+            rows: UInt16(min(Int(UInt16.max), rows))
+        )
+    }
+
+    private func currentLayoutDrawableSize() -> CGSize? {
+        guard window != nil, bounds.width > 0, bounds.height > 0 else {
+            return nil
+        }
+        let scale = window?.backingScaleFactor
+            ?? NSScreen.main?.backingScaleFactor
+            ?? 2.0
+        let fallback = CGSize(
+            width: bounds.width * scale,
+            height: bounds.height * scale)
+        guard fallback.width > 0, fallback.height > 0 else { return nil }
+        return fallback
+    }
+
+    private func currentDrawableSizeForSync() -> CGSize? {
+        if let size = currentLayoutDrawableSize() {
+            return size
+        }
+        let drawableSize = mtkView.drawableSize
+        if drawableSize.width > 0, drawableSize.height > 0 {
+            return drawableSize
+        }
+        return nil
+    }
 }
 
 /// SwiftUI bridge. Caller supplies the grid and closures; this view is
@@ -175,7 +243,9 @@ struct MetalTerminalView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> MetalTerminalNSView {
         guard let v = MetalTerminalNSView(
-            grid: grid, onKey: onKey, onResize: onResize)
+            grid: grid,
+            onKey: onKey,
+            onResize: onResize)
         else {
             NSLog("MetalTerminalNSView init failed — Metal unavailable")
             return MetalTerminalNSView(

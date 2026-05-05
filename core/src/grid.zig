@@ -142,6 +142,16 @@ pub const Grid = struct {
     }
 
     pub fn resize(self: *Grid, cols: u16, rows: u16) !void {
+        try self.resizeWithPolicy(cols, rows, true);
+    }
+
+    /// Resize for UI chrome/layout changes where losing top visible rows is
+    /// worse than preserving the conventional terminal bottom anchor.
+    pub fn resizePreservingTop(self: *Grid, cols: u16, rows: u16) !void {
+        try self.resizeWithPolicy(cols, rows, false);
+    }
+
+    fn resizeWithPolicy(self: *Grid, cols: u16, rows: u16, preserve_bottom: bool) !void {
         if (cols == self.cols and rows == self.rows) return;
         const old_cols = self.cols;
         const old_rows = self.rows;
@@ -153,7 +163,7 @@ pub const Grid = struct {
         for (new_primary) |*c| c.* = .{};
         for (new_alt) |*c| c.* = .{};
 
-        if (!self.using_alt and cols == old_cols and rows < old_rows) {
+        if (preserve_bottom and !self.using_alt and cols == old_cols and rows < old_rows) {
             var y: u16 = 0;
             while (y < old_rows - rows) : (y += 1) {
                 const row_start: usize = @as(usize, y) * @as(usize, old_cols);
@@ -168,7 +178,7 @@ pub const Grid = struct {
             old_rows,
             cols,
             rows,
-            true,
+            preserve_bottom,
         );
         _ = copyResizedBuffer(
             new_alt,
@@ -191,7 +201,10 @@ pub const Grid = struct {
             try self.scrollback.reshape(cols);
         }
         self.cursor_x = @min(self.cursor_x, cols - 1);
-        self.cursor_y = shiftClampedRow(self.cursor_y, primary_shift, rows);
+        self.cursor_y = if (preserve_bottom)
+            shiftClampedRow(self.cursor_y, primary_shift, rows)
+        else
+            @min(self.cursor_y, rows - 1);
         self.saved.x = @min(self.saved.x, cols - 1);
         self.saved.y = @min(self.saved.y, rows - 1);
         self.scroll_top = 0;
@@ -875,6 +888,22 @@ test "resize growth keeps existing content top-anchored" {
     try std.testing.expectEqual(@as(u32, 'A'), g.cells[0].codepoint);
     try std.testing.expectEqual(@as(u32, 'B'), g.cells[4].codepoint);
     try std.testing.expectEqual(@as(u32, ' '), g.cells[8].codepoint);
+    try std.testing.expectEqual(@as(u16, 1), g.cursor_y);
+}
+
+test "top-preserving resize keeps first rows visible" {
+    var g = try Grid.init(std.testing.allocator, 4, 4);
+    defer g.deinit();
+    var row: u16 = 0;
+    while (row < g.rows) : (row += 1) {
+        g.cursor_x = 0;
+        g.cursor_y = row;
+        g.putCodepoint(@as(u32, 'A') + row);
+    }
+    g.cursor_y = 3;
+    try g.resizePreservingTop(4, 2);
+    try std.testing.expectEqual(@as(u32, 'A'), g.cells[0].codepoint);
+    try std.testing.expectEqual(@as(u32, 'B'), g.cells[4].codepoint);
     try std.testing.expectEqual(@as(u16, 1), g.cursor_y);
 }
 
