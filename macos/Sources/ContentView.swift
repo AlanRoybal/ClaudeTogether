@@ -1,5 +1,6 @@
 import SwiftUI
 import Combine
+import Darwin
 import CollabTermC
 
 struct ContentView: View {
@@ -14,19 +15,23 @@ struct ContentView: View {
                 if let controller = model.activeEditor {
                     EditorHost(controller: controller)
                         .frame(minWidth: 500, minHeight: 300)
-                } else if let grid = model.grid {
+                } else if !model.tabs.isEmpty {
                     VStack(spacing: 0) {
                         if model.shouldShowTabStrip {
                             TabStripView(model: model)
                         }
-                        MetalTerminalView(
-                            grid: grid,
-                            onKey: { model.handleKey($0) },
-                            onResize: { cols, rows in
-                                model.handleResize(cols: cols, rows: rows)
-                            },
-                            inputEnabled: model.inputEnabled)
-                            .frame(minWidth: 500, minHeight: 300)
+                        if let tab = model.activeTabForView {
+                            MetalTerminalView(
+                                grid: tab.grid,
+                                onKey: { bytes in
+                                    model.handleKey(bytes, forTabId: tab.id)
+                                },
+                                onResize: { cols, rows in
+                                    model.handleResize(cols: cols, rows: rows)
+                                },
+                                inputEnabled: model.inputEnabled)
+                                .frame(minWidth: 500, minHeight: 300)
+                        }
                     }
                 } else {
                     VStack(spacing: 16) {
@@ -101,6 +106,7 @@ final class TerminalModel: ObservableObject {
     private var activeTab: TabState? {
         tabs.first(where: { $0.id == activeTabId })
     }
+    var activeTabForView: TabState? { activeTab }
     private var nextTabId: UInt32 = 1
 
     /// Hide the tab strip when a session has at most one tab so the
@@ -112,6 +118,7 @@ final class TerminalModel: ObservableObject {
     /// terminal", which avoids misclassifying normal shell prompts.
     private var lastLocalCreatorOnlyMode: Bool = false
     private var modeTimer: Timer?
+    private var titleTimer: Timer?
     private var sharedInput = SharedInputState()
     private var sharedInputPromptTimer: Timer?
     private var editorSavedRevisions: [UInt64: UInt32] = [:]
@@ -178,6 +185,7 @@ final class TerminalModel: ObservableObject {
 
     deinit {
         modeTimer?.invalidate()
+        titleTimer?.invalidate()
         sharedInputPromptTimer?.invalidate()
         fileSyncTimer?.invalidate()
     }
@@ -214,6 +222,7 @@ final class TerminalModel: ObservableObject {
         // Default to one tab so the single-session UX matches the pre-tabs
         // experience. Subsequent tabs are user-initiated (⌘T / +).
         openNewTab()
+        startTitlePolling()
         startModeProbe()
         syncGridSharedInputOverlay()
     }
@@ -229,6 +238,7 @@ final class TerminalModel: ObservableObject {
         activeEditor = nil
         editorSavedRevisions.removeAll()
         stopSharing()
+        stopTitlePolling()
         stopModeProbe()
         stopFileSyncPolling()
         fileSyncApplier.configure(rootPath: nil)
@@ -248,17 +258,38 @@ final class TerminalModel: ObservableObject {
         }
         let tabId = nextTabId
         nextTabId &+= 1
-        let title = "Shell \(tabId)"
+        let title = TabTitleResolver.initialTitle(
+            cwd: folder,
+            sessionRootPath: rootPath)
         guard let tab = makeHostTab(id: tabId, title: title, cwd: folder) else {
             return
         }
+        if let prevId = activeTabId,
+           let prevGrid = tabs.first(where: { $0.id == prevId })?.grid
+        {
+            prevGrid.clearInputOverlay()
+        }
+        let wasInputActive = sharedInput.isActive
+        if wasInputActive {
+            _ = sharedInput.deactivate(bumpRevision: true)
+        }
         tabs.append(tab)
         activeTabId = tabId
+        refreshTabTitle(forTabID: tabId)
+        let currentTitle = tabs.first(where: { $0.id == tabId })?.title ?? title
         if sessionManager.state == .running {
-            sessionManager.sendTabOpen(tabId: tabId, title: title)
+            sessionManager.sendTabOpen(tabId: tabId, title: currentTitle)
             sessionManager.sendTabFocus(tabId: tabId)
+            if wasInputActive {
+                broadcastSharedInputSnapshot()
+            }
         }
         syncGridSharedInputOverlay()
+        if sessionManager.role == .host, sessionManager.state == .running,
+           !lastLocalCreatorOnlyMode
+        {
+            activateSharedInputAtCurrentCursor(broadcast: true)
+        }
     }
 
     /// Host: close a tab by id. Terminates the PTY, broadcasts TabClose, and
@@ -294,19 +325,30 @@ final class TerminalModel: ObservableObject {
     /// inbound TabFocus frames (without re-broadcasting).
     func focusTab(id: UInt32) {
         guard tabs.contains(where: { $0.id == id }) else { return }
+        if let prevId = activeTabId, prevId != id,
+           let prevGrid = tabs.first(where: { $0.id == prevId })?.grid
+        {
+            prevGrid.clearInputOverlay()
+        }
+        let wasInputActive = sharedInput.isActive
+        if wasInputActive {
+            _ = sharedInput.deactivate(bumpRevision: true)
+        }
         activeTabId = id
         if sessionManager.role == .host, sessionManager.state == .running {
             sessionManager.sendTabFocus(tabId: id)
-            // Re-paint legacy peers' single-grid view to match the new
-            // active tab — they only see content from the bare PtyOutput
-            // channel and would otherwise stay stuck on the old tab's
-            // last frame.
             broadcastTerminalSnapshot()
+            if wasInputActive {
+                broadcastSharedInputSnapshot()
+            }
         }
         syncGridSharedInputOverlay()
-        // Mode/raw-screen state is per-tab; re-probe so the banner/raw-mode
-        // signal reflects the new active tab right away.
         probeLocalMode(force: true)
+        if sessionManager.role == .host, sessionManager.state == .running,
+           !lastLocalCreatorOnlyMode
+        {
+            activateSharedInputAtCurrentCursor(broadcast: true)
+        }
     }
 
     func nextTab() {
@@ -362,9 +404,10 @@ final class TerminalModel: ObservableObject {
             if shouldShare {
                 let payload = Data(bytes)
                 self.sessionManager.sendTabPtyOutput(tabId: id, data: payload)
-                // Backward compat: legacy peers (and our own legacy code path)
-                // expect bare PtyOutput frames for the active tab.
-                if id == self.activeTabId {
+                // Backward compat for single-tab peers only. In multi-tab
+                // sessions, bare PtyOutput is session-wide and can repaint
+                // unrelated peer tabs with this tab's escape stream.
+                if self.tabs.count <= 1, id == self.activeTabId {
                     self.sessionManager.sendPtyOutput(payload)
                 }
             }
@@ -390,6 +433,53 @@ final class TerminalModel: ObservableObject {
             return nil
         }
         return TabState(id: id, title: title, pty: nil, grid: grid)
+    }
+
+    // MARK: tab titles
+
+    private func startTitlePolling() {
+        titleTimer?.invalidate()
+        titleTimer = Timer.scheduledTimer(
+            withTimeInterval: 0.75,
+            repeats: true
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.refreshAllTabTitles()
+            }
+        }
+        refreshAllTabTitles()
+    }
+
+    private func stopTitlePolling() {
+        titleTimer?.invalidate()
+        titleTimer = nil
+    }
+
+    private func refreshAllTabTitles() {
+        for tab in tabs where tab.pty != nil {
+            refreshTabTitle(forTabID: tab.id)
+        }
+    }
+
+    private func refreshTabTitle(forTabID tabId: UInt32) {
+        guard let idx = tabs.firstIndex(where: { $0.id == tabId }),
+              let pty = tabs[idx].pty
+        else {
+            return
+        }
+
+        let fallback = tabs[idx].title
+        let nextTitle = TabTitleResolver.resolveTitle(
+            fd: pty.fd,
+            pid: pty.pid,
+            sessionRootPath: rootPath,
+            fallbackTitle: fallback)
+        guard nextTitle != tabs[idx].title else { return }
+
+        tabs[idx].title = nextTitle
+        if sessionManager.role == .host, sessionManager.state == .running {
+            sessionManager.sendTabOpen(tabId: tabId, title: nextTitle)
+        }
     }
 
     // MARK: sharing
@@ -471,8 +561,11 @@ final class TerminalModel: ObservableObject {
 
     // MARK: keystroke + resize handling
 
-    /// Called by MetalTerminalView when the user types.
-    func handleKey(_ bytes: [UInt8]) {
+    /// Called by MetalTerminalView when the user types. The tab id is
+    /// supplied so each per-tab view writes only to its own PTY — no central
+    /// "active session" lookup that could leak keystrokes across tabs.
+    func handleKey(_ bytes: [UInt8], forTabId tabId: UInt32) {
+        guard tabId == activeTabId else { return }
         if isHostSharedLineSession || isPeerSharedLineSession {
             _ = handleSharedInputKey(bytes)
             return
@@ -480,15 +573,17 @@ final class TerminalModel: ObservableObject {
         if handleSharedInputKey(bytes) {
             return
         }
-        if let pty = pty {
-            // Host (or solo): write directly to local PTY.
+        if let pty = tabs.first(where: { $0.id == tabId })?.pty {
             pty.send(bytes)
             return
         }
-        // Peer: ship keystrokes to the host for it to write into its PTY.
-        // Opaque bytes payload — full CRDT merge is a later refinement.
         if sessionManager.role == .peer, sessionManager.state == .running {
-            sessionManager.sendInputBytes(Data(bytes))
+            let payload = Data(bytes)
+            if tabId == TerminalModel.placeholderTabId {
+                sessionManager.sendInputBytes(payload)
+            } else {
+                sessionManager.sendTabInput(tabId: tabId, data: payload)
+            }
         }
     }
 
@@ -571,17 +666,17 @@ final class TerminalModel: ObservableObject {
                     activeTabId = nil
                 }
             }
-            if !tabs.contains(where: { $0.id == tabId }) {
-                if let tab = makePeerTab(id: tabId, title: title) {
-                    // Match the live grid size so output streamed in via
-                    // TabPtyOutput renders at the user's viewport size.
-                    if let template = activeTab?.grid {
-                        tab.grid.resize(cols: template.cols, rows: template.rows)
-                    }
-                    tabs.append(tab)
-                    if activeTabId == nil {
-                        activeTabId = tabId
-                    }
+            if let idx = tabs.firstIndex(where: { $0.id == tabId }) {
+                tabs[idx].title = title
+            } else if let tab = makePeerTab(id: tabId, title: title) {
+                // Match the live grid size so output streamed in via
+                // TabPtyOutput renders at the user's viewport size.
+                if let template = activeTab?.grid {
+                    tab.grid.resize(cols: template.cols, rows: template.rows)
+                }
+                tabs.append(tab)
+                if activeTabId == nil {
+                    activeTabId = tabId
                 }
             }
         case .tabClose(let tabId):
@@ -595,12 +690,29 @@ final class TerminalModel: ObservableObject {
         case .tabFocus(let tabId):
             guard sessionManager.role == .peer else { return }
             if tabs.contains(where: { $0.id == tabId }) {
+                if let prevId = activeTabId, prevId != tabId,
+                   let prevGrid = tabs.first(where: { $0.id == prevId })?.grid
+                {
+                    prevGrid.clearInputOverlay()
+                }
                 activeTabId = tabId
+                if tabs.count > 1 {
+                    _ = sharedInput.deactivate(bumpRevision: false)
+                }
                 syncGridSharedInputOverlay()
             }
         case .tabPtyOutput(let tabId, let data):
             guard sessionManager.role == .peer else { return }
             tabs.first(where: { $0.id == tabId })?.grid.feed(Array(data))
+        case .tabInput(let tabId, let data):
+            guard sessionManager.role == .host,
+                  !data.isEmpty,
+                  let tab = tabs.first(where: { $0.id == tabId }),
+                  let pty = tab.pty
+            else {
+                return
+            }
+            pty.send(Array(data))
         case .fsDelta(let delta):
             guard sessionManager.role == .peer else { return }
             fileSyncApplier.apply(delta)
@@ -711,13 +823,15 @@ final class TerminalModel: ObservableObject {
     private var isHostSharedLineSession: Bool {
         sessionManager.role == .host &&
         sessionManager.state == .running &&
-        !lastLocalCreatorOnlyMode
+        !lastLocalCreatorOnlyMode &&
+        tabs.count <= 1
     }
 
     private var isPeerSharedLineSession: Bool {
         sessionManager.role == .peer &&
         sessionManager.state == .running &&
-        sessionManager.remoteMode == .line
+        sessionManager.remoteMode == .line &&
+        tabs.count <= 1
     }
 
     private var canUseHostSharedInput: Bool {
@@ -785,10 +899,15 @@ final class TerminalModel: ObservableObject {
     private func handleSharedInputPacket(_ packet: SharedInputPacket) {
         switch packet {
         case .request(let request):
-            guard sessionManager.role == .host else { return }
+            guard sessionManager.role == .host, tabs.count <= 1 else { return }
             applyAuthoritativeSharedInputRequest(request)
         case .snapshot(let snapshot):
             guard sessionManager.role == .peer else { return }
+            guard tabs.count <= 1 else {
+                _ = sharedInput.deactivate(bumpRevision: false)
+                syncGridSharedInputOverlay()
+                return
+            }
             let wasActive = sharedInput.isActive
             let preservedAnchor = (sharedInput.anchorCol, sharedInput.anchorRow)
             let localAnchor = grid?.term.cursor()
@@ -856,7 +975,8 @@ final class TerminalModel: ObservableObject {
     private func handleHostPtyOutput() {
         guard sessionManager.role == .host,
               sessionManager.state == .running,
-              !lastLocalCreatorOnlyMode
+              !lastLocalCreatorOnlyMode,
+              tabs.count <= 1
         else {
             return
         }
@@ -881,6 +1001,7 @@ final class TerminalModel: ObservableObject {
         guard sessionManager.role == .host,
               sessionManager.state == .running,
               !lastLocalCreatorOnlyMode,
+              tabs.count <= 1,
               let grid
         else {
             return
@@ -926,6 +1047,7 @@ final class TerminalModel: ObservableObject {
     private func broadcastTerminalSnapshot() {
         guard sessionManager.role == .host,
               sessionManager.state == .running,
+              tabs.count <= 1,
               let grid
         else {
             return
@@ -1309,9 +1431,11 @@ final class TerminalModel: ObservableObject {
         let bytes = Array("\r\n[\(message)]\r\n".utf8)
         grid?.feed(bytes)
         if sessionManager.role == .host, sessionManager.state == .running {
-            sessionManager.sendPtyOutput(Data(bytes))
             if let activeId = activeTabId {
                 sessionManager.sendTabPtyOutput(tabId: activeId, data: Data(bytes))
+            }
+            if tabs.count <= 1 {
+                sessionManager.sendPtyOutput(Data(bytes))
             }
         }
     }
@@ -1330,6 +1454,132 @@ final class TerminalModel: ObservableObject {
             ?? (identity == sessionManager.localIdentity
                 ? sessionManager.localColor
                 : 0x5AC8FA)
+    }
+}
+
+private enum TabTitleResolver {
+    private static let shellNames: Set<String> = [
+        "bash", "csh", "dash", "fish", "ksh", "nu",
+        "pwsh", "sh", "tcsh", "xonsh", "zsh",
+    ]
+
+    static func initialTitle(cwd: String?, sessionRootPath: String?) -> String {
+        displayPath(cwd, sessionRootPath: sessionRootPath) ?? "Shell"
+    }
+
+    static func resolveTitle(fd: Int32,
+                             pid: Int32,
+                             sessionRootPath: String?,
+                             fallbackTitle: String) -> String
+    {
+        guard fd >= 0, pid > 0 else { return fallbackTitle }
+
+        let foregroundPID = foregroundProcessGroupLeader(fd: fd) ?? pid
+        let processName = executableName(pid: foregroundPID)
+            ?? executableName(pid: pid)
+            ?? commandName(pid: foregroundPID)
+            ?? fallbackTitle
+        let cwd = currentDirectoryPath(pid: foregroundPID)
+            ?? currentDirectoryPath(pid: pid)
+        let pathLabel = displayPath(cwd, sessionRootPath: sessionRootPath)
+
+        if isShellLike(processName) {
+            return pathLabel ?? fallbackTitle
+        }
+        if let pathLabel, !pathLabel.isEmpty {
+            return "\(processName) - \(pathLabel)"
+        }
+        return processName
+    }
+
+    private static func foregroundProcessGroupLeader(fd: Int32) -> Int32? {
+        var pgid: Int32 = 0
+        guard ioctl(fd, UInt(TIOCGPGRP), &pgid) == 0, pgid > 0 else {
+            return nil
+        }
+        return pgid
+    }
+
+    private static func executableName(pid: Int32) -> String? {
+        var buf = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        let rc = proc_pidpath(pid, &buf, UInt32(buf.count))
+        guard rc > 0 else { return nil }
+        let path = String(cString: buf)
+        let name = URL(fileURLWithPath: path).lastPathComponent
+        return sanitizedTitle(name)
+    }
+
+    private static func commandName(pid: Int32) -> String? {
+        let expectedSize = Int32(MemoryLayout<proc_bsdinfo>.size)
+        var info = proc_bsdinfo()
+        let rc = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, expectedSize)
+        guard rc == expectedSize else { return nil }
+        let name = withUnsafePointer(to: &info.pbi_comm) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXCOMLEN)) {
+                String(cString: $0)
+            }
+        }
+        return sanitizedTitle(name)
+    }
+
+    private static func currentDirectoryPath(pid: Int32) -> String? {
+        let expectedSize = Int32(MemoryLayout<proc_vnodepathinfo>.size)
+        var info = proc_vnodepathinfo()
+        let rc = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &info, expectedSize)
+        guard rc == expectedSize else { return nil }
+        let path = withUnsafePointer(to: &info.pvi_cdir.vip_path) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: Int(MAXPATHLEN)) {
+                String(cString: $0)
+            }
+        }
+        return sanitizedPath(path)
+    }
+
+    private static func isShellLike(_ processName: String) -> Bool {
+        shellNames.contains(processName.lowercased())
+    }
+
+    private static func displayPath(_ path: String?, sessionRootPath: String?) -> String? {
+        guard let path = sanitizedPath(path) else { return nil }
+        let normalized = URL(fileURLWithPath: path).standardizedFileURL.path
+
+        if let sessionRootPath = sanitizedPath(sessionRootPath) {
+            let root = URL(fileURLWithPath: sessionRootPath).standardizedFileURL.path
+            if normalized == root {
+                return root == "/" ? "/" : URL(fileURLWithPath: root).lastPathComponent
+            }
+            if normalized.hasPrefix(root + "/") {
+                return String(normalized.dropFirst(root.count + 1))
+            }
+        }
+
+        let home = URL(fileURLWithPath: NSHomeDirectory()).standardizedFileURL.path
+        if normalized == home {
+            return "~"
+        }
+        if normalized.hasPrefix(home + "/") {
+            return "~" + String(normalized.dropFirst(home.count))
+        }
+        if normalized == "/" {
+            return "/"
+        }
+
+        let parts = normalized.split(separator: "/")
+        if parts.count <= 2 {
+            return normalized
+        }
+        return ".../" + parts.suffix(2).joined(separator: "/")
+    }
+
+    private static func sanitizedTitle(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func sanitizedPath(_ value: String?) -> String? {
+        guard let value = sanitizedTitle(value) else { return nil }
+        return value == "." ? nil : value
     }
 }
 

@@ -300,6 +300,13 @@ final class SessionManager: ObservableObject {
         }
     }
 
+    /// Peer only: ship keystrokes for one tab to the host. The host writes
+    /// them only into the matching PTY, so tabs do not share input state.
+    func sendTabInput(tabId: UInt32, data: Data) {
+        guard role == .peer, state == .running, !data.isEmpty else { return }
+        broadcast(.tabInput(tabId: tabId, data: data))
+    }
+
     /// Peer only: ship keystroke bytes to the host as an opaque `inputOp`
     /// payload. (Full CRDT merge is a future step; Phase 3 uses this as a
     /// "raw-bytes passthrough" so end-to-end shared typing works.)

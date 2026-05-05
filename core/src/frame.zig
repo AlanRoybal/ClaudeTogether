@@ -22,11 +22,12 @@ pub const Tag = enum(u8) {
     roster = 0x09,
     /// Lightweight keepalive frame to keep idle tunnels/sockets warm.
     heartbeat = 0x0A,
-    // --- multi-tab frames (0x0C..0x0F) ------------------------------------
-    // Each session can host N concurrent PTY shells. Tags 0x0C..0x0F carry
-    // the per-tab lifecycle and per-tab PTY output. Legacy 0x01 pty_output
-    // remains for backward compatibility (active tab also flows through it
-    // for legacy peers).
+    // --- multi-tab frames --------------------------------------------------
+    // Each session can host N concurrent PTY shells. These tags carry the
+    // per-tab lifecycle, per-tab PTY output, and per-tab peer input. Legacy
+    // 0x01 pty_output remains only for single-tab compatibility.
+    /// Peer sends keystrokes for one tab to the host.
+    tab_input = 0x0B,
     /// Host announces a new tab with its initial title.
     tab_open = 0x0C,
     /// Host announces a tab teardown.
@@ -125,6 +126,11 @@ pub const TabPtyOutput = struct {
     data: []const u8,
 };
 
+pub const TabInput = struct {
+    tab_id: u32,
+    data: []const u8,
+};
+
 /// Stable cursor anchor id matching the `client:u32 clock:u32` pair used by
 /// `crdt.Id`. Declared here to avoid a direct dependency on `crdt.zig` from
 /// the wire layer (keeps the codec and the CRDT module decoupled).
@@ -186,6 +192,7 @@ pub const Frame = union(Tag) {
     /// opaque bytes passing through the transport layer.
     roster: void,
     heartbeat: void,
+    tab_input: TabInput,
     tab_open: TabOpen,
     tab_close: TabClose,
     tab_focus: TabFocus,
@@ -348,6 +355,15 @@ pub fn decode(bytes: []const u8) DecodeError!Frame {
                 .data = data,
             } };
         },
+        .tab_input => blk: {
+            const tab_id = try r.readU32();
+            const n = try r.readU32();
+            const data = try r.readBytes(n);
+            break :blk Frame{ .tab_input = .{
+                .tab_id = tab_id,
+                .data = data,
+            } };
+        },
         .editor_open => blk: {
             const doc_id = try r.readU64();
             const path_len = try r.readU16();
@@ -497,6 +513,11 @@ pub fn encode(frame: Frame, out: []u8) EncodeError!usize {
             try w.writeU32(@intCast(p.data.len));
             try w.writeBytes(p.data);
         },
+        .tab_input => |p| {
+            try w.writeU32(p.tab_id);
+            try w.writeU32(@intCast(p.data.len));
+            try w.writeBytes(p.data);
+        },
         .editor_open => |p| {
             try w.writeU64(p.doc_id);
             try w.writeU16(@intCast(p.path.len));
@@ -542,6 +563,7 @@ pub fn encodedLen(frame: Frame) usize {
         .tab_close => 1 + 4,
         .tab_focus => 1 + 4,
         .tab_pty_output => |p| 1 + 4 + 4 + p.data.len,
+        .tab_input => |p| 1 + 4 + 4 + p.data.len,
         .editor_open => |p| 1 + 8 + 2 + p.path.len + 4 + p.snapshot.len,
         .editor_op => |p| 1 + 8 + 4 + p.op_bytes.len,
         // doc_id + user_id + two optional CrdtIds (each: 1 tag + up to 8 body)
@@ -679,6 +701,19 @@ test "tab_pty_output roundtrip" {
     const decoded = try decode(buf[0..n]);
     try std.testing.expectEqual(@as(u32, 3), decoded.tab_pty_output.tab_id);
     try std.testing.expectEqualStrings(payload, decoded.tab_pty_output.data);
+}
+
+test "tab_input roundtrip" {
+    const payload = "echo hi\r";
+    const frame = Frame{ .tab_input = .{
+        .tab_id = 9,
+        .data = payload,
+    } };
+    var buf: [64]u8 = undefined;
+    const n = try encode(frame, &buf);
+    const decoded = try decode(buf[0..n]);
+    try std.testing.expectEqual(@as(u32, 9), decoded.tab_input.tab_id);
+    try std.testing.expectEqualStrings(payload, decoded.tab_input.data);
 }
 
 test "editor_open roundtrip" {

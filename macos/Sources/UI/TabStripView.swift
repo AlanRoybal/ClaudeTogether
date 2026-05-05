@@ -47,33 +47,52 @@ private struct TabStripButton: View {
     let onClose: () -> Void
 
     var body: some View {
-        HStack(spacing: 6) {
-            Text(title)
-                .font(.system(size: 11,
-                              weight: isActive ? .semibold : .regular,
-                              design: .rounded))
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .foregroundStyle(isActive ? .primary : .secondary)
+        HStack(spacing: 2) {
+            Button(action: onSelect) {
+                Text(title)
+                    .font(.system(size: 11,
+                                  weight: isActive ? .semibold : .regular,
+                                  design: .rounded))
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .foregroundStyle(isActive ? .primary : .secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .frame(minWidth: 70, maxWidth: 180, alignment: .leading)
+                    .background(tabBackground)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Select tab \(title)")
+
             if canClose {
                 Button(action: onClose) {
                     Image(systemName: "xmark")
                         .font(.system(size: 9, weight: .semibold))
-                        .opacity(0.75)
+                        .frame(width: 20, height: 20)
+                        .foregroundStyle(isActive ? .primary : .secondary)
+                        .background(closeBackground)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Close tab")
+                .accessibilityLabel("Close tab \(title)")
+                .help("Close \(title)")
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 3)
-        .frame(minWidth: 70, maxWidth: 180, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 5, style: .continuous)
-                .fill(isActive
-                      ? Color.accentColor.opacity(0.22)
-                      : Color.secondary.opacity(0.08)))
-        .contentShape(Rectangle())
-        .onTapGesture(perform: onSelect)
+    }
+
+    private var tabBackground: some View {
+        RoundedRectangle(cornerRadius: 5, style: .continuous)
+            .fill(isActive
+                  ? Color.accentColor.opacity(0.22)
+                  : Color.secondary.opacity(0.08))
+    }
+
+    private var closeBackground: some View {
+        RoundedRectangle(cornerRadius: 5, style: .continuous)
+            .fill(isActive
+                  ? Color.accentColor.opacity(0.16)
+                  : Color.secondary.opacity(0.06))
+            .overlay(
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .strokeBorder(Color.secondary.opacity(0.08), lineWidth: 1))
     }
 }

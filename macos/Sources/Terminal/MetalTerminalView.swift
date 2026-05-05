@@ -12,8 +12,8 @@ final class MetalTerminalNSView: NSView {
     let mtkView: MTKView
     let renderer: TerminalRenderer
     private(set) var grid: GridModel
-    private let onKey: ([UInt8]) -> Void
-    private let onResize: (UInt16, UInt16) -> Void
+    private var onKey: ([UInt8]) -> Void
+    private var onResize: (UInt16, UInt16) -> Void
     /// When true, keystrokes are dropped (peer in raw mode: creator-only input).
     var inputEnabled: Bool = true
 
@@ -59,6 +59,13 @@ final class MetalTerminalNSView: NSView {
         // swaps grids, so bring the new grid up to the renderer's live size
         // immediately.
         grid.resize(cols: renderer.cols, rows: renderer.rows)
+    }
+
+    func updateHandlers(onKey: @escaping ([UInt8]) -> Void,
+                        onResize: @escaping (UInt16, UInt16) -> Void)
+    {
+        self.onKey = onKey
+        self.onResize = onResize
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -151,16 +158,19 @@ struct MetalTerminalView: NSViewRepresentable {
     let onKey: ([UInt8]) -> Void
     let onResize: (UInt16, UInt16) -> Void
     let inputEnabled: Bool
+    let isActive: Bool
 
     init(grid: GridModel,
          onKey: @escaping ([UInt8]) -> Void,
          onResize: @escaping (UInt16, UInt16) -> Void = { _, _ in },
-         inputEnabled: Bool = true)
+         inputEnabled: Bool = true,
+         isActive: Bool = true)
     {
         self.grid = grid
         self.onKey = onKey
         self.onResize = onResize
         self.inputEnabled = inputEnabled
+        self.isActive = isActive
     }
 
     func makeNSView(context: Context) -> MetalTerminalNSView {
@@ -168,16 +178,23 @@ struct MetalTerminalView: NSViewRepresentable {
             grid: grid, onKey: onKey, onResize: onResize)
         else {
             NSLog("MetalTerminalNSView init failed — Metal unavailable")
-            // Return an empty placeholder view rather than crash.
             return MetalTerminalNSView(
                 grid: grid, onKey: { _ in }, onResize: { _, _ in })!
         }
         v.inputEnabled = inputEnabled
+        v.mtkView.isPaused = !isActive
         return v
     }
 
     func updateNSView(_ nsView: MetalTerminalNSView, context: Context) {
         nsView.updateGrid(grid)
+        nsView.updateHandlers(onKey: onKey, onResize: onResize)
         nsView.inputEnabled = inputEnabled
+        nsView.mtkView.isPaused = !isActive
+    }
+
+    static func dismantleNSView(_ nsView: MetalTerminalNSView, coordinator: ()) {
+        nsView.mtkView.delegate = nil
+        nsView.mtkView.isPaused = true
     }
 }

@@ -14,8 +14,9 @@ enum FrameTag: UInt8 {
     case modeChange  = 0x08
     case roster      = 0x09
     case heartbeat   = 0x0A
-    // Multi-tab frames (0x0C..0x0F). Each session can host N concurrent PTY
-    // shells; these tags carry per-tab lifecycle and per-tab PTY output.
+    // Multi-tab frames. Each session can host N concurrent PTY shells; these
+    // tags carry per-tab lifecycle, per-tab output, and per-tab peer input.
+    case tabInput     = 0x0B
     case tabOpen      = 0x0C
     case tabClose     = 0x0D
     case tabFocus     = 0x0E
@@ -112,6 +113,7 @@ enum Frame {
     case tabClose(tabId: UInt32)
     case tabFocus(tabId: UInt32)
     case tabPtyOutput(tabId: UInt32, data: Data)
+    case tabInput(tabId: UInt32, data: Data)
     case editorOpen(docId: UInt64, path: String, snapshot: Data)
     case editorOp(docId: UInt64, opBytes: Data)
     case editorPresence(docId: UInt64, userId: UInt32,
@@ -205,6 +207,11 @@ enum FrameCodec {
             appendU32(&out, tabId)
         case .tabPtyOutput(let tabId, let data):
             out.append(FrameTag.tabPtyOutput.rawValue)
+            appendU32(&out, tabId)
+            appendU32(&out, UInt32(data.count))
+            out.append(data)
+        case .tabInput(let tabId, let data):
+            out.append(FrameTag.tabInput.rawValue)
             appendU32(&out, tabId)
             appendU32(&out, UInt32(data.count))
             out.append(data)
@@ -346,6 +353,11 @@ enum FrameCodec {
             let n = try r.readU32()
             let payload = try r.readBytes(Int(n))
             return .tabPtyOutput(tabId: tabId, data: payload)
+        case .tabInput:
+            let tabId = try r.readU32()
+            let n = try r.readU32()
+            let payload = try r.readBytes(Int(n))
+            return .tabInput(tabId: tabId, data: payload)
         case .editorOpen:
             let docId = try r.readU64()
             let pathLen = try r.readU16()
