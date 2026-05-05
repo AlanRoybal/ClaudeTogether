@@ -2072,7 +2072,7 @@ final class TerminalModel: ObservableObject {
                 at: parent,
                 withIntermediateDirectories: true,
                 attributes: nil)
-            try editor.snapshotData.write(to: url, options: .atomic)
+            try editor.textData.write(to: url, options: .atomic)
             let nextRev = (editorSavedRevisions[docId] ?? editor.state.lastSavedRev) &+ 1
             editorSavedRevisions[docId] = nextRev
             editor.markSaved(rev: nextRev)

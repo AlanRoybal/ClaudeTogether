@@ -59,6 +59,10 @@ pub const Op = union(OpKind) {
 
 pub const Sequence = struct {
     const snapshot_client: u32 = 0;
+    const encoded_snapshot_magic = "CTDS";
+    const encoded_snapshot_version: u8 = 1;
+    const encoded_snapshot_header_len: usize = 4 + 1 + 4;
+    const encoded_snapshot_item_len: usize = 8 + 1 + 8 + 4 + 1;
 
     allocator: std.mem.Allocator,
     client: u32,
@@ -157,6 +161,122 @@ pub const Sequence = struct {
     /// Remove all items (live and tombstones). Called after a commit/enter.
     pub fn clear(self: *Sequence) void {
         self.items.clearRetainingCapacity();
+    }
+
+    pub fn isEncodedSnapshot(bytes: []const u8) bool {
+        return bytes.len >= encoded_snapshot_magic.len + 1 and
+            std.mem.eql(u8, bytes[0..encoded_snapshot_magic.len], encoded_snapshot_magic) and
+            bytes[encoded_snapshot_magic.len] == encoded_snapshot_version;
+    }
+
+    pub fn encodedSnapshotLen(self: *const Sequence) usize {
+        return encoded_snapshot_header_len +
+            self.items.items.len * encoded_snapshot_item_len;
+    }
+
+    /// Serialize the full CRDT item list, including tombstones and item ids.
+    /// This is used for editor-open/join snapshots after live edits already
+    /// exist; plain UTF-8 snapshots cannot preserve anchors for late joiners.
+    pub fn encodeSnapshot(self: *const Sequence, out: []u8) !usize {
+        const required = self.encodedSnapshotLen();
+        if (out.len < required) return error.BufferTooSmall;
+
+        var pos: usize = 0;
+        @memcpy(out[pos..][0..encoded_snapshot_magic.len], encoded_snapshot_magic);
+        pos += encoded_snapshot_magic.len;
+        out[pos] = encoded_snapshot_version;
+        pos += 1;
+        std.mem.writeInt(u32, out[pos..][0..4], @intCast(self.items.items.len), .big);
+        pos += 4;
+
+        for (self.items.items) |item| {
+            std.mem.writeInt(u32, out[pos..][0..4], item.id.client, .big);
+            pos += 4;
+            std.mem.writeInt(u32, out[pos..][0..4], item.id.clock, .big);
+            pos += 4;
+            if (item.after) |after| {
+                out[pos] = 1;
+                pos += 1;
+                std.mem.writeInt(u32, out[pos..][0..4], after.client, .big);
+                pos += 4;
+                std.mem.writeInt(u32, out[pos..][0..4], after.clock, .big);
+                pos += 4;
+            } else {
+                out[pos] = 0;
+                pos += 1;
+                std.mem.writeInt(u32, out[pos..][0..4], 0, .big);
+                pos += 4;
+                std.mem.writeInt(u32, out[pos..][0..4], 0, .big);
+                pos += 4;
+            }
+            std.mem.writeInt(u32, out[pos..][0..4], item.codepoint, .big);
+            pos += 4;
+            out[pos] = if (item.deleted) 1 else 0;
+            pos += 1;
+        }
+
+        return pos;
+    }
+
+    /// Replace the sequence with a full CRDT snapshot produced by
+    /// `encodeSnapshot`.
+    pub fn loadEncodedSnapshot(self: *Sequence, bytes: []const u8) !void {
+        if (!isEncodedSnapshot(bytes)) return error.InvalidSnapshot;
+        var pos: usize = encoded_snapshot_magic.len + 1;
+        const count = try readSnapshotU32(bytes, &pos);
+        const required = encoded_snapshot_header_len +
+            @as(usize, count) * encoded_snapshot_item_len;
+        if (bytes.len != required) return error.Truncated;
+
+        var next = std.ArrayList(Item).init(self.allocator);
+        errdefer next.deinit();
+        try next.ensureTotalCapacity(@intCast(count));
+
+        var max_clock: u32 = 0;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const id = Id{
+                .client = try readSnapshotU32(bytes, &pos),
+                .clock = try readSnapshotU32(bytes, &pos),
+            };
+            const has_after = try readSnapshotU8(bytes, &pos);
+            const after_client = try readSnapshotU32(bytes, &pos);
+            const after_clock = try readSnapshotU32(bytes, &pos);
+            const codepoint = try readSnapshotU32(bytes, &pos);
+            const deleted_byte = try readSnapshotU8(bytes, &pos);
+
+            const after: ?Id = switch (has_after) {
+                0 => null,
+                1 => Id{ .client = after_client, .clock = after_clock },
+                else => return error.InvalidSnapshot,
+            };
+            const deleted = switch (deleted_byte) {
+                0 => false,
+                1 => true,
+                else => return error.InvalidSnapshot,
+            };
+
+            for (next.items) |existing| {
+                if (Id.eql(existing.id, id)) return error.InvalidSnapshot;
+            }
+            const valid_codepoint = std.math.cast(u21, codepoint) orelse {
+                return error.InvalidSnapshot;
+            };
+            var utf8_buf: [4]u8 = undefined;
+            _ = try std.unicode.utf8Encode(valid_codepoint, &utf8_buf);
+
+            if (id.clock > max_clock) max_clock = id.clock;
+            next.appendAssumeCapacity(.{
+                .id = id,
+                .after = after,
+                .codepoint = codepoint,
+                .deleted = deleted,
+            });
+        }
+
+        self.items.deinit();
+        self.items = next;
+        self.clock = max_clock;
     }
 
     /// Bulk-insert the UTF-8-decoded codepoints of `s` at the end of the
@@ -303,6 +423,20 @@ pub const Sequence = struct {
         return null;
     }
 };
+
+fn readSnapshotU8(bytes: []const u8, pos: *usize) !u8 {
+    if (pos.* + 1 > bytes.len) return error.Truncated;
+    const value = bytes[pos.*];
+    pos.* += 1;
+    return value;
+}
+
+fn readSnapshotU32(bytes: []const u8, pos: *usize) !u32 {
+    if (pos.* + 4 > bytes.len) return error.Truncated;
+    const value = std.mem.readInt(u32, bytes[pos.*..][0..4], .big);
+    pos.* += 4;
+    return value;
+}
 
 // --- op wire encoding -----------------------------------------------------
 
@@ -524,6 +658,44 @@ test "loadFromString uses replica-stable ids" {
     for (0..5) |idx| {
         try testing.expectEqual(a.idAtVisiblePos(idx).?, b.idAtVisiblePos(idx).?);
     }
+}
+
+test "encoded snapshot preserves live edit anchors for late join" {
+    var host = Sequence.init(testing.allocator, 101);
+    defer host.deinit();
+    try host.loadFromString("abc");
+
+    // Host has already edited before this peer joins.
+    _ = try host.localInsert(1, 'H');
+    const host_before = try host.toUtf8(testing.allocator);
+    defer testing.allocator.free(host_before);
+    try testing.expectEqualStrings("aHbc", host_before);
+
+    const snapshot_len = host.encodedSnapshotLen();
+    const snapshot = try testing.allocator.alloc(u8, snapshot_len);
+    defer testing.allocator.free(snapshot);
+    const n = try host.encodeSnapshot(snapshot);
+
+    var guest = Sequence.init(testing.allocator, 202);
+    defer guest.deinit();
+    try guest.loadEncodedSnapshot(snapshot[0..n]);
+    const guest_before = try guest.toUtf8(testing.allocator);
+    defer testing.allocator.free(guest_before);
+    try testing.expectEqualStrings("aHbc", guest_before);
+    try testing.expectEqual(host.idAtVisiblePos(1).?, guest.idAtVisiblePos(1).?);
+
+    // Guest inserts after the host-authored "H". If the join snapshot had
+    // only been plain text, the host would not know that anchor id and the
+    // insert would fall back to the end.
+    const guest_op = try guest.localInsert(2, 'G');
+    _ = try host.apply(guest_op);
+
+    const host_after = try host.toUtf8(testing.allocator);
+    defer testing.allocator.free(host_after);
+    const guest_after = try guest.toUtf8(testing.allocator);
+    defer testing.allocator.free(guest_after);
+    try testing.expectEqualStrings("aHGbc", host_after);
+    try testing.expectEqualStrings(host_after, guest_after);
 }
 
 test "idAtVisiblePos basic" {

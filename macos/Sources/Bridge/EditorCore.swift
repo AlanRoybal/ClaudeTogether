@@ -23,8 +23,8 @@ final class EditorCore {
         handle = nil
     }
 
-    /// Bulk-load a UTF-8 snapshot into the doc. Each codepoint becomes a
-    /// full CRDT item authored by the local client.
+    /// Load either a full CRDT snapshot from a peer/host or a legacy UTF-8
+    /// text snapshot from disk/older peers.
     func loadSnapshot(_ data: Data) throws {
         guard let h = handle else { throw EditorCoreError.crdtFailure("closed") }
         let rc = data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int32 in
@@ -34,6 +34,15 @@ final class EditorCore {
             return ct_doc_load_snapshot(h, base, raw.count)
         }
         if rc != 0 { throw EditorCoreError.crdtFailure(Self.lastError()) }
+    }
+
+    /// Export the full CRDT item state so late joiners keep the same item ids
+    /// and can insert at their own cursor anchors.
+    func exportSnapshot() throws -> Data {
+        guard let h = handle else { throw EditorCoreError.crdtFailure("closed") }
+        return try roundTripOp(stackCap: 4096) { buf, lenPtr in
+            ct_doc_export_snapshot(h, buf, lenPtr)
+        }
     }
 
     /// Perform a local insert of `codepoint` at visible offset `pos`.

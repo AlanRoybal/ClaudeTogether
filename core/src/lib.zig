@@ -288,7 +288,8 @@ export fn ct_doc_destroy(doc: ?*Doc) void {
     d.allocator.destroy(d);
 }
 
-/// Bulk-load a UTF-8 snapshot into the doc. Returns 0 on success, -1 on
+/// Load either a full CRDT snapshot produced by `ct_doc_export_snapshot` or
+/// a legacy UTF-8 text snapshot into the doc. Returns 0 on success, -1 on
 /// error (e.g. invalid UTF-8).
 export fn ct_doc_load_snapshot(
     doc: ?*Doc,
@@ -296,10 +297,43 @@ export fn ct_doc_load_snapshot(
     len: usize,
 ) c_int {
     const d = doc orelse return -1;
-    d.seq.loadFromString(bytes[0..len]) catch |err| {
+    const snapshot = bytes[0..len];
+    if (crdt.Sequence.isEncodedSnapshot(snapshot)) {
+        d.seq.loadEncodedSnapshot(snapshot) catch |err| {
+            setLastError("ct_doc_load_snapshot: import: {s}", .{@errorName(err)});
+            return -1;
+        };
+        return 0;
+    }
+    d.seq.clear();
+    d.seq.loadFromString(snapshot) catch |err| {
         setLastError("ct_doc_load_snapshot: {s}", .{@errorName(err)});
         return -1;
     };
+    return 0;
+}
+
+/// Export the full CRDT item state, including tombstones and stable ids.
+/// Same round-trip buffer protocol as the local-insert/delete calls:
+/// 0 success, -2 if `out_buf` is too small (required size in
+/// `*in_out_len`), -1 on error.
+export fn ct_doc_export_snapshot(
+    doc: ?*Doc,
+    out_buf: [*]u8,
+    in_out_len: *usize,
+) c_int {
+    const d = doc orelse return -1;
+    const cap = in_out_len.*;
+    const required = d.seq.encodedSnapshotLen();
+    if (required > cap) {
+        in_out_len.* = required;
+        return -2;
+    }
+    const n = d.seq.encodeSnapshot(out_buf[0..cap]) catch |err| {
+        setLastError("ct_doc_export_snapshot: {s}", .{@errorName(err)});
+        return -1;
+    };
+    in_out_len.* = n;
     return 0;
 }
 
@@ -434,4 +468,66 @@ fn encodeOpToOut(op: crdt.Op, out_buf: [*]u8, in_out_len: *usize) c_int {
     };
     in_out_len.* = n;
     return 0;
+}
+
+test "doc export snapshot preserves late-join insert anchors through C ABI" {
+    const testing = std.testing;
+    const text = "abc";
+
+    const host = ct_doc_create(101).?;
+    defer ct_doc_destroy(host);
+    try testing.expectEqual(
+        @as(c_int, 0),
+        ct_doc_load_snapshot(host, text.ptr, text.len));
+
+    var host_insert_buf: [64]u8 = undefined;
+    var host_insert_len: usize = host_insert_buf.len;
+    try testing.expectEqual(
+        @as(c_int, 0),
+        ct_doc_local_insert(
+            host,
+            1,
+            'H',
+            host_insert_buf[0..].ptr,
+            &host_insert_len));
+
+    var snapshot_buf: [1024]u8 = undefined;
+    var snapshot_len: usize = snapshot_buf.len;
+    try testing.expectEqual(
+        @as(c_int, 0),
+        ct_doc_export_snapshot(host, snapshot_buf[0..].ptr, &snapshot_len));
+
+    const guest = ct_doc_create(202).?;
+    defer ct_doc_destroy(guest);
+    try testing.expectEqual(
+        @as(c_int, 0),
+        ct_doc_load_snapshot(guest, snapshot_buf[0..].ptr, snapshot_len));
+
+    var guest_insert_buf: [64]u8 = undefined;
+    var guest_insert_len: usize = guest_insert_buf.len;
+    try testing.expectEqual(
+        @as(c_int, 0),
+        ct_doc_local_insert(
+            guest,
+            2,
+            'G',
+            guest_insert_buf[0..].ptr,
+            &guest_insert_len));
+
+    var changed = false;
+    try testing.expectEqual(
+        @as(c_int, 0),
+        ct_doc_apply_op(
+            host,
+            guest_insert_buf[0..].ptr,
+            guest_insert_len,
+            &changed));
+    try testing.expect(changed);
+
+    var utf8_buf: [64]u8 = undefined;
+    var utf8_len: usize = utf8_buf.len;
+    try testing.expectEqual(
+        @as(c_int, 0),
+        ct_doc_to_utf8(host, utf8_buf[0..].ptr, &utf8_len));
+    try testing.expectEqualStrings("aHGbc", utf8_buf[0..utf8_len]);
 }

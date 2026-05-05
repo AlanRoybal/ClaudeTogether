@@ -158,7 +158,8 @@ pub const EditorOpen = struct {
     doc_id: u64,
     /// UTF-8 path relative to the shared root; borrowed from input buffer.
     path: []const u8,
-    /// Initial UTF-8 snapshot; borrowed from input buffer.
+    /// Opaque editor snapshot. New peers receive full CRDT state; legacy
+    /// callers may still send plain UTF-8 text.
     snapshot: []const u8,
 };
 

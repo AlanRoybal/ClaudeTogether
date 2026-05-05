@@ -163,7 +163,11 @@ final class EditorController {
 
     // MARK: Public helpers
 
-    var snapshotData: Data { Data(state.text.utf8) }
+    var textData: Data { Data(state.text.utf8) }
+
+    var snapshotData: Data {
+        (try? core.exportSnapshot()) ?? textData
+    }
 
     func requestSave() {
         requestSaveAction()

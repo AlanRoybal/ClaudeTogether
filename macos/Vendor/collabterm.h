@@ -151,6 +151,8 @@ typedef struct ct_doc ct_doc;
 ct_doc *ct_doc_create(uint32_t client_id);
 void    ct_doc_destroy(ct_doc *doc);
 int     ct_doc_load_snapshot(ct_doc *doc, const uint8_t *bytes, size_t len);
+int     ct_doc_export_snapshot(ct_doc *doc,
+                               uint8_t *out_buf, size_t *in_out_len);
 int     ct_doc_local_insert(ct_doc *doc, size_t visible_pos, uint32_t codepoint,
                             uint8_t *out_buf, size_t *in_out_len);
 int     ct_doc_local_delete(ct_doc *doc, size_t visible_pos,
