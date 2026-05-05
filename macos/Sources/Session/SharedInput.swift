@@ -9,6 +9,10 @@ enum SharedInputRequestKind: UInt8 {
     case moveEnd    = 6
     case commit     = 7
     case interrupt  = 8
+    case movePreviousWord = 9
+    case moveNextWord = 10
+    case deleteToStart = 11
+    case deletePreviousWord = 12
 }
 
 struct SharedInputRequest {
@@ -263,6 +267,25 @@ struct SharedInputState {
             cursors[request.actor] = 0
         case .moveEnd:
             cursors[request.actor] = textScalars.count
+        case .movePreviousWord:
+            cursor = clamp(cursor, max: textScalars.count)
+            cursors[request.actor] = previousWordBoundary(from: cursor)
+        case .moveNextWord:
+            cursor = clamp(cursor, max: textScalars.count)
+            cursors[request.actor] = nextWordBoundary(from: cursor)
+        case .deleteToStart:
+            cursor = clamp(cursor, max: textScalars.count)
+            guard cursor > 0 else { return .none }
+            textScalars.removeSubrange(0..<cursor)
+            shiftOtherCursors(deleting: 0..<cursor, except: request.actor)
+            cursors[request.actor] = 0
+        case .deletePreviousWord:
+            cursor = clamp(cursor, max: textScalars.count)
+            let start = previousWordBoundary(from: cursor)
+            guard start < cursor else { return .none }
+            textScalars.removeSubrange(start..<cursor)
+            shiftOtherCursors(deleting: start..<cursor, except: request.actor)
+            cursors[request.actor] = start
         case .commit:
             let committed = text
             _ = deactivate(bumpRevision: bumpRevision)
@@ -329,6 +352,49 @@ struct SharedInputState {
                 cursors[identity] = max(0, cursor + delta)
             }
         }
+    }
+
+    private mutating func shiftOtherCursors(deleting range: Range<Int>,
+                                            except actor: UserIdentity)
+    {
+        let count = range.count
+        guard count > 0 else { return }
+        for (identity, cursor) in cursors where identity != actor {
+            if cursor <= range.lowerBound {
+                continue
+            }
+            if cursor >= range.upperBound {
+                cursors[identity] = cursor - count
+            } else {
+                cursors[identity] = range.lowerBound
+            }
+        }
+    }
+
+    private func previousWordBoundary(from cursor: Int) -> Int {
+        var index = clamp(cursor, max: textScalars.count)
+        while index > 0, isWordSeparator(textScalars[index - 1]) {
+            index -= 1
+        }
+        while index > 0, !isWordSeparator(textScalars[index - 1]) {
+            index -= 1
+        }
+        return index
+    }
+
+    private func nextWordBoundary(from cursor: Int) -> Int {
+        var index = clamp(cursor, max: textScalars.count)
+        while index < textScalars.count, isWordSeparator(textScalars[index]) {
+            index += 1
+        }
+        while index < textScalars.count, !isWordSeparator(textScalars[index]) {
+            index += 1
+        }
+        return index
+    }
+
+    private func isWordSeparator(_ scalar: UnicodeScalar) -> Bool {
+        CharacterSet.whitespacesAndNewlines.contains(scalar)
     }
 
     private func clamp(_ value: Int, max upperBound: Int) -> Int {

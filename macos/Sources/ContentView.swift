@@ -762,7 +762,9 @@ final class TerminalModel: ObservableObject {
               let s = NSPasteboard.general.string(forType: .string),
               !s.isEmpty
         else { return }
-        handleKey(Array(s.utf8), forTabId: activeTabId)
+        let sanitized = TerminalPasteSanitizer.sanitize(s)
+        guard !sanitized.isEmpty else { return }
+        handleKey(Array(sanitized.utf8), forTabId: activeTabId)
     }
 
     /// Decode the visible cells into a String (one line per row, no trailing
@@ -1393,6 +1395,14 @@ final class TerminalModel: ObservableObject {
             return SharedInputRequest(actor: actor, kind: .moveLeft)
         case [0x06], Array("\u{1B}[C".utf8):
             return SharedInputRequest(actor: actor, kind: .moveRight)
+        case Array("\u{1B}b".utf8):
+            return SharedInputRequest(actor: actor, kind: .movePreviousWord)
+        case Array("\u{1B}f".utf8):
+            return SharedInputRequest(actor: actor, kind: .moveNextWord)
+        case [0x15]:
+            return SharedInputRequest(actor: actor, kind: .deleteToStart)
+        case [0x17], [0x1B, 0x7F]:
+            return SharedInputRequest(actor: actor, kind: .deletePreviousWord)
         case [0x09]:
             return SharedInputRequest(actor: actor, kind: .insertText, text: "    ")
         default:

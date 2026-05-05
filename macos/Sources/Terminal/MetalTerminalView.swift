@@ -136,10 +136,23 @@ final class MetalTerminalNSView: NSView {
         case "v":
             guard inputEnabled else { NSSound.beep(); return true }
             if let s = NSPasteboard.general.string(forType: .string) {
-                onKey(Array(s.utf8))
+                let sanitized = TerminalPasteSanitizer.sanitize(s)
+                if !sanitized.isEmpty {
+                    onKey(Array(sanitized.utf8))
+                }
                 return true
             }
         default: break
+        }
+        switch Int(event.keyCode) {
+        case kVK_LeftArrow, kVK_RightArrow, kVK_Delete:
+            guard inputEnabled else { NSSound.beep(); return true }
+            if let bytes = encodeKey(event) {
+                onKey(bytes)
+                return true
+            }
+        default:
+            break
         }
         return super.performKeyEquivalent(with: event)
     }
@@ -244,15 +257,28 @@ final class MetalTerminalNSView: NSView {
     private func encodeKey(_ event: NSEvent) -> [UInt8]? {
         let flags = event.modifierFlags
         let keyCode = Int(event.keyCode)
+        let command = flags.contains(.command)
+        let option = flags.contains(.option)
 
         switch keyCode {
-        case kVK_UpArrow:    return Array("\u{1B}[A".utf8)
-        case kVK_DownArrow:  return Array("\u{1B}[B".utf8)
-        case kVK_RightArrow: return Array("\u{1B}[C".utf8)
-        case kVK_LeftArrow:  return Array("\u{1B}[D".utf8)
+        case kVK_UpArrow:
+            return Array("\u{1B}[A".utf8)
+        case kVK_DownArrow:
+            return Array("\u{1B}[B".utf8)
+        case kVK_RightArrow:
+            if command { return [0x05] } // Ctrl-E: end of line.
+            if option { return Array("\u{1B}f".utf8) } // Meta-f: next word.
+            return Array("\u{1B}[C".utf8)
+        case kVK_LeftArrow:
+            if command { return [0x01] } // Ctrl-A: beginning of line.
+            if option { return Array("\u{1B}b".utf8) } // Meta-b: previous word.
+            return Array("\u{1B}[D".utf8)
         case kVK_Return:     return [0x0D]
         case kVK_Tab:        return [0x09]
-        case kVK_Delete:     return [0x7F] // Backspace
+        case kVK_Delete:
+            if command { return [0x15] } // Ctrl-U: delete to beginning.
+            if option { return [0x1B, 0x7F] } // Meta-Backspace: delete word.
+            return [0x7F] // Backspace
         case kVK_ForwardDelete: return Array("\u{1B}[3~".utf8)
         case kVK_Escape:     return [0x1B]
         case kVK_Home:       return Array("\u{1B}[H".utf8)
@@ -341,6 +367,57 @@ final class MetalTerminalNSView: NSView {
             return drawableSize
         }
         return nil
+    }
+}
+
+enum TerminalPasteSanitizer {
+    private static let promptRegex = try! NSRegularExpression(
+        pattern: #"^\S+@\S+(?:\s+.*?)?\s[%#]\s+"#)
+
+    static func sanitize(_ text: String) -> String {
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+
+        var strippedPrompt = false
+        let lines = normalized
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> String in
+                let result = stripPromptPrefixes(from: String(line))
+                strippedPrompt = strippedPrompt || result.didStrip
+                return result.text
+            }
+
+        var result = lines.joined(separator: "\n")
+        if strippedPrompt {
+            result = result.trimmingTrailingNewlines()
+        }
+        return result
+    }
+
+    private static func stripPromptPrefixes(from line: String) -> (text: String, didStrip: Bool) {
+        var remaining = line
+        var didStrip = false
+        while let match = promptRegex.firstMatch(
+            in: remaining,
+            range: NSRange(remaining.startIndex..<remaining.endIndex, in: remaining)),
+            match.range.location == 0,
+            let range = Range(match.range, in: remaining)
+        {
+            remaining = String(remaining[range.upperBound...])
+            didStrip = true
+        }
+        return (remaining, didStrip)
+    }
+}
+
+private extension String {
+    func trimmingTrailingNewlines() -> String {
+        var result = self
+        while result.last == "\n" {
+            result.removeLast()
+        }
+        return result
     }
 }
 
