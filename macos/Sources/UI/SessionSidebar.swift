@@ -96,13 +96,19 @@ struct SessionSidebar: View {
                                 participants: model.sessionManager.participants,
                                 localIdentity: model.sessionManager.localIdentity)
                         }
-                        Button("Leave") { model.stopSharing() }
+                        Button("Leave") {
+                            if model.sessionManager.role == .peer {
+                                model.endSession()
+                            } else {
+                                model.stopSharing()
+                            }
+                        }
                             .controlSize(.small)
                     case .disconnected:
                         Text("Host disconnected")
                             .font(.caption)
                             .foregroundStyle(.orange)
-                        Button("Dismiss") { model.stopSharing() }
+                        Button("Dismiss") { model.endSession() }
                             .controlSize(.small)
                     case .failed(let msg):
                         Text("Failed: \(msg)")
