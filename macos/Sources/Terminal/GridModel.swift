@@ -37,9 +37,13 @@ final class GridModel: ObservableObject {
     let localCursorID = UUID()
     private var overlay: InputOverlay?
     private var overlaySnapshot: [ct_cell] = []
+    private var peerTerminalCursors: [UUID: (col: UInt16, row: UInt16, color: UInt32)] = [:]
 
-    /// Ordered list of cursors. Local user is always present at index 0.
+    /// Ordered list of cursors currently visible in the viewport.
     @Published private(set) var cursors: [UserCursor]
+    /// Rows scrolled back from the live terminal bottom. 0 means the normal
+    /// live viewport; larger values show older scrollback rows.
+    @Published private(set) var scrollOffsetRows: Int = 0
 
     /// Bumped whenever the grid or cursor state changes. Currently advisory —
     /// the renderer redraws every frame — but lets SwiftUI views bind to it.
@@ -63,9 +67,16 @@ final class GridModel: ObservableObject {
     var isUsingAlternateScreen: Bool { term.isUsingAlternateScreen }
 
     func feed(_ bytes: [UInt8]) {
+        let previousScrollbackLength = term.scrollbackLength
         term.feed(bytes)
+        if term.isUsingAlternateScreen {
+            scrollOffsetRows = 0
+        } else if scrollOffsetRows > 0 {
+            let addedRows = max(0, term.scrollbackLength - previousScrollbackLength)
+            scrollOffsetRows = min(scrollOffsetRows + addedRows, maxScrollOffset)
+        }
         if overlay == nil {
-            syncLocalCursor()
+            syncTerminalCursors()
         } else {
             syncOverlayCursors()
         }
@@ -73,35 +84,80 @@ final class GridModel: ObservableObject {
 
     func resize(cols: UInt16, rows: UInt16, preserveTop: Bool = false) {
         term.resize(cols: cols, rows: rows, preserveTop: preserveTop)
+        clampScrollOffset()
         if overlay == nil {
-            syncLocalCursor()
+            syncTerminalCursors()
         } else {
             syncOverlayCursors()
         }
     }
 
+    @discardableResult
+    func scroll(byRows delta: Int) -> Bool {
+        guard delta != 0, !term.isUsingAlternateScreen else { return false }
+        let next = min(max(0, scrollOffsetRows + delta), maxScrollOffset)
+        guard next != scrollOffsetRows else { return false }
+        scrollOffsetRows = next
+        if overlay == nil {
+            syncTerminalCursors()
+        } else {
+            syncOverlayCursors()
+        }
+        epoch &+= 1
+        return true
+    }
+
+    func scrollToBottom() {
+        guard scrollOffsetRows != 0 else { return }
+        scrollOffsetRows = 0
+        if overlay == nil {
+            syncTerminalCursors()
+        } else {
+            syncOverlayCursors()
+        }
+        epoch &+= 1
+    }
+
     func snapshot() -> UnsafeBufferPointer<ct_cell> {
         let base = term.snapshot()
-        guard let overlay else { return base }
+        let scrollOffset = effectiveScrollOffset()
+        guard scrollOffset > 0 || overlay != nil else { return base }
 
         if overlaySnapshot.count != base.count {
             overlaySnapshot = [ct_cell](repeating: ct_cell(), count: base.count)
         }
-        for i in 0..<base.count {
-            overlaySnapshot[i] = base[i]
+        if scrollOffset > 0 {
+            copyScrolledSnapshot(primary: base, offset: scrollOffset)
+        } else {
+            for i in 0..<base.count {
+                overlaySnapshot[i] = base[i]
+            }
         }
 
-        guard let anchorIndex = linearIndex(
-            col: overlay.anchorCol,
-            row: overlay.anchorRow)
-        else {
+        guard let overlay else {
             return overlaySnapshot.withUnsafeBufferPointer { $0 }
         }
 
-        let styleCell = overlaySnapshot[anchorIndex]
-        let blank = blankCell(from: styleCell)
         let maxCursorOffset = overlay.cursors.map(\.offset).max() ?? 0
         let span = max(1, max(overlay.textScalars.count, maxCursorOffset + 1))
+        var styleIndex: Int?
+        for offset in 0..<span {
+            if let idx = linearIndex(
+                forOffset: offset,
+                anchorCol: overlay.anchorCol,
+                anchorRow: overlay.anchorRow)
+            {
+                styleIndex = idx
+                break
+            }
+        }
+
+        guard let styleIndex else {
+            return overlaySnapshot.withUnsafeBufferPointer { $0 }
+        }
+
+        let styleCell = overlaySnapshot[styleIndex]
+        let blank = blankCell(from: styleCell)
 
         for offset in 0..<span {
             guard let idx = linearIndex(
@@ -109,7 +165,7 @@ final class GridModel: ObservableObject {
                 anchorCol: overlay.anchorCol,
                 anchorRow: overlay.anchorRow)
             else {
-                break
+                continue
             }
             overlaySnapshot[idx] = blank
         }
@@ -120,7 +176,7 @@ final class GridModel: ObservableObject {
                 anchorCol: overlay.anchorCol,
                 anchorRow: overlay.anchorRow)
             else {
-                break
+                continue
             }
             var cell = blank
             cell.codepoint = UInt32(scalar.value)
@@ -145,55 +201,55 @@ final class GridModel: ObservableObject {
 
     func clearInputOverlay() {
         overlay = nil
-        syncLocalCursor()
-        cursors.removeAll { !$0.isLocal }
+        syncTerminalCursors()
         epoch &+= 1
     }
 
     func inputOverlayOffset(atCol col: UInt16, row: UInt16) -> Int? {
         guard let overlay else { return nil }
         let cols = max(Int(self.cols), 1)
+        guard let primaryRow = primaryRow(forVisibleRow: Int(row)) else {
+            return nil
+        }
         let start = Int(overlay.anchorRow) * cols + Int(overlay.anchorCol)
-        let target = Int(row) * cols + Int(col)
+        let target = primaryRow * cols + Int(col)
         let end = start + overlay.textScalars.count
         guard target >= start else { return nil }
-        guard target <= end || Int(row) == end / cols else { return nil }
+        guard target <= end || primaryRow == end / cols else { return nil }
         return min(max(0, target - start), overlay.textScalars.count)
     }
 
     /// Updates or inserts a peer cursor. Called by session code when a
     /// `CursorPos` frame arrives from a peer.
     func upsertPeerCursor(id: UUID, col: UInt16, row: UInt16, color: UInt32) {
-        if let i = cursors.firstIndex(where: { $0.id == id }) {
-            cursors[i].col = col
-            cursors[i].row = row
-            cursors[i].color = color
-        } else {
-            cursors.append(UserCursor(
-                id: id, col: col, row: row,
-                color: color, isLocal: false))
+        peerTerminalCursors[id] = (col: col, row: row, color: color)
+        if overlay == nil {
+            syncTerminalCursors()
         }
-        epoch &+= 1
     }
 
     func removePeerCursor(id: UUID) {
+        peerTerminalCursors.removeValue(forKey: id)
         cursors.removeAll { $0.id == id && !$0.isLocal }
         epoch &+= 1
     }
 
     private func syncOverlayCursors() {
         guard let overlay else {
-            syncLocalCursor()
+            syncTerminalCursors()
             return
         }
 
         var next: [UserCursor] = []
         next.reserveCapacity(overlay.cursors.count)
         for cursor in overlay.cursors {
-            let position = gridPosition(
+            guard let position = gridPosition(
                 forOffset: cursor.offset,
                 anchorCol: overlay.anchorCol,
                 anchorRow: overlay.anchorRow)
+            else {
+                continue
+            }
             next.append(UserCursor(
                 id: cursor.id,
                 col: position.col,
@@ -209,27 +265,51 @@ final class GridModel: ObservableObject {
         epoch &+= 1
     }
 
-    private func syncLocalCursor() {
-        let (cx, cy) = term.cursor()
-        if let i = cursors.firstIndex(where: { $0.isLocal }) {
-            if cursors[i].col != cx || cursors[i].row != cy {
-                cursors[i].col = cx
-                cursors[i].row = cy
-                epoch &+= 1
-            }
+    private func syncTerminalCursors() {
+        guard overlay == nil else {
+            syncOverlayCursors()
+            return
         }
+        let (cx, cy) = term.cursor()
+        var next: [UserCursor] = []
+        if let row = visibleRow(forPrimaryRow: Int(cy)) {
+            next.append(UserCursor(
+                id: localCursorID,
+                col: cx,
+                row: UInt16(row),
+                color: 0xFFFFFF,
+                isLocal: true))
+        }
+        for (id, cursor) in peerTerminalCursors.sorted(by: {
+            $0.key.uuidString < $1.key.uuidString
+        }) {
+            guard let row = visibleRow(forPrimaryRow: Int(cursor.row)) else {
+                continue
+            }
+            next.append(UserCursor(
+                id: id,
+                col: cursor.col,
+                row: UInt16(row),
+                color: cursor.color,
+                isLocal: false))
+        }
+        guard next != cursors else { return }
+        cursors = next
+        epoch &+= 1
     }
 
     private func gridPosition(forOffset offset: Int,
                               anchorCol: UInt16,
-                              anchorRow: UInt16) -> (col: UInt16, row: UInt16)
+                              anchorRow: UInt16) -> (col: UInt16, row: UInt16)?
     {
         let cols = max(Int(self.cols), 1)
         let start = Int(anchorRow) * cols + Int(anchorCol)
         let linear = start + max(0, offset)
-        let maxCell = max(Int(self.rows) * cols - 1, 0)
-        let clamped = min(linear, maxCell)
-        return (UInt16(clamped % cols), UInt16(clamped / cols))
+        let primaryRow = linear / cols
+        guard let visibleRow = visibleRow(forPrimaryRow: primaryRow) else {
+            return nil
+        }
+        return (UInt16(linear % cols), UInt16(visibleRow))
     }
 
     private func linearIndex(forOffset offset: Int,
@@ -240,7 +320,84 @@ final class GridModel: ObservableObject {
             forOffset: offset,
             anchorCol: anchorCol,
             anchorRow: anchorRow)
+        guard let pos else { return nil }
         return linearIndex(col: pos.col, row: pos.row)
+    }
+
+    private var maxScrollOffset: Int {
+        term.isUsingAlternateScreen ? 0 : term.scrollbackLength
+    }
+
+    private func effectiveScrollOffset() -> Int {
+        min(max(0, scrollOffsetRows), maxScrollOffset)
+    }
+
+    private func clampScrollOffset() {
+        let clamped = effectiveScrollOffset()
+        if clamped != scrollOffsetRows {
+            scrollOffsetRows = clamped
+        }
+    }
+
+    private func windowStartRow(scrollOffset: Int? = nil) -> Int {
+        term.scrollbackLength - (scrollOffset ?? effectiveScrollOffset())
+    }
+
+    private func visibleRow(forPrimaryRow primaryRow: Int) -> Int? {
+        let absoluteRow = term.scrollbackLength + primaryRow
+        let visibleRow = absoluteRow - windowStartRow()
+        guard visibleRow >= 0, visibleRow < Int(rows) else { return nil }
+        return visibleRow
+    }
+
+    private func primaryRow(forVisibleRow visibleRow: Int) -> Int? {
+        let absoluteRow = windowStartRow() + visibleRow
+        let primaryRow = absoluteRow - term.scrollbackLength
+        guard primaryRow >= 0, primaryRow < Int(rows) else { return nil }
+        return primaryRow
+    }
+
+    private func copyScrolledSnapshot(primary: UnsafeBufferPointer<ct_cell>,
+                                      offset: Int)
+    {
+        guard !overlaySnapshot.isEmpty else { return }
+        let cols = max(Int(self.cols), 1)
+        let rows = max(Int(self.rows), 1)
+        let scrollbackLength = term.scrollbackLength
+        let startRow = scrollbackLength - offset
+
+        var visibleRow = 0
+        if startRow < scrollbackLength {
+            let scrollbackRows = min(rows, scrollbackLength - startRow)
+            var scrollbackCells = [ct_cell](
+                repeating: ct_cell(),
+                count: scrollbackRows * cols)
+            let copied = term.copyScrollback(
+                startRow: startRow,
+                rowCount: scrollbackRows,
+                into: &scrollbackCells)
+            let cellsToCopy = min(copied * cols, overlaySnapshot.count)
+            if cellsToCopy > 0 {
+                overlaySnapshot.replaceSubrange(
+                    0..<cellsToCopy,
+                    with: scrollbackCells.prefix(cellsToCopy))
+            }
+            visibleRow = copied
+        }
+
+        var primaryRow = max(0, startRow + visibleRow - scrollbackLength)
+        while visibleRow < rows {
+            let dstStart = visibleRow * cols
+            let srcStart = primaryRow * cols
+            guard dstStart < overlaySnapshot.count else { break }
+            if srcStart + cols <= primary.count {
+                overlaySnapshot.replaceSubrange(
+                    dstStart..<(dstStart + cols),
+                    with: primary[srcStart..<(srcStart + cols)])
+            }
+            visibleRow += 1
+            primaryRow += 1
+        }
     }
 
     private func linearIndex(col: UInt16, row: UInt16) -> Int? {

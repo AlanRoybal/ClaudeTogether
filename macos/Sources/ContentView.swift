@@ -975,6 +975,7 @@ final class TerminalModel: ObservableObject {
             NSSound.beep()
             return
         }
+        tabs.first(where: { $0.id == tabId })?.grid.scrollToBottom()
         if handleSharedInputKey(bytes, tabId: tabId) {
             return
         }

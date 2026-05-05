@@ -63,6 +63,12 @@ int      ct_term_resize_preserving_top(ct_term *t, uint16_t cols, uint16_t rows)
 /* Writes up to `capacity` cells (row-major) into `out`.
  * Returns the number of cells written. */
 size_t   ct_term_snapshot(ct_term *t, ct_cell *out, size_t capacity);
+uint32_t ct_term_scrollback_len(ct_term *t);
+uint32_t ct_term_scrollback_snapshot(ct_term *t,
+                                     uint32_t start_row,
+                                     uint32_t num_rows,
+                                     ct_cell *out,
+                                     size_t capacity);
 
 void     ct_term_size(ct_term *t, uint16_t *out_cols, uint16_t *out_rows);
 void     ct_term_cursor(ct_term *t, uint16_t *out_x, uint16_t *out_y);
