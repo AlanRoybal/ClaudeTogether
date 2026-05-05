@@ -16,5 +16,38 @@ struct ClaudeTogetherApp: App {
                     }
                 }
         }
+        .commands {
+            // Tabs commands. We post NotificationCenter messages instead of
+            // talking to TerminalModel directly so the @StateObject inside
+            // ContentView remains the single source of truth.
+            CommandGroup(after: .newItem) {
+                Divider()
+                Button("New Tab") {
+                    NotificationCenter.default.post(
+                        name: .ctTabsNew, object: nil)
+                }
+                .keyboardShortcut("t", modifiers: .command)
+
+                Button("Close Tab") {
+                    NotificationCenter.default.post(
+                        name: .ctTabsClose, object: nil)
+                }
+                .keyboardShortcut("w", modifiers: .command)
+
+                Divider()
+
+                Button("Show Next Tab") {
+                    NotificationCenter.default.post(
+                        name: .ctTabsNext, object: nil)
+                }
+                .keyboardShortcut("]", modifiers: [.command, .shift])
+
+                Button("Show Previous Tab") {
+                    NotificationCenter.default.post(
+                        name: .ctTabsPrevious, object: nil)
+                }
+                .keyboardShortcut("[", modifiers: [.command, .shift])
+            }
+        }
     }
 }

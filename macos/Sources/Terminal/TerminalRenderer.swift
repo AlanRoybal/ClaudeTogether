@@ -199,7 +199,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         var cursorTextInstances: [TextInstance] = []
         bgInstances.reserveCapacity(cellCount)
         textInstances.reserveCapacity(cellCount)
-        cursorTextInstances.reserveCapacity(overlay.blocks.count)
+        cursorTextInstances.reserveCapacity(overlay.rects.count)
 
         if snap.count >= cellCount {
             let atlasW = Float(atlas.atlasWidthPx)
@@ -232,12 +232,14 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                 }
             }
 
-            var cursorCells = Set<Int>()
-            cursorCells.reserveCapacity(overlay.blocks.count)
-            for block in overlay.blocks {
+            var cursorCells: [Int: CursorOverlay.Rect] = [:]
+            cursorCells.reserveCapacity(overlay.rects.count)
+            for block in overlay.rects {
                 let index = Int(block.row) * cols + Int(block.col)
                 guard index >= 0, index < snap.count else { continue }
-                if !cursorCells.insert(index).inserted { continue }
+                cursorCells[index] = block
+            }
+            for (index, block) in cursorCells {
                 let cell = snap[index]
                 guard let ti = makeTextInstance(
                     cell: cell,
@@ -253,10 +255,10 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             }
         }
 
-        // Full colored collaborator blocks.
+        // Full colored block cursors for all visible collaborators.
         var cursorInstances: [CursorInstance] = []
-        cursorInstances.reserveCapacity(overlay.blocks.count)
-        for r in overlay.blocks {
+        cursorInstances.reserveCapacity(overlay.rects.count)
+        for r in overlay.rects {
             var ci = CursorInstance()
             ci.gridPos = SIMD2<UInt16>(r.col, r.row)
             ci.originFrac = r.originFrac
@@ -328,7 +330,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         }
 
         // Pass 4: redraw any glyph under a block cursor in a contrasting color
-        // so full block cursors still leave typed text legible.
+        // so fully colored cursors still leave typed text legible.
         if !cursorTextInstances.isEmpty, let cursorTextBuf = cursorTextBuffer {
             enc.setRenderPipelineState(textPipeline)
             enc.setVertexBuffer(cursorTextBuf, offset: 0, index: 0)
@@ -452,4 +454,5 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             ? SIMD4<UInt8>(245, 247, 250, 255)
             : SIMD4<UInt8>(17, 17, 17, 255)
     }
+
 }

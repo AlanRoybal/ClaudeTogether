@@ -263,6 +263,63 @@ final class SessionManager: ObservableObject {
         broadcast(.modeChange(mode))
     }
 
+    // MARK: tab send helpers (host only)
+
+    /// Host only: announce a new tab (broadcast or directed).
+    func sendTabOpen(tabId: UInt32, title: String,
+                     toTransportPeerID peerID: UInt32? = nil)
+    {
+        guard role == .host, state == .running else { return }
+        let frame = Frame.tabOpen(tabId: tabId, title: title)
+        if let peerID {
+            send(frame, toTransportPeerID: peerID)
+        } else {
+            broadcast(frame)
+        }
+    }
+
+    /// Host only: announce a tab teardown.
+    func sendTabClose(tabId: UInt32) {
+        guard role == .host, state == .running else { return }
+        broadcast(.tabClose(tabId: tabId))
+    }
+
+    /// Announce which tab the local user is currently focused on. Hosts use
+    /// this for initial focus hints; peers use it so the host can keep
+    /// per-user tab cursor state separate.
+    func sendTabFocus(tabId: UInt32,
+                      toTransportPeerID peerID: UInt32? = nil)
+    {
+        guard state == .running else { return }
+        let frame = Frame.tabFocus(tabId: tabId)
+        if let peerID {
+            send(frame, toTransportPeerID: peerID)
+        } else {
+            broadcast(frame)
+        }
+    }
+
+    /// Host only: fan a chunk of PTY output for a specific tab to peers.
+    func sendTabPtyOutput(tabId: UInt32, data: Data,
+                          toTransportPeerID peerID: UInt32? = nil)
+    {
+        guard role == .host, state == .running, !data.isEmpty else { return }
+        let frame = Frame.tabPtyOutput(tabId: tabId, data: data)
+        if let peerID {
+            send(frame, toTransportPeerID: peerID)
+        } else {
+            broadcast(frame)
+        }
+    }
+
+    /// Peer only: ship keystrokes for one tab to the host. The host writes
+    /// them only into the matching PTY, so tabs do not share input state.
+    func sendTabInput(tabId: UInt32, data: Data) {
+        guard role == .peer, state == .running, !data.isEmpty else { return }
+        guard accessMode == .full else { return }
+        broadcast(.tabInput(tabId: tabId, data: data))
+    }
+
     /// Host only: change the access policy and announce it to all peers.
     /// Persisted via `UserDefaults` so subsequent sessions remember the
     /// last preference. Safe to call before any peer has connected — the
@@ -666,6 +723,13 @@ final class SessionManager: ObservableObject {
 
     func participant(forEditorUserID editorUserID: UInt32) -> Participant? {
         participants.first { Self.editorUserID(for: $0.identity) == editorUserID }
+    }
+
+    func identity(forTransportPeerID peerID: UInt32) -> UserIdentity? {
+        if role == .host {
+            return transportToIdentity[peerID]
+        }
+        return nil
     }
 
     nonisolated private static func colorHash(for identity: UserIdentity) -> UInt32 {

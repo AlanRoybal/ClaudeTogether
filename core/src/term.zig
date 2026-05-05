@@ -41,6 +41,10 @@ pub const Term = struct {
     pub fn resize(self: *Term, cols: u16, rows: u16) !void {
         try self.grid.resize(cols, rows);
     }
+
+    pub fn resizePreservingTop(self: *Term, cols: u16, rows: u16) !void {
+        try self.grid.resizePreservingTop(cols, rows);
+    }
 };
 
 // Global allocator for the Term lifecycle. Swift owns the handle pointer.
@@ -67,6 +71,14 @@ export fn ct_term_feed(t: ?*Term, bytes: [*]const u8, len: usize) void {
 export fn ct_term_resize(t: ?*Term, cols: u16, rows: u16) c_int {
     if (t) |p| {
         p.resize(cols, rows) catch return -1;
+        return 0;
+    }
+    return -1;
+}
+
+export fn ct_term_resize_preserving_top(t: ?*Term, cols: u16, rows: u16) c_int {
+    if (t) |p| {
+        p.resizePreservingTop(cols, rows) catch return -1;
         return 0;
     }
     return -1;

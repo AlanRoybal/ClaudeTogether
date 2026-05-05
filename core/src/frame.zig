@@ -26,7 +26,6 @@ pub const Tag = enum(u8) {
     /// know whether their input should be accepted.
     access_mode = 0x0B,
     // --- collaborative editor frames (0x10..0x15) -------------------------
-    // Tags start at 0x10 to leave room above the core session frames.
     /// Host announces an editor is open with initial file contents.
     editor_open = 0x10,
     /// Single CRDT op transported verbatim (see crdt.encodeOp format).
@@ -39,6 +38,20 @@ pub const Tag = enum(u8) {
     editor_saved = 0x14,
     /// Host broadcasts editor teardown (after arbitration).
     editor_close = 0x15,
+    // --- multi-tab frames (0x16..0x1A) ------------------------------------
+    // Access-mode and editor tags now occupy 0x0B and 0x10..0x15 on main, so
+    // the tab protocol lives above them. Legacy 0x01 pty_output remains only
+    // for single-tab compatibility.
+    /// Peer sends keystrokes for one tab to the host.
+    tab_input = 0x16,
+    /// Host announces a new tab with its initial title.
+    tab_open = 0x17,
+    /// Host announces a tab teardown.
+    tab_close = 0x18,
+    /// Host announces which tab is currently focused.
+    tab_focus = 0x19,
+    /// Host fans a chunk of PTY output for a specific tab to peers.
+    tab_pty_output = 0x1A,
 };
 
 pub const Role = enum(u8) {
@@ -109,6 +122,30 @@ pub const ModeChange = struct {
     mode: Mode,
 };
 
+pub const TabOpen = struct {
+    tab_id: u32,
+    /// UTF-8 tab title; borrowed from input buffer.
+    title: []const u8,
+};
+
+pub const TabClose = struct {
+    tab_id: u32,
+};
+
+pub const TabFocus = struct {
+    tab_id: u32,
+};
+
+pub const TabPtyOutput = struct {
+    tab_id: u32,
+    data: []const u8,
+};
+
+pub const TabInput = struct {
+    tab_id: u32,
+    data: []const u8,
+};
+
 /// Stable cursor anchor id matching the `client:u32 clock:u32` pair used by
 /// `crdt.Id`. Declared here to avoid a direct dependency on `crdt.zig` from
 /// the wire layer (keeps the codec and the CRDT module decoupled).
@@ -177,6 +214,11 @@ pub const Frame = union(Tag) {
     editor_save: EditorSave,
     editor_saved: EditorSaved,
     editor_close: EditorClose,
+    tab_input: TabInput,
+    tab_open: TabOpen,
+    tab_close: TabClose,
+    tab_focus: TabFocus,
+    tab_pty_output: TabPtyOutput,
 };
 
 pub const DecodeError = error{
@@ -355,6 +397,41 @@ pub fn decode(bytes: []const u8) DecodeError!Frame {
             const doc_id = try r.readU64();
             break :blk Frame{ .editor_close = .{ .doc_id = doc_id } };
         },
+        .tab_open => blk: {
+            const tab_id = try r.readU32();
+            const title_len = try r.readU16();
+            const title = try r.readBytes(title_len);
+            break :blk Frame{ .tab_open = .{
+                .tab_id = tab_id,
+                .title = title,
+            } };
+        },
+        .tab_close => blk: {
+            const tab_id = try r.readU32();
+            break :blk Frame{ .tab_close = .{ .tab_id = tab_id } };
+        },
+        .tab_focus => blk: {
+            const tab_id = try r.readU32();
+            break :blk Frame{ .tab_focus = .{ .tab_id = tab_id } };
+        },
+        .tab_pty_output => blk: {
+            const tab_id = try r.readU32();
+            const n = try r.readU32();
+            const data = try r.readBytes(n);
+            break :blk Frame{ .tab_pty_output = .{
+                .tab_id = tab_id,
+                .data = data,
+            } };
+        },
+        .tab_input => blk: {
+            const tab_id = try r.readU32();
+            const n = try r.readU32();
+            const data = try r.readBytes(n);
+            break :blk Frame{ .tab_input = .{
+                .tab_id = tab_id,
+                .data = data,
+            } };
+        },
         .fs_delta => blk: {
             const payload = try r.readBytes(r.remaining());
             break :blk Frame{ .fs_delta = .{ .payload = payload } };
@@ -471,6 +548,23 @@ pub fn encode(frame: Frame, out: []u8) EncodeError!usize {
             try w.writeU32(p.rev);
         },
         .editor_close => |p| try w.writeU64(p.doc_id),
+        .tab_open => |p| {
+            try w.writeU32(p.tab_id);
+            try w.writeU16(@intCast(p.title.len));
+            try w.writeBytes(p.title);
+        },
+        .tab_close => |p| try w.writeU32(p.tab_id),
+        .tab_focus => |p| try w.writeU32(p.tab_id),
+        .tab_pty_output => |p| {
+            try w.writeU32(p.tab_id);
+            try w.writeU32(@intCast(p.data.len));
+            try w.writeBytes(p.data);
+        },
+        .tab_input => |p| {
+            try w.writeU32(p.tab_id);
+            try w.writeU32(@intCast(p.data.len));
+            try w.writeBytes(p.data);
+        },
         .fs_delta => |p| try w.writeBytes(p.payload),
         .fs_snapshot => |p| try w.writeBytes(p.payload),
         .roster => return error.BufferTooSmall, // NYI
@@ -496,6 +590,11 @@ pub fn encodedLen(frame: Frame) usize {
         .editor_save => 1 + 8,
         .editor_saved => 1 + 8 + 4,
         .editor_close => 1 + 8,
+        .tab_open => |p| 1 + 4 + 2 + p.title.len,
+        .tab_close => 1 + 4,
+        .tab_focus => 1 + 4,
+        .tab_pty_output => |p| 1 + 4 + 4 + p.data.len,
+        .tab_input => |p| 1 + 4 + 4 + p.data.len,
         .fs_delta => |p| 1 + p.payload.len,
         .fs_snapshot => |p| 1 + p.payload.len,
         .roster => 1,
@@ -599,6 +698,60 @@ test "truncated input errors" {
 test "unknown tag errors" {
     const bad = [_]u8{0xFF};
     try std.testing.expectError(error.UnknownTag, decode(&bad));
+}
+
+test "tab_open roundtrip" {
+    const frame = Frame{ .tab_open = .{
+        .tab_id = 0xCAFEBABE,
+        .title = "shell",
+    } };
+    var buf: [64]u8 = undefined;
+    const n = try encode(frame, &buf);
+    const decoded = try decode(buf[0..n]);
+    try std.testing.expectEqual(@as(u32, 0xCAFEBABE), decoded.tab_open.tab_id);
+    try std.testing.expectEqualStrings("shell", decoded.tab_open.title);
+}
+
+test "tab_close roundtrip" {
+    const frame = Frame{ .tab_close = .{ .tab_id = 7 } };
+    var buf: [16]u8 = undefined;
+    const n = try encode(frame, &buf);
+    const decoded = try decode(buf[0..n]);
+    try std.testing.expectEqual(@as(u32, 7), decoded.tab_close.tab_id);
+}
+
+test "tab_focus roundtrip" {
+    const frame = Frame{ .tab_focus = .{ .tab_id = 13 } };
+    var buf: [16]u8 = undefined;
+    const n = try encode(frame, &buf);
+    const decoded = try decode(buf[0..n]);
+    try std.testing.expectEqual(@as(u32, 13), decoded.tab_focus.tab_id);
+}
+
+test "tab_pty_output roundtrip" {
+    const payload = "hello tab 3\n";
+    const frame = Frame{ .tab_pty_output = .{
+        .tab_id = 3,
+        .data = payload,
+    } };
+    var buf: [64]u8 = undefined;
+    const n = try encode(frame, &buf);
+    const decoded = try decode(buf[0..n]);
+    try std.testing.expectEqual(@as(u32, 3), decoded.tab_pty_output.tab_id);
+    try std.testing.expectEqualStrings(payload, decoded.tab_pty_output.data);
+}
+
+test "tab_input roundtrip" {
+    const payload = "echo hi\r";
+    const frame = Frame{ .tab_input = .{
+        .tab_id = 9,
+        .data = payload,
+    } };
+    var buf: [64]u8 = undefined;
+    const n = try encode(frame, &buf);
+    const decoded = try decode(buf[0..n]);
+    try std.testing.expectEqual(@as(u32, 9), decoded.tab_input.tab_id);
+    try std.testing.expectEqualStrings(payload, decoded.tab_input.data);
 }
 
 test "editor_open roundtrip" {

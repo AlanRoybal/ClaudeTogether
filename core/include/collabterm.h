@@ -58,6 +58,7 @@ ct_term *ct_term_new(uint16_t cols, uint16_t rows);
 void     ct_term_free(ct_term *t);
 void     ct_term_feed(ct_term *t, const uint8_t *bytes, size_t len);
 int      ct_term_resize(ct_term *t, uint16_t cols, uint16_t rows);
+int      ct_term_resize_preserving_top(ct_term *t, uint16_t cols, uint16_t rows);
 
 /* Writes up to `capacity` cells (row-major) into `out`.
  * Returns the number of cells written. */

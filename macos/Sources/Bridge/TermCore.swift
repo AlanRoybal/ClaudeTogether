@@ -33,9 +33,13 @@ final class TermCore {
         }
     }
 
-    func resize(cols: UInt16, rows: UInt16) {
+    func resize(cols: UInt16, rows: UInt16, preserveTop: Bool = false) {
         guard let h = handle else { return }
-        _ = ct_term_resize(h, cols, rows)
+        if preserveTop {
+            _ = ct_term_resize_preserving_top(h, cols, rows)
+        } else {
+            _ = ct_term_resize(h, cols, rows)
+        }
         self.cols = cols
         self.rows = rows
         self.buf = [ct_cell](
