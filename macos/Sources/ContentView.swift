@@ -957,10 +957,10 @@ final class TerminalModel: ObservableObject {
     func promptJoin() {
         let alert = NSAlert()
         alert.messageText = "Join shared session"
-        alert.informativeText = "Enter host:port (e.g. bore.pub:12345 or 127.0.0.1:5555)"
+        alert.informativeText = "Paste the share URL (e.g. bore.pub:12345#k=...)"
         alert.alertStyle = .informational
-        let input = EditableTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        input.placeholderString = "host:port"
+        let input = EditableTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        input.placeholderString = "host:port#k=..."
         alert.accessoryView = input
         alert.addButton(withTitle: "Join")
         alert.addButton(withTitle: "Cancel")
@@ -968,14 +968,26 @@ final class TerminalModel: ObservableObject {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         let raw = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let colon = raw.lastIndex(of: ":"),
-              let port = UInt16(raw[raw.index(after: colon)...]),
-              !raw[..<colon].isEmpty
+        // Strip optional #k=<base64url> fragment and extract session key.
+        let (hostPort, extractedKey): (String, SessionKey?) = {
+            if let hashIdx = raw.firstIndex(of: "#") {
+                let fragment = String(raw[raw.index(after: hashIdx)...])
+                let addr = String(raw[..<hashIdx])
+                if fragment.hasPrefix("k=") {
+                    return (addr, SessionKey(base64url: String(fragment.dropFirst(2))))
+                }
+                return (addr, nil)
+            }
+            return (raw, nil)
+        }()
+        guard let colon = hostPort.lastIndex(of: ":"),
+              let port = UInt16(hostPort[hostPort.index(after: colon)...]),
+              !hostPort[..<colon].isEmpty
         else {
             NSLog("join: malformed \(raw)")
             return
         }
-        let host = String(raw[..<colon])
+        let host = String(hostPort[..<colon])
         guard let peerRoot = FolderPicker.pick(
             prompt: "Choose the local folder this peer should use as the session root"
         ) else {
@@ -1002,6 +1014,7 @@ final class TerminalModel: ObservableObject {
         rootPath = peerRoot
         fileSyncApplier.configure(rootPath: peerRoot)
         resetSharedInputState()
+        sessionManager.sessionKey = extractedKey
         DispatchQueue.main.async { [weak self] in
             self?.sessionManager.joinPeer(host: host, port: port)
         }

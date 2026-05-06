@@ -60,7 +60,7 @@ struct SessionSidebar: View {
                             .foregroundStyle(.secondary)
                         Divider()
                         Button("Join shared session…") { model.promptJoin() }
-                        Text("Paste the host:port URL you received.")
+                        Text("Paste the host:port#k=... URL you received.")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     case .starting:
