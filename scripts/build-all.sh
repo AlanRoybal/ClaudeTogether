@@ -21,21 +21,21 @@ echo "==> 3/4 xcodegen"
 
 echo "==> 4/4 xcodebuild"
 xcodebuild \
-  -project macos/ClaudeTogether.xcodeproj \
-  -scheme ClaudeTogether \
+  -project macos/CoTTY.xcodeproj \
+  -scheme CoTTY \
   -configuration Debug \
   -derivedDataPath build \
   -destination 'platform=macOS,arch=arm64' \
   build | xcbeautify 2>/dev/null || \
 xcodebuild \
-  -project macos/ClaudeTogether.xcodeproj \
-  -scheme ClaudeTogether \
+  -project macos/CoTTY.xcodeproj \
+  -scheme CoTTY \
   -configuration Debug \
   -derivedDataPath build \
   -destination 'platform=macOS,arch=arm64' \
   build
 
-APP="$ROOT/build/Build/Products/Debug/ClaudeTogether.app"
+APP="$ROOT/build/Build/Products/Debug/CoTTY.app"
 if [[ -d "$APP" ]]; then
   echo ""
   echo "==> .app built at: $APP"

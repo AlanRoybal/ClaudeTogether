@@ -1,14 +1,14 @@
 import SwiftUI
 
 @main
-struct ClaudeTogetherApp: App {
+struct CoTTYApp: App {
     /// The model is owned at the App level so menu commands (which live in
     /// `.commands { ... }` on the scene) can drive the same TerminalModel
     /// instance that ContentView renders.
     @StateObject private var model = TerminalModel()
 
     var body: some Scene {
-        WindowGroup("ClaudeTogether") {
+        WindowGroup("CoTTY") {
             ContentView(model: model)
                 .frame(minWidth: 800, minHeight: 500)
                 .onAppear {

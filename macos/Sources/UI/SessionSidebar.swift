@@ -55,7 +55,14 @@ struct SessionSidebar: View {
                     switch model.sessionManager.state {
                     case .idle:
                         Button("Start shared session") { model.startSharing() }
+                        Text("Starts a tunnel and gives you a URL to share.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                        Divider()
                         Button("Join shared session…") { model.promptJoin() }
+                        Text("Paste the host:port URL you received.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     case .starting:
                         Text("Starting…")
                             .font(.caption)
@@ -82,8 +89,10 @@ struct SessionSidebar: View {
                                     .font(.caption)
                                     .foregroundStyle(.red)
                                     .textSelection(.enabled)
+                                Button("Retry") { model.retryBoreTunnel() }
+                                    .controlSize(.small)
                             } else {
-                                Text("Waiting for bore URL…")
+                                Text("Connecting to relay…")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -163,17 +172,18 @@ struct SessionSidebar: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("core v\(model.coreVersion)")
                         .font(.caption)
-                    if let bore = model.boreBundlePath {
-                        Text("bore: bundled")
+                    if let tool = model.tunnelTool {
+                        let label = tool.server.isEmpty ? "tunnel: ngrok" : "tunnel: bore relay"
+                        Text(label)
                             .font(.caption)
                             .foregroundStyle(.green)
-                        Text(bore)
+                        Text(tool.path)
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .lineLimit(2)
                             .truncationMode(.middle)
                     } else {
-                        Text("bore: MISSING")
+                        Text("tunnel: not found")
                             .font(.caption)
                             .foregroundStyle(.red)
                     }

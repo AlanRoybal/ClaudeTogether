@@ -9,8 +9,8 @@ xcuserdata/
 *.xccheckout
 
 # xcodegen output
-ClaudeTogether.xcodeproj/
-macos/ClaudeTogether.xcodeproj/
+CoTTY.xcodeproj/
+macos/CoTTY.xcodeproj/
 
 # Zig
 core/zig-out/
@@ -19,6 +19,10 @@ core/zig-cache/
 
 # Build artifacts copied from core
 macos/Vendor/
+
+# Local secrets (never commit)
+macos/Secrets.xcconfig
+server/.env
 
 # Bundled bore binary (produced by build-bore.sh)
 macos/Resources/bore

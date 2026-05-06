@@ -1,0 +1,10 @@
+services:
+  bore:
+    build: .
+    ports:
+      - "7835:7835"
+      - "10000-20000:10000-20000"
+    restart: unless-stopped
+    environment:
+      - BORE_SECRET=${BORE_SECRET}
+    command: ["bore", "server", "--min-port", "10000", "--max-port", "20000", "--secret", "${BORE_SECRET}"]

@@ -135,9 +135,10 @@ typedef struct ct_bore ct_bore;
 ct_bore *ct_bore_new(void);
 void     ct_bore_free(ct_bore *b);
 
-/* Spawn `bore local --to bore.pub <port>` using the binary at `bore_path`.
+/* Spawn `bore local <port> --to <server> [--secret <secret>]` using `bore_path`.
+ * `server` is the bore relay hostname. Pass "" for `secret` to omit auth.
  * Returns 0 on success, -1 on spawn failure. */
-int      ct_bore_start(ct_bore *b, const char *bore_path, uint16_t port);
+int      ct_bore_start(ct_bore *b, const char *bore_path, uint16_t port, const char *server, const char *secret);
 
 /* Poll once. If the public URL is now available, writes up to `cap` bytes
  * (NOT NUL-terminated) into `out` and returns the URL length. Returns 0 if

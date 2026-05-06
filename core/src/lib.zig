@@ -210,16 +210,19 @@ export fn ct_bore_free(handle: ?*anyopaque) void {
     gpa().destroy(sup);
 }
 
-/// Spawn `bore local --to bore.pub <port>` using `bore_path` (NUL-terminated).
+/// Spawn `bore local <port> --to <server> [--secret <secret>]` using `bore_path`.
+/// `server` is the bore relay hostname. `secret` may be empty for no auth.
 /// Returns 0 on success, -1 on error.
 export fn ct_bore_start(
     handle: ?*anyopaque,
     bore_path: [*:0]const u8,
     port: u16,
+    server: [*:0]const u8,
+    secret: [*:0]const u8,
 ) c_int {
     const sup: *bore_mod.Supervisor =
         @ptrCast(@alignCast(handle orelse return -1));
-    sup.start(std.mem.span(bore_path), port) catch return -1;
+    sup.start(std.mem.span(bore_path), std.mem.span(server), port, std.mem.span(secret)) catch return -1;
     return 0;
 }
 

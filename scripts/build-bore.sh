@@ -5,7 +5,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/macos/Resources/bore"
-BORE_VERSION="${BORE_VERSION:-0.5.2}"
+BORE_VERSION="${BORE_VERSION:-0.6.0}"
 
 if [[ -f "$OUT" ]]; then
   echo "[build-bore] already present at $OUT — skipping (delete to rebuild)"
