@@ -7,7 +7,7 @@ import Foundation
 /// `userDefaultsKey` so history survives app relaunch.
 @MainActor
 final class CommandHistory: ObservableObject {
-    static let userDefaultsKey = "ClaudeTogether.cmdHistory"
+    static let userDefaultsKey = "CoTTY.cmdHistory"
     static let maxEntries = 100
 
     /// All persisted commands, oldest first. Public so the autocomplete

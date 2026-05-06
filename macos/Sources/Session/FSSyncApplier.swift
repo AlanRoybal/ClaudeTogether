@@ -291,7 +291,7 @@ final class FSSyncApplier {
         }
         let key = stableKey(for: rootURL.path)
         return appSupport
-            .appendingPathComponent("ClaudeTogether", isDirectory: true)
+            .appendingPathComponent("CoTTY", isDirectory: true)
             .appendingPathComponent("FileSync", isDirectory: true)
             .appendingPathComponent(key + ".json", isDirectory: false)
     }

@@ -3,6 +3,23 @@ import Combine
 import Darwin
 import CollabTermC
 
+/// NSTextField subclass that routes Cmd+V/C/X/A through the responder chain
+/// so standard edit shortcuts work inside NSAlert accessory views.
+private class EditableTextField: NSTextField {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.type == .keyDown,
+              event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command
+        else { return super.performKeyEquivalent(with: event) }
+        switch event.charactersIgnoringModifiers {
+        case "v": return NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: self)
+        case "c": return NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: self)
+        case "x": return NSApp.sendAction(#selector(NSText.cut(_:)), to: nil, from: self)
+        case "a": return NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: self)
+        default:  return super.performKeyEquivalent(with: event)
+        }
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var model: TerminalModel
 
@@ -50,7 +67,7 @@ struct ContentView: View {
                     }
                 } else {
                     VStack(spacing: 16) {
-                        Text("ClaudeTogether")
+                        Text("CoTTY")
                             .font(.largeTitle)
                             .bold()
                         Text("Host: pick a folder to start a session.\nPeer: join a shared session from the sidebar.")
@@ -105,7 +122,9 @@ final class TerminalModel: ObservableObject {
     @Published var activeTabId: UInt32?
 
     @Published var rootPath: String?
-    @Published var boreBundlePath: String?
+    @Published var boreBundlePath: String?  // kept for sidebar diagnostics display
+    /// Non-nil when a supported tunnel tool (ngrok or bore) is available.
+    var tunnelTool: (path: String, server: String)?
     @Published var coreVersion: Int32 = 0
     @Published var activeEditor: EditorController?
     /// User-visible "Mouse mode" toggle. When false, MetalTerminalView drops
@@ -149,8 +168,8 @@ final class TerminalModel: ObservableObject {
     static let maximumFontSize: CGFloat = 48
     static let fontSizeStep: CGFloat = 1
 
-    fileprivate static let fontSizeDefaultsKey = "ClaudeTogether.fontSize"
-    fileprivate static let sidebarDefaultsKey = "ClaudeTogether.sidebarVisible"
+    fileprivate static let fontSizeDefaultsKey = "CoTTY.fontSize"
+    fileprivate static let sidebarDefaultsKey = "CoTTY.sidebarVisible"
 
     let sessionManager = SessionManager()
 
@@ -205,8 +224,11 @@ final class TerminalModel: ObservableObject {
 
     init() {
         coreVersion = ct_version()
-        boreBundlePath = Self.findBoreBinaryPath()
-        NSLog("[ct] TerminalModel init borePath=%@", boreBundlePath ?? "<nil>")
+        tunnelTool = Self.findTunnelTool()
+        // Keep boreBundlePath populated for the diagnostics panel
+        boreBundlePath = tunnelTool.map { $0.path }
+        NSLog("[ct] TerminalModel init tunnelTool=%@ server=%@",
+              tunnelTool?.path ?? "<nil>", tunnelTool?.server ?? "(ngrok)")
 
         // Restore persisted UI prefs without firing the didSet writers.
         let defaults = UserDefaults.standard
@@ -285,14 +307,28 @@ final class TerminalModel: ObservableObject {
         fileSyncTimer?.invalidate()
     }
 
-    private static func findBoreBinaryPath() -> String? {
-        let candidates = [
+    /// Returns (toolPath, server) for the best available tunnel tool.
+    /// ngrok (user-installed) is preferred; bundled bore is the fallback.
+    /// Returns nil if neither is available.
+    static func findTunnelTool() -> (path: String, server: String)? {
+        let fm = FileManager.default
+        // Prefer ngrok: search PATH and common Homebrew locations
+        let pathDirs = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .split(separator: ":").map(String.init)
+        let ngrokCandidates = pathDirs.map { "\($0)/ngrok" }
+            + ["/usr/local/bin/ngrok", "/opt/homebrew/bin/ngrok", "/usr/bin/ngrok"]
+        if let ngrok = ngrokCandidates.first(where: { fm.isExecutableFile(atPath: $0) }) {
+            return (path: ngrok, server: "")  // empty server → ngrok mode
+        }
+        // Fall back to bundled bore binary
+        let boreCandidates = [
             Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/bore").path,
             Bundle.main.url(forResource: "bore", withExtension: nil)?.path,
         ].compactMap { $0 }
-
-        let fm = FileManager.default
-        return candidates.first(where: { fm.isExecutableFile(atPath: $0) })
+        if let bore = boreCandidates.first(where: { fm.isExecutableFile(atPath: $0) }) {
+            return (path: bore, server: SessionManager.defaultBoreServer)
+        }
+        return nil
     }
 
     // MARK: derived UI state
@@ -882,8 +918,11 @@ final class TerminalModel: ObservableObject {
         sessionManager.startHost()
         restartFileSyncWatcher()
         startFileSyncPolling()
-        if let borePath = boreBundlePath {
-            sessionManager.startBoreTunnel(borePath: borePath)
+        if let tool = tunnelTool {
+            sessionManager.startBoreTunnel(
+                borePath: tool.path,
+                server: tool.server,
+                secret: tool.server.isEmpty ? "" : SessionManager.boreSecret)
         }
         // Immediately publish our current mode so fresh joiners aren't stuck
         // on the default (.line) assumption.
@@ -904,16 +943,28 @@ final class TerminalModel: ObservableObject {
         resetSharedInputState()
     }
 
+    func retryBoreTunnel() {
+        // Re-detect in case user just installed ngrok
+        tunnelTool = Self.findTunnelTool()
+        boreBundlePath = tunnelTool.map { $0.path }
+        guard let tool = tunnelTool else { return }
+        sessionManager.startBoreTunnel(
+            borePath: tool.path,
+            server: tool.server,
+            secret: tool.server.isEmpty ? "" : SessionManager.boreSecret)
+    }
+
     func promptJoin() {
         let alert = NSAlert()
         alert.messageText = "Join shared session"
         alert.informativeText = "Enter host:port (e.g. bore.pub:12345 or 127.0.0.1:5555)"
         alert.alertStyle = .informational
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        let input = EditableTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
         input.placeholderString = "host:port"
         alert.accessoryView = input
         alert.addButton(withTitle: "Join")
         alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = input
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         let raw = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)

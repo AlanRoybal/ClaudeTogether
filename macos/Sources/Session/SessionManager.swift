@@ -44,6 +44,26 @@ final class SessionManager: ObservableObject {
     @Published private(set) var publicURL: String?
     @Published var lastError: String?
 
+    /// Bore relay hostname injected at build time from Secrets.xcconfig.
+    static let defaultBoreServer: String = {
+        Bundle.main.infoDictionary?["CTBoreServer"] as? String ?? ""
+    }()
+
+    /// Bore secret injected at build time from Secrets.xcconfig.
+    static let boreSecret: String = {
+        Bundle.main.infoDictionary?["CTBoreSecret"] as? String ?? ""
+    }()
+
+    /// Bore relay server hostname. Persisted across launches.
+    @Published var boreServer: String = {
+        UserDefaults.standard.string(forKey: "CoTTY.boreServer") ?? SessionManager.defaultBoreServer
+    }() {
+        didSet {
+            guard boreServer != oldValue else { return }
+            UserDefaults.standard.set(boreServer, forKey: "CoTTY.boreServer")
+        }
+    }
+
     /// Last mode broadcast by the host. Peers consult this to decide whether
     /// to drop keystrokes and surface a creator-only banner. Defaults to
     /// `.line` so a fresh peer allows input until it hears otherwise.
@@ -171,12 +191,14 @@ final class SessionManager: ObservableObject {
 
     // MARK: bore tunnel (host only)
 
-    func startBoreTunnel(borePath: String) {
-        NSLog("[ct] startBoreTunnel role=%@ handle=%@ port=%d path=%@",
+    /// `server`: bore relay hostname (empty = ngrok mode). `secret`: bore --secret value (empty = no auth).
+    func startBoreTunnel(borePath: String, server: String = "", secret: String = "") {
+        NSLog("[ct] startBoreTunnel role=%@ handle=%@ port=%d path=%@ server=%@",
               role == .host ? "host" : "peer",
               boreHandle == nil ? "nil" : "set",
               Int32(localPort),
-              borePath)
+              borePath,
+              server.isEmpty ? "(ngrok)" : server)
         guard role == .host, boreHandle == nil, localPort != 0 else {
             NSLog("[ct] startBoreTunnel early return")
             return
@@ -189,8 +211,12 @@ final class SessionManager: ObservableObject {
             return
         }
         boreHandle = b
-        let rc = borePath.withCString { cstr in
-            ct_bore_start(b, cstr, localPort)
+        let rc = borePath.withCString { boreCStr in
+            server.withCString { serverCStr in
+                secret.withCString { secretCStr in
+                    ct_bore_start(b, boreCStr, localPort, serverCStr, secretCStr)
+                }
+            }
         }
         NSLog("[ct] ct_bore_start rc=%d", rc)
         if rc != 0 {
@@ -474,6 +500,9 @@ final class SessionManager: ObservableObject {
                     NSLog("[ct] bore pump rc=-1 bufferedLen=%d preview=%@",
                           dlen, preview)
                     t.invalidate()
+                    // Free the handle so startBoreTunnel can be called again (retry).
+                    ct_bore_free(b)
+                    self.boreHandle = nil
                 }
             }
         }
@@ -651,11 +680,11 @@ final class SessionManager: ObservableObject {
 
     // MARK: persisted name
 
-    static let nameDefaultsKey = "ClaudeTogether.displayName"
+    static let nameDefaultsKey = "CoTTY.displayName"
 
     /// UserDefaults key for the host-side access policy. Mirrors the
     /// shape used for `nameDefaultsKey`; the sidebar Picker writes this.
-    static let accessModeDefaultsKey = "ClaudeTogether.accessMode"
+    static let accessModeDefaultsKey = "CoTTY.accessMode"
 
     nonisolated static func savedAccessMode() -> AccessMode {
         let raw = UserDefaults.standard.integer(forKey: accessModeDefaultsKey)

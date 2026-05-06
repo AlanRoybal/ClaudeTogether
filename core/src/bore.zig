@@ -37,22 +37,35 @@ pub const Supervisor = struct {
         self.output_buf.deinit();
     }
 
-    /// Spawn `bore local --to bore.pub <local_port>` from `bore_path`.
-    pub fn start(self: *Supervisor, bore_path: []const u8, local_port: u16) !void {
+    /// Spawn a tunnel process from `tool_path`.
+    /// If `server` is non-empty: bore mode → `bore local <port> --to <server> [--secret <secret>]`
+    /// If `server` is empty:    ngrok mode → `ngrok tcp <port>`
+    pub fn start(self: *Supervisor, tool_path: []const u8, server: []const u8, local_port: u16, secret: []const u8) !void {
         if (self.child != null) return; // already running
 
         const port_str = try std.fmt.allocPrint(self.allocator, "{d}", .{local_port});
         defer self.allocator.free(port_str);
 
-        const argv = [_][]const u8{
-            bore_path,
-            "local",
-            "--to",
-            "bore.pub",
-            port_str,
-        };
+        var argv_buf: [8][]const u8 = undefined;
+        var argc: usize = 0;
+        argv_buf[argc] = tool_path; argc += 1;
+        if (server.len == 0) {
+            // ngrok tcp <port>
+            argv_buf[argc] = "tcp"; argc += 1;
+            argv_buf[argc] = port_str; argc += 1;
+        } else {
+            // bore local <port> --to <server> [--secret <secret>]
+            argv_buf[argc] = "local"; argc += 1;
+            argv_buf[argc] = port_str; argc += 1;
+            argv_buf[argc] = "--to"; argc += 1;
+            argv_buf[argc] = server; argc += 1;
+            if (secret.len > 0) {
+                argv_buf[argc] = "--secret"; argc += 1;
+                argv_buf[argc] = secret; argc += 1;
+            }
+        }
 
-        var child = std.process.Child.init(&argv, self.allocator);
+        var child = std.process.Child.init(argv_buf[0..argc], self.allocator);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
         child.stdin_behavior = .Ignore;
@@ -147,23 +160,41 @@ fn setPipeNonBlocking(file: std.fs.File) !void {
     };
 }
 
-/// Scans `output` (accumulated bore stdout/stderr) for the announcement line
-/// and returns the borrowed address token after "listening at ", or null.
+/// Scans `output` (accumulated tunnel stdout/stderr) for a public address.
 ///
-/// Bore prints lines like:
-///   2024-01-01T00:00:00Z  INFO bore_cli::client: listening at bore.pub:12345
+/// Bore:  "… listening at bore.pub:12345"
+/// ngrok: "Forwarding   tcp://0.tcp.ngrok.io:12345 -> localhost:…"
+///        or JSON log: …"url":"tcp://0.tcp.ngrok.io:12345"…
+///
+/// Returns the bare HOST:PORT token (no scheme prefix), borrowed from `output`.
 pub fn parsePublicUrl(output: []const u8) ?[]const u8 {
-    const needle = "listening at ";
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, output, i, needle)) |match_start| {
-        const start = match_start + needle.len;
-        if (start >= output.len) return null;
-        var end = start;
-        while (end < output.len and !std.ascii.isWhitespace(output[end])) {
-            end += 1;
+    // bore: "listening at HOST:PORT"
+    {
+        const needle = "listening at ";
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, output, i, needle)) |pos| {
+            const start = pos + needle.len;
+            if (start >= output.len) break;
+            var end = start;
+            while (end < output.len and !std.ascii.isWhitespace(output[end])) end += 1;
+            if (end > start) return output[start..end];
+            i = start;
         }
-        if (end > start) return output[start..end];
-        i = start;
+    }
+    // ngrok: "tcp://HOST:PORT" (plain output or JSON url field)
+    {
+        const needle = "tcp://";
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, output, i, needle)) |pos| {
+            const start = pos + needle.len;
+            if (start >= output.len) break;
+            var end = start;
+            while (end < output.len and !std.ascii.isWhitespace(output[end]) and output[end] != '"') end += 1;
+            const candidate = output[start..end];
+            if (std.mem.indexOfScalar(u8, candidate, ':') != null and candidate.len > 0)
+                return candidate;
+            i = start;
+        }
     }
     return null;
 }
@@ -207,6 +238,23 @@ test "parsePublicUrl supports non-bore domains" {
     try testing.expectEqualStrings("tunnel.example.com:43210", got.?);
 }
 
+test "parsePublicUrl parses ngrok plain-text Forwarding line" {
+    const sample =
+        "ngrok by @inconshreveable\n" ++
+        "\n" ++
+        "Forwarding                    tcp://0.tcp.ngrok.io:12345 -> localhost:5555\n";
+    const got = parsePublicUrl(sample);
+    try testing.expectEqualStrings("0.tcp.ngrok.io:12345", got.?);
+}
+
+test "parsePublicUrl parses ngrok JSON log url field" {
+    const sample =
+        \\{"level":"info","msg":"started tunnel","url":"tcp://0.tcp.us.ngrok.io:54321"}
+    ++ "\n";
+    const got = parsePublicUrl(sample);
+    try testing.expectEqualStrings("0.tcp.us.ngrok.io:54321", got.?);
+}
+
 test "Supervisor parses public URL from stderr" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -231,7 +279,7 @@ test "Supervisor parses public URL from stderr" {
 
     var sup = Supervisor.init(testing.allocator);
     defer sup.deinit();
-    try sup.start(script_path, 43210);
+    try sup.start(script_path, "bore.pub", 43210, "");
 
     for (0..50) |_| {
         if (try sup.pump()) |url| {
@@ -268,7 +316,7 @@ test "Supervisor reports process exit after stderr-only failure" {
 
     var sup = Supervisor.init(testing.allocator);
     defer sup.deinit();
-    try sup.start(script_path, 43210);
+    try sup.start(script_path, "bore.pub", 43210, "");
 
     for (0..50) |_| {
         const url = sup.pump() catch |err| {
