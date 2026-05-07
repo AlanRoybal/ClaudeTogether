@@ -2073,7 +2073,10 @@ final class TerminalModel: ObservableObject {
     private func deactivateSharedInput(tabId: UInt32,
                                        bumpRevision: Bool) {
         sharedInputTransientOutputTimers.removeValue(forKey: tabId)?.invalidate()
-        pendingHistoryRecovery.remove(tabId)
+        // pendingHistoryRecovery is intentionally NOT cleared here — the ↑/↓
+        // key sets it and then the resulting PTY output triggers this
+        // deactivation. The flag must survive to the next activation so
+        // activateSharedInputAtCurrentCursor can recover the history text.
         sharedInputFromHistory.remove(tabId)
         var state = sharedInputs[tabId] ?? SharedInputState()
         _ = state.deactivate(bumpRevision: bumpRevision)
