@@ -32,13 +32,15 @@ targets:
     deploymentTarget: "14.0"
     sources:
       - path: Sources
-    assets: Sources/Assets.xcassets
+        excludes:
+          - "Assets.xcassets"
+      - path: Resources/AppIcon.icns
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.alanroybal.cotty
         GENERATE_INFOPLIST_FILE: NO
         INFOPLIST_FILE: Sources/Info.plist
-        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         # Link the Zig static lib and expose its C header as a Swift module
         LIBRARY_SEARCH_PATHS:
           - $(SRCROOT)/Vendor
