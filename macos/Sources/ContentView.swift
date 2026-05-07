@@ -202,6 +202,12 @@ final class TerminalModel: ObservableObject {
     private var sharedInputs: [UInt32: SharedInputState] = [:]
     private var sharedInputPromptTimers: [UInt32: Timer] = [:]
     private var sharedInputTransientOutputTimers: [UInt32: Timer] = [:]
+    /// Tabs where ↑/↓ bypassed the shared input to the PTY — signals that
+    /// the next activation should try to recover the recalled history text.
+    private var pendingHistoryRecovery = Set<UInt32>()
+    /// Tabs whose shared-input text came from history recovery; commit sends
+    /// Ctrl+U first to clear the shell's readline buffer.
+    private var sharedInputFromHistory = Set<UInt32>()
     private var participantFocusedTab: [UserIdentity: UInt32] = [:]
     private var editorSavedRevisions: [UInt64: UInt32] = [:]
     private var fileSyncWatcher: FSSyncWatcher?
@@ -422,6 +428,8 @@ final class TerminalModel: ObservableObject {
         splitPaneGrids.removeAll()
         participantFocusedPane.removeAll()
         participantFocusedTab.removeAll()
+        pendingHistoryRecovery.removeAll()
+        sharedInputFromHistory.removeAll()
         for timer in sharedInputTransientOutputTimers.values {
             timer.invalidate()
         }
@@ -1214,6 +1222,18 @@ final class TerminalModel: ObservableObject {
         if handleSharedInputKey(bytes, tabId: tabId) {
             return
         }
+        // Key bypassed the shared input — going straight to the PTY.
+        // If it is ↑ or ↓ and the shared input was active, flag this tab
+        // so the next activation recovers the recalled history text.
+        if sharedInputs[tabId]?.isActive == true {
+            let up   = [0x1B as UInt8, 0x5B, 0x41]  // ESC [ A
+            let down = [0x1B as UInt8, 0x5B, 0x42]  // ESC [ B
+            let upApp   = [0x1B as UInt8, 0x4F, 0x41]  // ESC O A (application cursor)
+            let downApp = [0x1B as UInt8, 0x4F, 0x42]  // ESC O B
+            if bytes == up || bytes == down || bytes == upApp || bytes == downApp {
+                pendingHistoryRecovery.insert(tabId)
+            }
+        }
         if let pty = tabs.first(where: { $0.id == tabId })?.pty {
             pty.send(bytes)
             return
@@ -1864,12 +1884,13 @@ final class TerminalModel: ObservableObject {
                let pty = tabs.first(where: { $0.id == tabId })?.pty
             {
                 sharedInputPromptTimers.removeValue(forKey: tabId)?.invalidate()
-                // Ctrl+U (0x15) clears the shell's readline buffer before we
-                // send the committed text. When the user pressed ↑ to recall
-                // a history entry the shell's readline held that text; without
-                // the clear the committed line would be appended to it.
-                // On a fresh empty prompt Ctrl+U is a no-op in bash/zsh.
-                let payload = [0x15 as UInt8] + Array(line.utf8) + [0x0D]
+                // If the shared-input text was recovered from history (↑ was
+                // pressed), prepend Ctrl+U to clear the shell's readline buffer
+                // before sending the committed line. Without this the shell
+                // would append our text to the history entry it already holds.
+                let fromHistory = sharedInputFromHistory.remove(tabId) != nil
+                let prefix: [UInt8] = fromHistory ? [0x15] : []
+                let payload = prefix + Array(line.utf8) + [0x0D]
                 pty.send(payload)
             }
         case .interrupt:
@@ -1945,12 +1966,12 @@ final class TerminalModel: ObservableObject {
         let cols = Int(grid.cols)
         let anchorLinear = Int(state.anchorRow) * cols + Int(state.anchorCol)
         let cursorLinear = Int(cursor.y) * cols + Int(cursor.x)
-        if existingState != nil,                  // must have a real prior state
+        let isHistoryNavigation = pendingHistoryRecovery.remove(tabId) != nil
+        if isHistoryNavigation,
            !state.isActive,
-           cursor.y >= state.anchorRow,           // cursor on same or later row
-           anchorLinear < cursorLinear,            // anchor is linearly before cursor
-           cursorLinear - anchorLinear <= cols * 3, // within 3 rows (handles wrapping)
-           state.textScalars.isEmpty              // no existing shared text
+           anchorLinear < cursorLinear,            // history text sits between anchor and cursor
+           cursorLinear - anchorLinear < cols * 10, // sanity: max ~10 rows of command
+           state.textScalars.isEmpty              // no stale text in the shared input
         {
             // Extract the text the shell placed on the line between the saved
             // anchor position and the cursor (the recalled history command).
@@ -1974,6 +1995,9 @@ final class TerminalModel: ObservableObject {
             // overlay is positioned correctly over the history command text.
             anchorCol = state.anchorCol
             anchorRow = state.anchorRow
+            if !initialText.isEmpty {
+                sharedInputFromHistory.insert(tabId)
+            }
         } else {
             // Normal activation: fresh prompt, cursor IS the anchor.
             anchorCol = cursor.x
@@ -2049,6 +2073,8 @@ final class TerminalModel: ObservableObject {
     private func deactivateSharedInput(tabId: UInt32,
                                        bumpRevision: Bool) {
         sharedInputTransientOutputTimers.removeValue(forKey: tabId)?.invalidate()
+        pendingHistoryRecovery.remove(tabId)
+        sharedInputFromHistory.remove(tabId)
         var state = sharedInputs[tabId] ?? SharedInputState()
         _ = state.deactivate(bumpRevision: bumpRevision)
         sharedInputs[tabId] = state
