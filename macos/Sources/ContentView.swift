@@ -1870,13 +1870,11 @@ final class TerminalModel: ObservableObject {
                let pty = tabs.first(where: { $0.id == tabId })?.pty
             {
                 sharedInputPromptTimers.removeValue(forKey: tabId)?.invalidate()
-                // If the shared-input text was recovered from history (↑ was
-                // pressed), prepend Ctrl+U to clear the shell's readline buffer
-                // before sending the committed line. Without this the shell
-                // would append our text to the history entry it already holds.
-                let needsClear = sharedInputNeedsLineClear.remove(tabId) != nil
-                let prefix: [UInt8] = needsClear ? [0x15] : []
-                let payload = prefix + Array(line.utf8) + [0x0D]
+                // The shell's readline buffer was cleared with Ctrl+U at
+                // activation time (see activateSharedInputAtCurrentCursor),
+                // so we just send the committed line and Enter.
+                sharedInputNeedsLineClear.remove(tabId)
+                let payload = Array(line.utf8) + [0x0D]
                 pty.send(payload)
             }
         case .interrupt:
@@ -2008,6 +2006,23 @@ final class TerminalModel: ObservableObject {
         }
 
         syncGridSharedInputOverlay(tabId: tabId)
+
+        // After loading existing text into the overlay, clear the shell's
+        // readline buffer so PTY and UI agree: the shell holds the same text
+        // we just loaded (typed before sharing, or recalled via ↑). Ctrl+U
+        // (0x15) kills from cursor to beginning of line. The shell will
+        // redraw the empty input area; preserveSharedInputAcrossTransientOutput
+        // ensures that redraw doesn't tear down the overlay we just set up.
+        // After the redraw the cursor sits at the prompt end and the terminal
+        // cells beyond our overlay are blank, so subsequent backspaces no
+        // longer leave residue from the original (longer) command.
+        if !initialText.isEmpty,
+           let pty = tabs.first(where: { $0.id == tabId })?.pty
+        {
+            preserveSharedInputAcrossTransientOutput(tabId: tabId)
+            pty.send([0x15])
+        }
+
         if broadcast && (changed || state.isActive) {
             broadcastSharedInputSnapshot(tabId: tabId)
         }
