@@ -1926,7 +1926,12 @@ final class TerminalModel: ObservableObject {
         }
         syncSharedInputParticipants(tabId: tabId, broadcast: false)
         let cursor = grid.term.cursor()
-        var state = sharedInputs[tabId] ?? SharedInputState()
+        // Only check for recovered history when a prior SharedInputState exists
+        // (meaning the shared input has activated at least once). A nil entry
+        // means this is the very first activation and the default anchor (0,0)
+        // must NOT be mistaken for a saved prompt position.
+        let existingState = sharedInputs[tabId]
+        var state = existingState ?? SharedInputState()
 
         // Detect history navigation: the previous anchor (preserved through
         // deactivate) is to the LEFT of the current cursor on the same row,
@@ -1939,10 +1944,11 @@ final class TerminalModel: ObservableObject {
         let cols = Int(grid.cols)
         let anchorLinear = Int(state.anchorRow) * cols + Int(state.anchorCol)
         let cursorLinear = Int(cursor.y) * cols + Int(cursor.x)
-        if !state.isActive,
-           state.anchorRow == cursor.y,          // same terminal row
-           anchorLinear < cursorLinear,           // anchor is left of cursor
-           state.textScalars.isEmpty             // no existing shared text
+        if existingState != nil,                  // must have a real prior state
+           !state.isActive,
+           state.anchorRow == cursor.y,           // same terminal row
+           anchorLinear < cursorLinear,            // anchor is left of cursor
+           state.textScalars.isEmpty              // no existing shared text
         {
             // Extract the text the shell placed on the line between the saved
             // anchor position and the cursor (the recalled history command).
