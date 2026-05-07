@@ -215,6 +215,12 @@ final class TerminalModel: ObservableObject {
     /// their first live PTY output chunk so peers see the initial prompt even
     /// if tab-open/focus beats the shell's first paint.
     private var pendingHostTabInitialSnapshots = Set<UInt32>()
+    /// Tabs whose PTY was just respawned (e.g. when a session begins and the
+    /// shell needs to move into the chosen root). Their next shared-input
+    /// activation must NOT extract existing row text as initialText — the
+    /// shell is guaranteed fresh, so any cells before the cursor are the
+    /// prompt itself, not user-typed input.
+    private var freshlyRespawnedTabs = Set<UInt32>()
     /// Peer-only: TabPtyOutput can arrive before TabOpen during join-time
     /// catch-up, so buffer it until the mirrored tab exists locally.
     private var pendingPeerTabOutput: [UInt32: [Data]] = [:]
@@ -410,6 +416,45 @@ final class TerminalModel: ObservableObject {
         rootPath = folder
         fileSyncWatcher = nil
         fileSyncApplier.configure(rootPath: nil)
+        // If a shared session is already running, re-activate the jail at the
+        // new root so subsequent shells inherit the updated CT_SESSION_ROOT.
+        if sessionManager.state == .running {
+            SessionRootJail.activate(rootPath: folder)
+        }
+        // Reset every host PTY into the new root so the terminal reflects the
+        // user's explicit folder change.
+        respawnAllPtys(at: folder)
+    }
+
+    private func respawnAllPtys(at rootPath: String) {
+        let root = URL(fileURLWithPath: rootPath).standardizedFileURL.path
+        let notice = "[CoTTY] root folder changed — restarting shell at \(root)"
+        for tab in tabs {
+            if let pty = tab.pty, pty.pid > 0 {
+                respawnPty(pty: pty, grid: tab.grid, root: root, notice: notice)
+            }
+            if let pane = tab.splitPane, let pty = pane.pty, pty.pid > 0 {
+                respawnPty(pty: pty, grid: pane.grid, root: root, notice: notice)
+            }
+        }
+    }
+
+    /// Respawn a PTY at `root` with a fully reset grid. Feeds RIS (ESC c) so
+    /// the new shell starts on a virgin screen with cursor at row 0 col 0,
+    /// preventing ZLE from redrawing on top of the previous shell's prompt.
+    private func respawnPty(pty: PTYSession, grid: GridModel, root: String,
+                            notice: String)
+    {
+        let cols = grid.cols
+        let rows = grid.rows
+        // ESC c (RIS) — full terminal reset: clears screen + scrollback,
+        // exits alt screen, resets attributes, homes cursor.
+        let payload = Array("\u{1B}c\(notice)\r\n".utf8)
+        grid.feed(payload)
+        pty.terminate()
+        if !pty.spawn(cwd: root, cols: cols, rows: rows) {
+            NSLog("respawnPty: spawn failed at %@", root)
+        }
     }
 
     /// Kept for call-sites that still reference startSession by name.
@@ -441,6 +486,7 @@ final class TerminalModel: ObservableObject {
         lastKnownTerminalGridSize = nil
         cancelPendingHostTabStarts()
         pendingHostTabStartCwds.removeAll()
+        freshlyRespawnedTabs.removeAll()
         stopSharing()
         stopTitlePolling()
         stopModeProbe()
@@ -1076,6 +1122,13 @@ final class TerminalModel: ObservableObject {
             rootPath = folder
             fileSyncApplier.configure(rootPath: nil)
         }
+        // Activate the session-root jail so any shells spawned (or respawned)
+        // from here on are confined to the chosen root.
+        var didRespawn = false
+        if let root = rootPath {
+            SessionRootJail.activate(rootPath: root)
+            didRespawn = respawnPtysOutsideRoot(rootPath: root)
+        }
         let size = currentTerminalGridSize()
         startPendingHostTabs(cols: size.cols, rows: size.rows)
         sessionManager.startHost()
@@ -1094,9 +1147,46 @@ final class TerminalModel: ObservableObject {
             recordLocalTabFocus(activeTabId, broadcast: true)
         }
         if sessionManager.state == .running, !lastLocalCreatorOnlyMode {
+            // If we just respawned shells, the new prompts haven't been
+            // written to the grid yet (PTY output is async, and zsh startup
+            // through user rcfiles can take hundreds of milliseconds).
+            // Activating now would anchor the shared input at column 0 of an
+            // empty row, so when the prompt eventually paints it would land
+            // inside the editable region — making prompt characters look
+            // like typed text. Poll until the prompt is detectable, then
+            // activate.
             for tab in tabs {
-                activateSharedInputAtCurrentCursor(tabId: tab.id, broadcast: true)
+                if didRespawn {
+                    waitForPromptThenActivateSharedInput(tabId: tab.id)
+                } else {
+                    activateSharedInputAtCurrentCursor(
+                        tabId: tab.id, broadcast: true)
+                }
             }
+        }
+    }
+
+    /// Poll up to ~2s waiting for a shell prompt to appear on the active row
+    /// of `tabId`'s grid, then activate the shared input. Falls through and
+    /// activates anyway after the timeout so an unusual prompt format
+    /// doesn't permanently block sharing.
+    private func waitForPromptThenActivateSharedInput(tabId: UInt32,
+                                                      attempts: Int = 0)
+    {
+        let maxAttempts = 20
+        guard let grid = tabs.first(where: { $0.id == tabId })?.grid else {
+            return
+        }
+        let cursor = grid.term.cursor()
+        let promptEnd = shellPromptEnd(onRow: cursor.y, before: cursor.x, grid: grid)
+        let detected = cursor.x > 0 && promptEnd < cursor.x
+        if detected || attempts >= maxAttempts {
+            activateSharedInputAtCurrentCursor(tabId: tabId, broadcast: true)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.waitForPromptThenActivateSharedInput(
+                tabId: tabId, attempts: attempts + 1)
         }
     }
 
@@ -1104,6 +1194,53 @@ final class TerminalModel: ObservableObject {
         stopFileSyncPolling()
         sessionManager.stop()
         resetSharedInputState()
+        freshlyRespawnedTabs.removeAll()
+        SessionRootJail.deactivate()
+    }
+
+    /// Walk every host PTY (primary + split panes) and respawn any whose
+    /// shell has wandered outside `rootPath`. PTYs already inside the chosen
+    /// root keep their state so in-flight work isn't disturbed.
+    @discardableResult
+    private func respawnPtysOutsideRoot(rootPath: String) -> Bool {
+        let root = URL(fileURLWithPath: rootPath).standardizedFileURL.path
+        var any = false
+        for tab in tabs {
+            if let pty = tab.pty, pty.pid > 0 {
+                if respawnIfOutsideRoot(pty: pty, grid: tab.grid, root: root) {
+                    sharedInputs.removeValue(forKey: tab.id)
+                    sharedInputNeedsLineClear.remove(tab.id)
+                    freshlyRespawnedTabs.insert(tab.id)
+                    any = true
+                }
+            }
+            if let pane = tab.splitPane, let pty = pane.pty, pty.pid > 0 {
+                if respawnIfOutsideRoot(pty: pty, grid: pane.grid, root: root) {
+                    sharedInputs.removeValue(forKey: tab.id)
+                    sharedInputNeedsLineClear.remove(tab.id)
+                    freshlyRespawnedTabs.insert(tab.id)
+                    any = true
+                }
+            }
+        }
+        return any
+    }
+
+    /// Returns true if the PTY was actually respawned.
+    private func respawnIfOutsideRoot(pty: PTYSession, grid: GridModel, root: String) -> Bool {
+        let cwd = TabTitleResolver.cwd(pid: pty.pid)
+        if let cwd {
+            let normalized = URL(fileURLWithPath: cwd).standardizedFileURL.path
+            if normalized == root || normalized.hasPrefix(root + "/") {
+                return false
+            }
+        }
+        respawnPty(
+            pty: pty,
+            grid: grid,
+            root: root,
+            notice: "[CoTTY] session started — restarting shell at session root")
+        return true
     }
 
     func retryBoreTunnel() {
@@ -1821,6 +1958,10 @@ final class TerminalModel: ObservableObject {
     private func applyAuthoritativeSharedInputRequest(tabId: UInt32,
                                                      _ request: SharedInputRequest)
     {
+        // Any user interaction with the shared input means startup is done
+        // and any future reactivation should resume normal prompt-aware
+        // extraction (e.g. for history recall via ↑).
+        freshlyRespawnedTabs.remove(tabId)
         syncSharedInputParticipants(tabId: tabId, broadcast: false)
         var state = sharedInputs[tabId] ?? SharedInputState()
         if !state.isActive {
@@ -1940,8 +2081,25 @@ final class TerminalModel: ObservableObject {
         //   activation, e.g. from history navigation or typing before sharing).
         // Priority 2: scan the current row for a shell prompt pattern (% $ # >).
         // Fallback: cursor position — nothing to recover, fresh prompt.
+        // Tabs whose PTY was just respawned have a guaranteed-fresh shell:
+        // the cells before the cursor are the new prompt, never user input.
+        // Skip the prompt-detection / extraction path entirely so we can't
+        // accidentally pull prompt characters into initialText.
+        //
+        // The flag is sticky — we do NOT clear it here. Shell startup emits
+        // output in multiple chunks (zshrc sourcing, prompt redraws), each
+        // of which can trigger handleHostPtyOutput → reschedule a 350 ms
+        // sharedInputPromptTimer that reactivates after this call. Clearing
+        // on the first activation would let a later activation extract the
+        // prompt as initialText. Cleared only when the user actually types
+        // (see appendSharedInputCharacter / sendSharedInputCommit) or when
+        // the session ends.
+        let isFreshShell = freshlyRespawnedTabs.contains(tabId)
+
         let userInputCol: UInt16
-        if let es = existingState,
+        if isFreshShell {
+            userInputCol = cursor.x
+        } else if let es = existingState,
            !es.isActive,
            es.anchorRow == cursor.y,
            es.anchorCol < cursor.x,
@@ -2766,6 +2924,10 @@ private enum TabTitleResolver {
             }
         }
         return sanitizedTitle(name)
+    }
+
+    static func cwd(pid: Int32) -> String? {
+        currentDirectoryPath(pid: pid)
     }
 
     private static func currentDirectoryPath(pid: Int32) -> String? {
