@@ -1779,7 +1779,26 @@ final class TerminalModel: ObservableObject {
             let wasActive = state.isActive
             let preservedAnchor = (state.anchorCol, state.anchorRow)
             let localAnchor = tabs.first(where: { $0.id == tabId })?.grid.term.cursor()
+
+            // If the text is unchanged this snapshot was triggered by a pure
+            // cursor move (arrow keys) on another participant — not an
+            // insert/delete. Preserve the local user's own cursor so optimistic
+            // moves aren't rolled back by another user's navigation.
+            let localId = sessionManager.localIdentity
+            let textUnchanged = snapshot.isActive
+                && state.isActive
+                && snapshot.text == state.text
+            let savedLocalCursor: Int? = textUnchanged
+                ? state.cursors[localId]
+                : nil
+
             state.apply(snapshot)
+
+            // Restore local cursor for move-only snapshots (text didn't change).
+            if let saved = savedLocalCursor, state.isActive {
+                state.restoreCursor(for: localId, to: saved)
+            }
+
             if snapshot.isActive {
                 if wasActive {
                     state.overrideAnchor(

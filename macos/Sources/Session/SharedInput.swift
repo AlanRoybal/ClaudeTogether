@@ -334,6 +334,14 @@ struct SharedInputState {
         self.anchorRow = anchorRow
     }
 
+    /// Restore one participant's cursor to a previously saved offset, clamped
+    /// to the current text length. Used by peers to prevent cursor rollback
+    /// when a move-only snapshot (no text change) arrives from the host.
+    mutating func restoreCursor(for identity: UserIdentity, to offset: Int) {
+        guard isActive else { return }
+        cursors[identity] = min(max(0, offset), textScalars.count)
+    }
+
     func snapshot(participants: [UserIdentity]) -> SharedInputSnapshot {
         let activeCursors: [SharedInputCursorState]
         if isActive {
