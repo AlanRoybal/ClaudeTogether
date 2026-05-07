@@ -1799,17 +1799,13 @@ final class TerminalModel: ObservableObject {
                 state.restoreCursor(for: localId, to: saved)
             }
 
-            if snapshot.isActive {
-                if wasActive {
-                    state.overrideAnchor(
-                        anchorCol: preservedAnchor.0,
-                        anchorRow: preservedAnchor.1)
-                } else if let localAnchor {
-                    state.overrideAnchor(
-                        anchorCol: localAnchor.x,
-                        anchorRow: localAnchor.y)
-                }
-            }
+            // The host's anchor (already applied by state.apply above) is
+            // authoritative: it marks exactly where user input starts on the
+            // prompt line. Overriding it with the local terminal cursor would
+            // place the anchor at the END of any typed text, causing the
+            // overlay to render that text again after what is already visible
+            // in the terminal grid (duplicating the command line content).
+            _ = (wasActive, preservedAnchor, localAnchor) // unused now
             sharedInputs[tabId] = state
             syncGridSharedInputOverlay(tabId: tabId)
             refreshInputAutocomplete()
