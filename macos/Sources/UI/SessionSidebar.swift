@@ -11,24 +11,25 @@ struct SessionSidebar: View {
             Text("Session")
                 .font(.headline)
 
-            GroupBox("Root folder") {
-                if let path = model.rootPath {
-                    Text(path)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .lineLimit(3)
-                        .truncationMode(.middle)
-                } else {
-                    Text("(no session)")
-                        .foregroundStyle(.secondary)
-                        .font(.caption)
+            GroupBox("Project folder") {
+                VStack(alignment: .leading, spacing: 4) {
+                    if let path = model.rootPath {
+                        Text(path)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .lineLimit(3)
+                            .truncationMode(.middle)
+                    } else {
+                        Text("Not set — required to share")
+                            .foregroundStyle(.secondary)
+                            .font(.caption)
+                    }
+                    Button(model.rootPath == nil ? "Choose folder…" : "Change folder…") {
+                        model.pickProjectFolder()
+                    }
+                    .font(.caption)
+                    .disabled(model.sessionManager.state == .running)
                 }
-            }
-
-            if model.pty != nil {
-                Button("End session") { model.endSession() }
-            } else {
-                Button("Start session…") { model.startSession() }
             }
 
             // Mouse-reporting (xterm SGR) — when off, mouse events fall

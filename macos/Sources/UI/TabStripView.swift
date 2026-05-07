@@ -24,11 +24,70 @@ struct TabStripView: View {
                         .frame(width: 18, height: 18)
                 }
                 .buttonStyle(.plain)
-                .help("New tab (Cmd+T)")
+                .help("New tab (⌘T)")
                 .accessibilityLabel("New tab")
             }
 
             Spacer(minLength: 0)
+
+            // Split-pane controls — always visible so peers can see the layout
+            // even though only the host can create/destroy split panes.
+            if let tab = model.activeTabForView {
+                if tab.splitPane == nil {
+                    if model.sessionManager.role == .host {
+                        Button(action: {
+                            NotificationCenter.default.post(
+                                name: .ctPaneSplitH, object: nil)
+                        }) {
+                            Image(systemName: "rectangle.split.2x1")
+                                .font(.system(size: 11, weight: .semibold))
+                                .frame(width: 18, height: 18)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Split pane horizontally (⌘D)")
+                        .accessibilityLabel("Split pane horizontally")
+
+                        Button(action: {
+                            NotificationCenter.default.post(
+                                name: .ctPaneSplitV, object: nil)
+                        }) {
+                            Image(systemName: "rectangle.split.1x2")
+                                .font(.system(size: 11, weight: .semibold))
+                                .frame(width: 18, height: 18)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Split pane vertically (⌘⇧D)")
+                        .accessibilityLabel("Split pane vertically")
+                    }
+                } else {
+                    Button(action: {
+                        NotificationCenter.default.post(
+                            name: .ctPaneNext, object: nil)
+                    }) {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 11, weight: .semibold))
+                            .frame(width: 18, height: 18)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Focus next pane (⌘⌥⇥)")
+                    .accessibilityLabel("Focus next pane")
+
+                    if model.sessionManager.role == .host {
+                        Button(action: {
+                            NotificationCenter.default.post(
+                                name: .ctPaneClose, object: nil)
+                        }) {
+                            Image(systemName: "rectangle.grid.1x2")
+                                .font(.system(size: 11, weight: .semibold))
+                                .frame(width: 18, height: 18)
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Close split pane (⌘⇧P)")
+                        .accessibilityLabel("Close split pane")
+                    }
+                }
+            }
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)

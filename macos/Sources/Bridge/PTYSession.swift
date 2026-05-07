@@ -9,6 +9,12 @@ final class PTYSession {
     private(set) var pid: Int32 = -1
     private var readSource: DispatchSourceRead?
     private let readQueue = DispatchQueue(label: "ct.pty.read")
+    /// Bumped on every terminate(). startReading captures the value at
+    /// spawn time; any output dispatched on the main queue checks it
+    /// before invoking onOutput, so bytes from a previous shell instance
+    /// that were already in flight when the PTY was respawned get dropped
+    /// instead of being fed into the new shell's grid.
+    private var generation: Int = 0
 
     /// Called on the main queue with each chunk of PTY output.
     var onOutput: (([UInt8]) -> Void)?
@@ -79,6 +85,7 @@ final class PTYSession {
     }
 
     func terminate() {
+        generation &+= 1
         readSource?.cancel()
         readSource = nil
         if pid > 0 { ct_pty_kill(pid) }
@@ -88,6 +95,7 @@ final class PTYSession {
     }
 
     private func startReading() {
+        let myGeneration = self.generation
         let src = DispatchSource.makeReadSource(fileDescriptor: fd, queue: readQueue)
         src.setEventHandler { [weak self] in
             guard let self else { return }
@@ -97,9 +105,15 @@ final class PTYSession {
             }
             if n > 0 {
                 let chunk = Array(buf.prefix(n))
-                DispatchQueue.main.async { self.onOutput?(chunk) }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.generation == myGeneration else { return }
+                    self.onOutput?(chunk)
+                }
             } else if n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR) {
-                DispatchQueue.main.async { self.onExit?() }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.generation == myGeneration else { return }
+                    self.onExit?()
+                }
                 self.readSource?.cancel()
             }
         }

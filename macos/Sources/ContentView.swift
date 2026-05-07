@@ -40,43 +40,17 @@ struct ContentView: View {
                     VStack(spacing: 0) {
                         TabStripView(model: model)
                         if let tab = model.activeTabForView {
-                            ZStack(alignment: .topLeading) {
-                                MetalTerminalView(
-                                    grid: tab.grid,
-                                    onKey: { bytes in
-                                        model.handleKey(bytes, forTabId: tab.id)
-                                    },
-                                    onResize: { cols, rows in
-                                        model.handleResize(cols: cols, rows: rows)
-                                    },
-                                    onMouseCell: { col, row in
-                                        model.handleTerminalMouseCell(
-                                            col: col,
-                                            row: row,
-                                            forTabId: tab.id)
-                                    },
-                                    inputEnabled: model.inputEnabled,
-                                    fontSize: model.fontSize,
-                                    mouseModeEnabled: model.mouseMode)
-                                SharedInputAutocompleteOverlay(
-                                    grid: tab.grid,
-                                    autocomplete: model.inputAutocomplete)
-                            }
-                            .frame(minWidth: 500, minHeight: 300)
+                            SplitPaneView(tab: tab, model: model)
+                                .frame(minWidth: 500, minHeight: 300)
                         }
                     }
                 } else {
-                    VStack(spacing: 16) {
-                        Text("CoTTY")
-                            .font(.largeTitle)
-                            .bold()
-                        Text("Host: pick a folder to start a session.\nPeer: join a shared session from the sidebar.")
-                            .multilineTextAlignment(.center)
-                            .foregroundStyle(.secondary)
-                        Button("Choose folder…") { model.startSession() }
-                            .controlSize(.large)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    // Tabs are empty — auto-open the initial terminal. This
+                    // state is only visible briefly on first launch or after a
+                    // peer session ends while the tab is being created.
+                    Color.clear
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .onAppear { model.openInitialTab() }
                 }
 
                 if model.activeEditor == nil, model.showRawBanner {
@@ -94,6 +68,16 @@ struct ContentView: View {
     }
 }
 
+/// A secondary terminal pane created by splitting the primary pane of a tab.
+struct SplitPaneState: Identifiable {
+    /// Unique pane identifier used in wire frames.
+    let id: UInt32
+    /// Host: the PTY backing this pane. Peer: nil (display-only mirror).
+    var pty: PTYSession?
+    /// Render target for this pane. Independent from the primary pane grid.
+    var grid: GridModel
+}
+
 /// One tab in a session. Each tab owns its own grid; on the host each tab
 /// also owns a PTY shell (peer tabs are display-only and have nil pty).
 struct TabState: Identifiable {
@@ -104,6 +88,12 @@ struct TabState: Identifiable {
     /// Render target for this tab. The active tab's grid is the one that
     /// `MetalTerminalView` is currently rendering.
     let grid: GridModel
+    /// Non-nil when this tab has been split into two panes.
+    var splitPane: SplitPaneState? = nil
+    /// Whether the split is side-by-side or stacked.
+    var splitAxis: SplitAxis = .horizontal
+    /// 0 = primary pane, 1 = split pane. Determines where keystrokes go.
+    var activePaneIndex: Int = 0
 }
 
 extension Notification.Name {
@@ -111,6 +101,10 @@ extension Notification.Name {
     static let ctTabsClose = Notification.Name("ct.tabs.close")
     static let ctTabsNext = Notification.Name("ct.tabs.next")
     static let ctTabsPrevious = Notification.Name("ct.tabs.previous")
+    static let ctPaneSplitH = Notification.Name("ct.pane.splitH")
+    static let ctPaneSplitV = Notification.Name("ct.pane.splitV")
+    static let ctPaneClose = Notification.Name("ct.pane.close")
+    static let ctPaneNext = Notification.Name("ct.pane.next")
 }
 
 @MainActor
@@ -185,6 +179,14 @@ final class TerminalModel: ObservableObject {
     }
     var activeTabForView: TabState? { activeTab }
     private var nextTabId: UInt32 = 1
+    /// Pane IDs start above the tab-ID range so they never collide on the wire.
+    private var nextPaneId: UInt32 = 10_000
+    /// Tracks which pane ID each participant is currently focused in, for
+    /// routing paneCursorPos updates to the correct GridModel.
+    private var participantFocusedPane: [UserIdentity: UInt32] = [:]
+    /// paneId → the grid that owns it (split pane grids only; primary pane
+    /// grids are looked up via the TabState they belong to).
+    private var splitPaneGrids: [UInt32: GridModel] = [:]
 
     /// Keep the tab strip visible from the first tab onward so adding the
     /// second tab does not shrink the terminal viewport and drop visible
@@ -200,6 +202,11 @@ final class TerminalModel: ObservableObject {
     private var sharedInputs: [UInt32: SharedInputState] = [:]
     private var sharedInputPromptTimers: [UInt32: Timer] = [:]
     private var sharedInputTransientOutputTimers: [UInt32: Timer] = [:]
+    /// Tabs whose shared input was activated with pre-existing text (typed
+    /// before sharing started, or recalled via ↑ history). The commit handler
+    /// prepends Ctrl+U to clear the shell's readline buffer before sending
+    /// the committed line, since the shell already holds that text.
+    private var sharedInputNeedsLineClear = Set<UInt32>()
     private var participantFocusedTab: [UserIdentity: UInt32] = [:]
     private var editorSavedRevisions: [UInt64: UInt32] = [:]
     private var fileSyncWatcher: FSSyncWatcher?
@@ -208,6 +215,12 @@ final class TerminalModel: ObservableObject {
     /// their first live PTY output chunk so peers see the initial prompt even
     /// if tab-open/focus beats the shell's first paint.
     private var pendingHostTabInitialSnapshots = Set<UInt32>()
+    /// Tabs whose PTY was just respawned (e.g. when a session begins and the
+    /// shell needs to move into the chosen root). Their next shared-input
+    /// activation must NOT extract existing row text as initialText — the
+    /// shell is guaranteed fresh, so any cells before the cursor are the
+    /// prompt itself, not user-typed input.
+    private var freshlyRespawnedTabs = Set<UInt32>()
     /// Peer-only: TabPtyOutput can arrive before TabOpen during join-time
     /// catch-up, so buffer it until the mirrored tab exists locally.
     private var pendingPeerTabOutput: [UInt32: [Data]] = [:]
@@ -291,6 +304,26 @@ final class TerminalModel: ObservableObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.previousTab() }
         }
+        NotificationCenter.default.addObserver(
+            forName: .ctPaneSplitH, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.splitActivePane(axis: .horizontal) }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .ctPaneSplitV, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.splitActivePane(axis: .vertical) }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .ctPaneClose, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.closeSplitPane() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .ctPaneNext, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.focusNextPane() }
+        }
     }
 
     private var cancellables = Set<AnyCancellable>()
@@ -355,27 +388,91 @@ final class TerminalModel: ObservableObject {
 
     // MARK: host session
 
-    func startSession() {
-        guard let folder = FolderPicker.pick() else { return }
-        rootPath = folder
-        fileSyncWatcher = nil
-        fileSyncApplier.configure(rootPath: nil)
-        // Default to one tab so the single-session UX matches the pre-tabs
-        // experience. Subsequent tabs are user-initiated (⌘T / +).
-        openNewTab()
+    /// Open a terminal at the home directory without requiring a project folder.
+    /// Called automatically on launch and whenever the tab list becomes empty.
+    func openInitialTab() {
+        guard sessionManager.role == .host, tabs.isEmpty else { return }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let tabId = nextTabId
+        nextTabId &+= 1
+        let title = TabTitleResolver.initialTitle(cwd: home, sessionRootPath: nil)
+        let shouldDefer = lastKnownTerminalGridSize == nil
+        guard let tab = makeHostTab(id: tabId, title: title, cwd: home,
+                                    spawnImmediately: !shouldDefer)
+        else { return }
+        tabs.append(tab)
+        if shouldDefer { pendingHostTabStartCwds[tabId] = home }
+        activeTabId = tabId
+        recordLocalTabFocus(tabId, broadcast: false)
         startTitlePolling()
         startModeProbe()
         syncAllGridSharedInputOverlays()
     }
 
+    /// Let the host choose a project root folder for file sync. Does not open
+    /// a new terminal tab. Required before starting a shared session.
+    func pickProjectFolder() {
+        guard let folder = FolderPicker.pick() else { return }
+        rootPath = folder
+        fileSyncWatcher = nil
+        fileSyncApplier.configure(rootPath: nil)
+        // If a shared session is already running, re-activate the jail at the
+        // new root so subsequent shells inherit the updated CT_SESSION_ROOT.
+        if sessionManager.state == .running {
+            SessionRootJail.activate(rootPath: folder)
+        }
+        // Reset every host PTY into the new root so the terminal reflects the
+        // user's explicit folder change.
+        respawnAllPtys(at: folder)
+    }
+
+    private func respawnAllPtys(at rootPath: String) {
+        let root = URL(fileURLWithPath: rootPath).standardizedFileURL.path
+        let notice = "[CoTTY] root folder changed — restarting shell at \(root)"
+        for tab in tabs {
+            if let pty = tab.pty, pty.pid > 0 {
+                respawnPty(pty: pty, grid: tab.grid, root: root, notice: notice)
+            }
+            if let pane = tab.splitPane, let pty = pane.pty, pty.pid > 0 {
+                respawnPty(pty: pty, grid: pane.grid, root: root, notice: notice)
+            }
+        }
+    }
+
+    /// Respawn a PTY at `root` with a fully reset grid. Feeds RIS (ESC c) so
+    /// the new shell starts on a virgin screen with cursor at row 0 col 0,
+    /// preventing ZLE from redrawing on top of the previous shell's prompt.
+    private func respawnPty(pty: PTYSession, grid: GridModel, root: String,
+                            notice: String)
+    {
+        let cols = grid.cols
+        let rows = grid.rows
+        // ESC c (RIS) — full terminal reset: clears screen + scrollback,
+        // exits alt screen, resets attributes, homes cursor.
+        let payload = Array("\u{1B}c\(notice)\r\n".utf8)
+        grid.feed(payload)
+        pty.terminate()
+        if !pty.spawn(cwd: root, cols: cols, rows: rows) {
+            NSLog("respawnPty: spawn failed at %@", root)
+        }
+    }
+
+    /// Kept for call-sites that still reference startSession by name.
+    func startSession() { pickProjectFolder() }
+
     func endSession() {
         for tab in tabs {
             tab.pty?.terminate()
+            tab.splitPane?.pty?.terminate()
         }
         tabs.removeAll()
         activeTabId = nil
         nextTabId = 1
+        nextPaneId = 10_000
+        splitPaneGrids.removeAll()
+        participantFocusedPane.removeAll()
         participantFocusedTab.removeAll()
+        sharedInputNeedsLineClear.removeAll()
         for timer in sharedInputTransientOutputTimers.values {
             timer.invalidate()
         }
@@ -389,25 +486,24 @@ final class TerminalModel: ObservableObject {
         lastKnownTerminalGridSize = nil
         cancelPendingHostTabStarts()
         pendingHostTabStartCwds.removeAll()
+        freshlyRespawnedTabs.removeAll()
         stopSharing()
         stopTitlePolling()
         stopModeProbe()
         stopFileSyncPolling()
         fileSyncApplier.configure(rootPath: nil)
         resetSharedInputState()
+        // Reopen a terminal at home so the user is never left with a blank window.
+        openInitialTab()
     }
 
     // MARK: tabs
 
-    /// Host: spawn a new PTY at the current rootPath, allocate a tab id,
-    /// broadcast TabOpen + TabFocus, and switch to the new tab.
+    /// Host: spawn a new PTY, allocate a tab id, broadcast TabOpen + TabFocus,
+    /// and switch to the new tab. Uses rootPath when set; falls back to home.
     func openNewTab() {
         guard sessionManager.role == .host else { return }
-        guard let folder = rootPath ?? activeTab.flatMap({ _ in rootPath }) else {
-            // No session yet — bootstrap one.
-            startSession()
-            return
-        }
+        let folder = rootPath ?? FileManager.default.homeDirectoryForCurrentUser.path
         let tabId = nextTabId
         nextTabId &+= 1
         let title = TabTitleResolver.initialTitle(
@@ -529,6 +625,112 @@ final class TerminalModel: ObservableObject {
         let count = tabs.count
         let prev = tabs[(idx - 1 + count) % count]
         focusTab(id: prev.id)
+    }
+
+    // MARK: panes
+
+    /// Split the active tab's primary pane along `axis`. On the host a new PTY
+    /// is spawned; on peers the split is display-only until the host announces
+    /// it via a `paneOpen` frame. Ignored if the tab is already split.
+    /// Only the host can split. The split is broadcast to all peers so every
+    /// participant shares the same two terminals side-by-side.
+    func splitActivePane(axis: SplitAxis) {
+        guard sessionManager.role == .host else { return }
+        guard let activeTabId,
+              let idx = tabs.firstIndex(where: { $0.id == activeTabId }),
+              tabs[idx].splitPane == nil
+        else { return }
+
+        let paneId = nextPaneId
+        nextPaneId &+= 1
+        let tabId  = activeTabId
+        let spawnCols = max(tabs[idx].grid.cols / (axis == .horizontal ? 2 : 1), 20)
+        let spawnRows = max(tabs[idx].grid.rows / (axis == .vertical   ? 2 : 1), 6)
+        guard let grid = GridModel(cols: spawnCols, rows: spawnRows) else { return }
+
+        let cwd = rootPath ?? FileManager.default.homeDirectoryForCurrentUser.path
+        let p = PTYSession()
+        p.onOutput = { [weak self] bytes in
+            guard let self else { return }
+            grid.feed(bytes)
+            if self.sessionManager.state == .running {
+                self.sessionManager.sendPanePtyOutput(paneId: paneId, data: Data(bytes))
+            }
+        }
+        p.onExit = { grid.feed(Array("\r\n[process exited]\r\n".utf8)) }
+        guard p.spawn(cwd: cwd, cols: spawnCols, rows: spawnRows) else { return }
+
+        let pane = SplitPaneState(id: paneId, pty: p, grid: grid)
+        splitPaneGrids[paneId] = grid
+        tabs[idx].splitPane = pane
+        tabs[idx].splitAxis = axis
+        tabs[idx].activePaneIndex = 1
+
+        if sessionManager.state == .running {
+            sessionManager.sendPaneOpen(tabId: tabId, paneId: paneId, axis: axis)
+        }
+    }
+
+    /// Host only: close the split pane and broadcast the teardown.
+    func closeSplitPane() {
+        guard sessionManager.role == .host else { return }
+        guard let activeTabId,
+              let idx = tabs.firstIndex(where: { $0.id == activeTabId }),
+              let pane = tabs[idx].splitPane
+        else { return }
+
+        pane.pty?.terminate()
+        splitPaneGrids.removeValue(forKey: pane.id)
+        let paneId = pane.id
+        tabs[idx].splitPane = nil
+        tabs[idx].activePaneIndex = 0
+
+        if sessionManager.state == .running {
+            sessionManager.sendPaneClose(tabId: activeTabId, paneId: paneId)
+        }
+    }
+
+    /// Cycle focus between the primary and split pane of the active tab.
+    func focusNextPane() {
+        guard let activeTabId,
+              let idx = tabs.firstIndex(where: { $0.id == activeTabId }),
+              tabs[idx].splitPane != nil
+        else { return }
+        tabs[idx].activePaneIndex = tabs[idx].activePaneIndex == 0 ? 1 : 0
+    }
+
+    /// Update which pane is active locally (called from the `onKey` closures
+    /// so clicking / typing in a pane makes it the target).
+    func setActivePaneIndex(tabId: UInt32, index: Int) {
+        guard let idx = tabs.firstIndex(where: { $0.id == tabId }) else { return }
+        guard tabs[idx].activePaneIndex != index else { return }
+        tabs[idx].activePaneIndex = index
+    }
+
+    /// Broadcast the local participant's terminal cursor position inside the
+    /// split pane so every peer can render their unique cursor there.
+    func broadcastSplitPaneCursor(paneId: UInt32, grid: GridModel) {
+        guard sessionManager.state == .running else { return }
+        var col: UInt16 = 0
+        var row: UInt16 = 0
+        if let local = grid.cursors.first(where: { $0.isLocal }) {
+            col = local.col
+            row = local.row
+        }
+        sessionManager.sendPaneCursor(paneId: paneId, col: col, row: row)
+    }
+
+    /// Resize a specific split pane's grid and PTY independently of the
+    /// primary pane. Called from the split pane's `MetalTerminalView.onResize`.
+    func handleSplitPaneResize(tabId: UInt32, paneId: UInt32,
+                               cols: UInt16, rows: UInt16)
+    {
+        guard let idx = tabs.firstIndex(where: { $0.id == tabId }),
+              tabs[idx].splitPane?.id == paneId
+        else { return }
+        let pane = tabs[idx].splitPane!
+        pane.pty?.resize(cols: cols, rows: rows)
+        pane.grid.resize(cols: cols, rows: rows, preserveTop: true)
     }
 
     private func makeHostTab(id: UInt32,
@@ -913,6 +1115,20 @@ final class TerminalModel: ObservableObject {
     // MARK: sharing
 
     func startSharing() {
+        // Sharing requires an explicit project root for file sync. If none has
+        // been chosen yet, prompt the user before proceeding.
+        if rootPath == nil {
+            guard let folder = FolderPicker.pick() else { return }
+            rootPath = folder
+            fileSyncApplier.configure(rootPath: nil)
+        }
+        // Activate the session-root jail so any shells spawned (or respawned)
+        // from here on are confined to the chosen root.
+        var didRespawn = false
+        if let root = rootPath {
+            SessionRootJail.activate(rootPath: root)
+            didRespawn = respawnPtysOutsideRoot(rootPath: root)
+        }
         let size = currentTerminalGridSize()
         startPendingHostTabs(cols: size.cols, rows: size.rows)
         sessionManager.startHost()
@@ -931,9 +1147,46 @@ final class TerminalModel: ObservableObject {
             recordLocalTabFocus(activeTabId, broadcast: true)
         }
         if sessionManager.state == .running, !lastLocalCreatorOnlyMode {
+            // If we just respawned shells, the new prompts haven't been
+            // written to the grid yet (PTY output is async, and zsh startup
+            // through user rcfiles can take hundreds of milliseconds).
+            // Activating now would anchor the shared input at column 0 of an
+            // empty row, so when the prompt eventually paints it would land
+            // inside the editable region — making prompt characters look
+            // like typed text. Poll until the prompt is detectable, then
+            // activate.
             for tab in tabs {
-                activateSharedInputAtCurrentCursor(tabId: tab.id, broadcast: true)
+                if didRespawn {
+                    waitForPromptThenActivateSharedInput(tabId: tab.id)
+                } else {
+                    activateSharedInputAtCurrentCursor(
+                        tabId: tab.id, broadcast: true)
+                }
             }
+        }
+    }
+
+    /// Poll up to ~2s waiting for a shell prompt to appear on the active row
+    /// of `tabId`'s grid, then activate the shared input. Falls through and
+    /// activates anyway after the timeout so an unusual prompt format
+    /// doesn't permanently block sharing.
+    private func waitForPromptThenActivateSharedInput(tabId: UInt32,
+                                                      attempts: Int = 0)
+    {
+        let maxAttempts = 20
+        guard let grid = tabs.first(where: { $0.id == tabId })?.grid else {
+            return
+        }
+        let cursor = grid.term.cursor()
+        let promptEnd = shellPromptEnd(onRow: cursor.y, before: cursor.x, grid: grid)
+        let detected = cursor.x > 0 && promptEnd < cursor.x
+        if detected || attempts >= maxAttempts {
+            activateSharedInputAtCurrentCursor(tabId: tabId, broadcast: true)
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.waitForPromptThenActivateSharedInput(
+                tabId: tabId, attempts: attempts + 1)
         }
     }
 
@@ -941,6 +1194,53 @@ final class TerminalModel: ObservableObject {
         stopFileSyncPolling()
         sessionManager.stop()
         resetSharedInputState()
+        freshlyRespawnedTabs.removeAll()
+        SessionRootJail.deactivate()
+    }
+
+    /// Walk every host PTY (primary + split panes) and respawn any whose
+    /// shell has wandered outside `rootPath`. PTYs already inside the chosen
+    /// root keep their state so in-flight work isn't disturbed.
+    @discardableResult
+    private func respawnPtysOutsideRoot(rootPath: String) -> Bool {
+        let root = URL(fileURLWithPath: rootPath).standardizedFileURL.path
+        var any = false
+        for tab in tabs {
+            if let pty = tab.pty, pty.pid > 0 {
+                if respawnIfOutsideRoot(pty: pty, grid: tab.grid, root: root) {
+                    sharedInputs.removeValue(forKey: tab.id)
+                    sharedInputNeedsLineClear.remove(tab.id)
+                    freshlyRespawnedTabs.insert(tab.id)
+                    any = true
+                }
+            }
+            if let pane = tab.splitPane, let pty = pane.pty, pty.pid > 0 {
+                if respawnIfOutsideRoot(pty: pty, grid: pane.grid, root: root) {
+                    sharedInputs.removeValue(forKey: tab.id)
+                    sharedInputNeedsLineClear.remove(tab.id)
+                    freshlyRespawnedTabs.insert(tab.id)
+                    any = true
+                }
+            }
+        }
+        return any
+    }
+
+    /// Returns true if the PTY was actually respawned.
+    private func respawnIfOutsideRoot(pty: PTYSession, grid: GridModel, root: String) -> Bool {
+        let cwd = TabTitleResolver.cwd(pid: pty.pid)
+        if let cwd {
+            let normalized = URL(fileURLWithPath: cwd).standardizedFileURL.path
+            if normalized == root || normalized.hasPrefix(root + "/") {
+                return false
+            }
+        }
+        respawnPty(
+            pty: pty,
+            grid: grid,
+            root: root,
+            notice: "[CoTTY] session started — restarting shell at session root")
+        return true
     }
 
     func retryBoreTunnel() {
@@ -1029,7 +1329,7 @@ final class TerminalModel: ObservableObject {
     /// Called by MetalTerminalView when the user types. The tab id is
     /// supplied so each per-tab view writes only to its own PTY — no central
     /// "active session" lookup that could leak keystrokes across tabs.
-    func handleKey(_ bytes: [UInt8], forTabId tabId: UInt32) {
+    func handleKey(_ bytes: [UInt8], forTabId tabId: UInt32, paneIndex: Int = 0) {
         guard tabId == activeTabId else { return }
         startPendingHostTabIfNeeded(tabId: tabId)
         // View-only enforcement: the MetalTerminalNSView already gates via
@@ -1039,6 +1339,20 @@ final class TerminalModel: ObservableObject {
             NSSound.beep()
             return
         }
+        // Route to the split pane when paneIndex == 1 and the tab is split.
+        // Route to the split pane (host: local PTY; peer: send to host).
+        if paneIndex == 1,
+           let pane = tabs.first(where: { $0.id == tabId })?.splitPane
+        {
+            pane.grid.scrollToBottom()
+            if let pty = pane.pty {
+                pty.send(bytes)
+            } else if sessionManager.role == .peer, sessionManager.state == .running {
+                sessionManager.sendPaneInput(paneId: pane.id, data: Data(bytes))
+            }
+            return
+        }
+        // Primary pane (unchanged behavior).
         tabs.first(where: { $0.id == tabId })?.grid.scrollToBottom()
         if handleSharedInputKey(bytes, tabId: tabId) {
             return
@@ -1271,6 +1585,19 @@ final class TerminalModel: ObservableObject {
                   let pty = tab.pty
             else { return }
             pty.send(Array(data))
+        case .cursorPos(let identity, let col, let row):
+            // Update the peer's cursor in the active tab's primary pane grid.
+            guard identity != sessionManager.localIdentity,
+                  let participant = sessionManager.participants.first(where: { $0.identity == identity }),
+                  let grid = tabs.first(where: { $0.id == activeTabId })?.grid
+            else { return }
+            grid.upsertPeerCursor(
+                id: identity.uuidValue,
+                col: col, row: row,
+                color: participant.color)
+            if sessionManager.role == .host {
+                sessionManager.broadcast(.cursorPos(identity, col: col, row: row))
+            }
         case .fsDelta(let delta):
             guard sessionManager.role == .peer else { return }
             fileSyncApplier.apply(delta)
@@ -1334,6 +1661,57 @@ final class TerminalModel: ObservableObject {
             } else {
                 closeEditor(docId: docId, broadcast: false)
             }
+
+        // MARK: split-pane inbound
+        case .paneOpen(let tabId, let paneId, let axis):
+            guard sessionManager.role == .peer else { return }
+            guard let tabIdx = tabs.firstIndex(where: { $0.id == tabId }) else { return }
+            // Replace any stale local split so the host's layout wins.
+            if let existing = tabs[tabIdx].splitPane {
+                existing.pty?.terminate()
+                splitPaneGrids.removeValue(forKey: existing.id)
+            }
+            let cols = max(tabs[tabIdx].grid.cols / (axis == .horizontal ? 2 : 1), 20)
+            let rows = max(tabs[tabIdx].grid.rows / (axis == .vertical   ? 2 : 1), 6)
+            guard let grid = GridModel(cols: cols, rows: rows) else { return }
+            let pane = SplitPaneState(id: paneId, pty: nil, grid: grid)
+            splitPaneGrids[paneId] = grid
+            tabs[tabIdx].splitPane = pane
+            tabs[tabIdx].splitAxis = axis
+
+        case .paneClose(let tabId, let paneId):
+            guard sessionManager.role == .peer else { return }
+            guard let tabIdx = tabs.firstIndex(where: { $0.id == tabId }),
+                  tabs[tabIdx].splitPane?.id == paneId
+            else { return }
+            splitPaneGrids.removeValue(forKey: paneId)
+            tabs[tabIdx].splitPane = nil
+            tabs[tabIdx].activePaneIndex = 0
+
+        case .panePtyOutput(let paneId, let data):
+            guard sessionManager.role == .peer else { return }
+            splitPaneGrids[paneId]?.feed(Array(data))
+
+        case .paneInput(let paneId, let data):
+            guard sessionManager.role == .host, !data.isEmpty else { return }
+            for tab in tabs {
+                if let pane = tab.splitPane, pane.id == paneId, let pty = pane.pty {
+                    pty.send(Array(data))
+                    return
+                }
+            }
+
+        case .paneCursorPos(let identity, let paneId, let col, let row):
+            guard identity != sessionManager.localIdentity,
+                  let participant = sessionManager.participants.first(where: { $0.identity == identity }),
+                  let grid = splitPaneGrids[paneId]
+            else { return }
+            grid.upsertPeerCursor(
+                id: identity.uuidValue, col: col, row: row, color: participant.color)
+            if sessionManager.role == .host {
+                sessionManager.relayPaneCursor(from: identity, paneId: paneId, col: col, row: row)
+            }
+
         default:
             break
         }
@@ -1544,18 +1922,33 @@ final class TerminalModel: ObservableObject {
             let wasActive = state.isActive
             let preservedAnchor = (state.anchorCol, state.anchorRow)
             let localAnchor = tabs.first(where: { $0.id == tabId })?.grid.term.cursor()
+
+            // If the text is unchanged this snapshot was triggered by a pure
+            // cursor move (arrow keys) on another participant — not an
+            // insert/delete. Preserve the local user's own cursor so optimistic
+            // moves aren't rolled back by another user's navigation.
+            let localId = sessionManager.localIdentity
+            let textUnchanged = snapshot.isActive
+                && state.isActive
+                && snapshot.text == state.text
+            let savedLocalCursor: Int? = textUnchanged
+                ? state.cursors[localId]
+                : nil
+
             state.apply(snapshot)
-            if snapshot.isActive {
-                if wasActive {
-                    state.overrideAnchor(
-                        anchorCol: preservedAnchor.0,
-                        anchorRow: preservedAnchor.1)
-                } else if let localAnchor {
-                    state.overrideAnchor(
-                        anchorCol: localAnchor.x,
-                        anchorRow: localAnchor.y)
-                }
+
+            // Restore local cursor for move-only snapshots (text didn't change).
+            if let saved = savedLocalCursor, state.isActive {
+                state.restoreCursor(for: localId, to: saved)
             }
+
+            // The host's anchor (already applied by state.apply above) is
+            // authoritative: it marks exactly where user input starts on the
+            // prompt line. Overriding it with the local terminal cursor would
+            // place the anchor at the END of any typed text, causing the
+            // overlay to render that text again after what is already visible
+            // in the terminal grid (duplicating the command line content).
+            _ = (wasActive, preservedAnchor, localAnchor) // unused now
             sharedInputs[tabId] = state
             syncGridSharedInputOverlay(tabId: tabId)
             refreshInputAutocomplete()
@@ -1565,6 +1958,10 @@ final class TerminalModel: ObservableObject {
     private func applyAuthoritativeSharedInputRequest(tabId: UInt32,
                                                      _ request: SharedInputRequest)
     {
+        // Any user interaction with the shared input means startup is done
+        // and any future reactivation should resume normal prompt-aware
+        // extraction (e.g. for history recall via ↑).
+        freshlyRespawnedTabs.remove(tabId)
         syncSharedInputParticipants(tabId: tabId, broadcast: false)
         var state = sharedInputs[tabId] ?? SharedInputState()
         if !state.isActive {
@@ -1614,6 +2011,10 @@ final class TerminalModel: ObservableObject {
                let pty = tabs.first(where: { $0.id == tabId })?.pty
             {
                 sharedInputPromptTimers.removeValue(forKey: tabId)?.invalidate()
+                // The shell's readline buffer was cleared with Ctrl+U at
+                // activation time (see activateSharedInputAtCurrentCursor),
+                // so we just send the committed line and Enter.
+                sharedInputNeedsLineClear.remove(tabId)
                 let payload = Array(line.utf8) + [0x0D]
                 pty.send(payload)
             }
@@ -1667,24 +2068,150 @@ final class TerminalModel: ObservableObject {
               sessionManager.state == .running,
               let grid = tabs.first(where: { $0.id == tabId })?.grid,
               !grid.isUsingAlternateScreen
-        else {
-            return
-        }
+        else { return }
+
         syncSharedInputParticipants(tabId: tabId, broadcast: false)
-        let (col, row) = grid.term.cursor()
-        var state = sharedInputs[tabId] ?? SharedInputState()
+        let cursor = grid.term.cursor()
+        let cols   = Int(grid.cols)
+        let existingState = sharedInputs[tabId]
+        var state = existingState ?? SharedInputState()
+
+        // Determine where user-editable input starts on the current prompt line.
+        // Priority 1: saved anchor on the SAME ROW (reliable — set by a prior
+        //   activation, e.g. from history navigation or typing before sharing).
+        // Priority 2: scan the current row for a shell prompt pattern (% $ # >).
+        // Fallback: cursor position — nothing to recover, fresh prompt.
+        // Tabs whose PTY was just respawned have a guaranteed-fresh shell:
+        // the cells before the cursor are the new prompt, never user input.
+        // Skip the prompt-detection / extraction path entirely so we can't
+        // accidentally pull prompt characters into initialText.
+        //
+        // The flag is sticky — we do NOT clear it here. Shell startup emits
+        // output in multiple chunks (zshrc sourcing, prompt redraws), each
+        // of which can trigger handleHostPtyOutput → reschedule a 350 ms
+        // sharedInputPromptTimer that reactivates after this call. Clearing
+        // on the first activation would let a later activation extract the
+        // prompt as initialText. Cleared only when the user actually types
+        // (see appendSharedInputCharacter / sendSharedInputCommit) or when
+        // the session ends.
+        let isFreshShell = freshlyRespawnedTabs.contains(tabId)
+
+        let userInputCol: UInt16
+        if isFreshShell {
+            userInputCol = cursor.x
+        } else if let es = existingState,
+           !es.isActive,
+           es.anchorRow == cursor.y,
+           es.anchorCol < cursor.x,
+           es.textScalars.isEmpty
+        {
+            userInputCol = es.anchorCol
+        } else {
+            userInputCol = shellPromptEnd(onRow: cursor.y, before: cursor.x, grid: grid)
+        }
+
+        let inputLinear  = Int(cursor.y) * cols + Int(userInputCol)
+        let cursorLinear = Int(cursor.y) * cols + Int(cursor.x)
+
+        let anchorCol:   UInt16
+        let anchorRow:   UInt16
+        let initialText: String
+
+        if userInputCol < cursor.x, inputLinear < cursorLinear {
+            // Text already sits between the detected prompt end and the cursor
+            // (typed before sharing started, or recalled via ↑). Read it so
+            // users can arrow through and delete it normally.
+            let snap = grid.snapshot()
+            var extracted = ""
+            for i in inputLinear..<min(cursorLinear, snap.count) {
+                let cell = snap[i]
+                if cell.width == 0 { continue }
+                if cell.codepoint == 0 { extracted.append(" ") }
+                else if let sc = UnicodeScalar(cell.codepoint) { extracted.append(Character(sc)) }
+            }
+            initialText = extracted.replacingOccurrences(
+                of: "\\s+$", with: "", options: .regularExpression)
+            anchorCol = userInputCol
+            anchorRow = cursor.y
+            // Mark this tab so the commit prepends Ctrl+U to clear the shell's
+            // readline buffer (which already holds this text).
+            if !initialText.isEmpty {
+                sharedInputNeedsLineClear.insert(tabId)
+            }
+        } else {
+            initialText = ""
+            anchorCol   = cursor.x
+            anchorRow   = cursor.y
+        }
+
         let changed = state.activate(
-            anchorCol: col,
-            anchorRow: row,
+            anchorCol: anchorCol,
+            anchorRow: anchorRow,
+            initialText: initialText,
             participants: sharedInputParticipants(forTabId: tabId),
             bumpRevision: true)
         sharedInputs[tabId] = state
+
+        // Place all participants at the end of any pre-loaded text so they
+        // start in the natural editing position (after the existing command).
+        if !initialText.isEmpty {
+            let end = state.textScalars.count
+            for identity in sharedInputParticipants(forTabId: tabId) {
+                if sharedInputs[tabId]?.cursors[identity] != nil {
+                    sharedInputs[tabId]?.restoreCursor(for: identity, to: end)
+                }
+            }
+        }
+
         syncGridSharedInputOverlay(tabId: tabId)
-        if broadcast && changed {
-            broadcastSharedInputSnapshot(tabId: tabId)
-        } else if broadcast && state.isActive {
+
+        // After loading existing text into the overlay, clear the shell's
+        // readline buffer so PTY and UI agree: the shell holds the same text
+        // we just loaded (typed before sharing, or recalled via ↑). Ctrl+U
+        // (0x15) kills from cursor to beginning of line. The shell will
+        // redraw the empty input area; preserveSharedInputAcrossTransientOutput
+        // ensures that redraw doesn't tear down the overlay we just set up.
+        // After the redraw the cursor sits at the prompt end and the terminal
+        // cells beyond our overlay are blank, so subsequent backspaces no
+        // longer leave residue from the original (longer) command.
+        if !initialText.isEmpty,
+           let pty = tabs.first(where: { $0.id == tabId })?.pty
+        {
+            preserveSharedInputAcrossTransientOutput(tabId: tabId)
+            pty.send([0x15])
+        }
+
+        if broadcast && (changed || state.isActive) {
             broadcastSharedInputSnapshot(tabId: tabId)
         }
+    }
+
+    /// Scan `row` of the terminal grid up to `before` (the cursor column) and
+    /// return the column right after the last common shell prompt indicator
+    /// ("% ", "$ ", "# ", "> "). Returns `before` if no pattern is found.
+    private func shellPromptEnd(onRow row: UInt16, before col: UInt16,
+                                grid: GridModel) -> UInt16
+    {
+        let snap = grid.snapshot()
+        let cols = Int(grid.cols)
+        let rowStart = Int(row) * cols
+        let limit = min(Int(col), cols)
+        guard rowStart + limit <= snap.count, limit > 0 else { return col }
+
+        var text = ""
+        for c in 0..<limit {
+            let cell = snap[rowStart + c]
+            if cell.codepoint == 0 { text.append(" ") }
+            else if let sc = UnicodeScalar(cell.codepoint) { text.append(Character(sc)) }
+        }
+
+        for pattern in ["% ", "$ ", "# ", "> "] {
+            if let range = text.range(of: pattern, options: .backwards) {
+                let end = text.distance(from: text.startIndex, to: range.upperBound)
+                if end < Int(col) { return UInt16(end) }
+            }
+        }
+        return col
     }
 
     private func syncSharedInputParticipants(broadcast: Bool) {
@@ -1730,6 +2257,7 @@ final class TerminalModel: ObservableObject {
     private func deactivateSharedInput(tabId: UInt32,
                                        bumpRevision: Bool) {
         sharedInputTransientOutputTimers.removeValue(forKey: tabId)?.invalidate()
+        sharedInputNeedsLineClear.remove(tabId)
         var state = sharedInputs[tabId] ?? SharedInputState()
         _ = state.deactivate(bumpRevision: bumpRevision)
         sharedInputs[tabId] = state
@@ -1817,6 +2345,18 @@ final class TerminalModel: ObservableObject {
                 .inputOp(SharedInputCodec.encode(
                     .snapshot(tabId: tab.id, sharedSnapshot))),
                 toTransportPeerID: peerID)
+            // If the tab is currently split, announce the pane and send its content.
+            if let pane = tab.splitPane {
+                sessionManager.sendPaneOpen(
+                    tabId: tab.id, paneId: pane.id, axis: tab.splitAxis,
+                    toTransportPeerID: peerID)
+                let snap = encodeTerminalSnapshot(from: pane.grid)
+                if !snap.isEmpty {
+                    sessionManager.sendPanePtyOutput(
+                        paneId: pane.id, data: Data(snap),
+                        toTransportPeerID: peerID)
+                }
+            }
         }
         if let activeId = activeTabId {
             sessionManager.sendTabFocus(
@@ -2384,6 +2924,10 @@ private enum TabTitleResolver {
             }
         }
         return sanitizedTitle(name)
+    }
+
+    static func cwd(pid: Int32) -> String? {
+        currentDirectoryPath(pid: pid)
     }
 
     private static func currentDirectoryPath(pid: Int32) -> String? {

@@ -185,6 +185,7 @@ struct SharedInputState {
 
     mutating func activate(anchorCol: UInt16,
                            anchorRow: UInt16,
+                           initialText: String = "",
                            participants: [UserIdentity],
                            bumpRevision: Bool = true) -> Bool
     {
@@ -192,7 +193,13 @@ struct SharedInputState {
         isActive = true
         self.anchorCol = anchorCol
         self.anchorRow = anchorRow
-        if syncParticipants(participants) {
+        // Pre-populate text when the caller recovered content from the
+        // terminal grid (e.g. after history navigation with ↑).
+        if !initialText.isEmpty && textScalars.isEmpty {
+            textScalars = Array(initialText.unicodeScalars)
+            changed = true
+        }
+        if syncParticipants(participants, bumpRevision: false) {
             changed = true
         }
         if changed && bumpRevision {
@@ -332,6 +339,14 @@ struct SharedInputState {
         guard isActive else { return }
         self.anchorCol = anchorCol
         self.anchorRow = anchorRow
+    }
+
+    /// Restore one participant's cursor to a previously saved offset, clamped
+    /// to the current text length. Used by peers to prevent cursor rollback
+    /// when a move-only snapshot (no text change) arrives from the host.
+    mutating func restoreCursor(for identity: UserIdentity, to offset: Int) {
+        guard isActive else { return }
+        cursors[identity] = min(max(0, offset), textScalars.count)
     }
 
     func snapshot(participants: [UserIdentity]) -> SharedInputSnapshot {

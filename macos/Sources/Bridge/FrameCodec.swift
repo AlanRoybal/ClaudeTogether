@@ -30,6 +30,17 @@ enum FrameTag: UInt8 {
     case tabClose     = 0x18
     case tabFocus     = 0x19
     case tabPtyOutput = 0x1A
+    // Split-pane frames (0x1B..0x1F).
+    // paneOpen:      tabId:u32 | paneId:u32 | axis:u8
+    // paneClose:     tabId:u32 | paneId:u32
+    // panePtyOutput: paneId:u32 | len:u32 | data
+    // paneInput:     paneId:u32 | len:u32 | data
+    // paneCursorPos: identity:16 | paneId:u32 | col:u16 | row:u16
+    case paneOpen      = 0x1B
+    case paneClose     = 0x1C
+    case panePtyOutput = 0x1D
+    case paneInput     = 0x1E
+    case paneCursorPos = 0x1F
 }
 
 enum SessionRole: UInt8 {
@@ -131,6 +142,17 @@ enum Frame {
     case tabFocus(tabId: UInt32)
     case tabPtyOutput(tabId: UInt32, data: Data)
     case tabInput(tabId: UInt32, data: Data)
+    case paneOpen(tabId: UInt32, paneId: UInt32, axis: SplitAxis)
+    case paneClose(tabId: UInt32, paneId: UInt32)
+    case panePtyOutput(paneId: UInt32, data: Data)
+    case paneInput(paneId: UInt32, data: Data)
+    case paneCursorPos(UserIdentity, paneId: UInt32, col: UInt16, row: UInt16)
+}
+
+/// Which direction a split divides the terminal viewport.
+enum SplitAxis: UInt8 {
+    case horizontal = 0  // two panes side-by-side (left | right)
+    case vertical   = 1  // two panes stacked (top / bottom)
 }
 
 enum FrameCodecError: Error {
@@ -257,6 +279,31 @@ enum FrameCodec {
             appendU32(&out, tabId)
             appendU32(&out, UInt32(data.count))
             out.append(data)
+        case .paneOpen(let tabId, let paneId, let axis):
+            out.append(FrameTag.paneOpen.rawValue)
+            appendU32(&out, tabId)
+            appendU32(&out, paneId)
+            out.append(axis.rawValue)
+        case .paneClose(let tabId, let paneId):
+            out.append(FrameTag.paneClose.rawValue)
+            appendU32(&out, tabId)
+            appendU32(&out, paneId)
+        case .panePtyOutput(let paneId, let data):
+            out.append(FrameTag.panePtyOutput.rawValue)
+            appendU32(&out, paneId)
+            appendU32(&out, UInt32(data.count))
+            out.append(data)
+        case .paneInput(let paneId, let data):
+            out.append(FrameTag.paneInput.rawValue)
+            appendU32(&out, paneId)
+            appendU32(&out, UInt32(data.count))
+            out.append(data)
+        case .paneCursorPos(let id, let paneId, let col, let row):
+            out.append(FrameTag.paneCursorPos.rawValue)
+            out.append(contentsOf: id.bytes)
+            appendU32(&out, paneId)
+            appendU16(&out, col)
+            appendU16(&out, row)
         }
         return out
     }
@@ -407,6 +454,34 @@ enum FrameCodec {
             let n = try r.readU32()
             let payload = try r.readBytes(Int(n))
             return .tabInput(tabId: tabId, data: payload)
+        case .paneOpen:
+            let tabId = try r.readU32()
+            let paneId = try r.readU32()
+            let axisByte = try r.readU8()
+            guard let axis = SplitAxis(rawValue: axisByte) else {
+                throw FrameCodecError.invalidEnum
+            }
+            return .paneOpen(tabId: tabId, paneId: paneId, axis: axis)
+        case .paneClose:
+            let tabId = try r.readU32()
+            let paneId = try r.readU32()
+            return .paneClose(tabId: tabId, paneId: paneId)
+        case .panePtyOutput:
+            let paneId = try r.readU32()
+            let n = try r.readU32()
+            let payload = try r.readBytes(Int(n))
+            return .panePtyOutput(paneId: paneId, data: payload)
+        case .paneInput:
+            let paneId = try r.readU32()
+            let n = try r.readU32()
+            let payload = try r.readBytes(Int(n))
+            return .paneInput(paneId: paneId, data: payload)
+        case .paneCursorPos:
+            let id = try UserIdentity.from(exactly16: Array(try r.readBytes(16)))
+            let paneId = try r.readU32()
+            let col = try r.readU16()
+            let row = try r.readU16()
+            return .paneCursorPos(id, paneId: paneId, col: col, row: row)
         }
     }
 

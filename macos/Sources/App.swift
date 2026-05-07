@@ -24,19 +24,22 @@ struct CoTTYApp: App {
         .commands {
             // File menu: standard Mac terminal session lifecycle and tabs.
             CommandGroup(replacing: .newItem) {
-                Button("New Session") { model.startSession() }
-                    .keyboardShortcut("n", modifiers: .command)
-
                 Button("New Tab") { model.openNewTab() }
-                .keyboardShortcut("t", modifiers: .command)
+                    .keyboardShortcut("t", modifiers: .command)
 
                 Button("Close Tab") { model.closeActiveTab() }
-                .keyboardShortcut("w", modifiers: .command)
-                .disabled(model.tabs.isEmpty)
+                    .keyboardShortcut("w", modifiers: .command)
+                    .disabled(model.tabs.isEmpty)
 
                 Divider()
 
-                Button("Close Session") { model.endSession() }
+                Button("Choose Project Folder…") { model.pickProjectFolder() }
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
+                    .disabled(model.sessionManager.state == .running)
+
+                Divider()
+
+                Button("End Session") { model.endSession() }
                     .keyboardShortcut("w", modifiers: [.command, .shift])
                     .disabled(!model.hasActiveSession)
 
@@ -47,6 +50,37 @@ struct CoTTYApp: App {
 
                 Button("Show Previous Tab") { model.previousTab() }
                 .keyboardShortcut("[", modifiers: [.command, .shift])
+
+                Divider()
+
+                Button("Split Pane Horizontally") {
+                    NotificationCenter.default.post(name: .ctPaneSplitH, object: nil)
+                }
+                .keyboardShortcut("d", modifiers: .command)
+                .disabled(model.sessionManager.role != .host
+                          || model.activeTabForView?.splitPane != nil
+                          || model.tabs.isEmpty)
+
+                Button("Split Pane Vertically") {
+                    NotificationCenter.default.post(name: .ctPaneSplitV, object: nil)
+                }
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+                .disabled(model.sessionManager.role != .host
+                          || model.activeTabForView?.splitPane != nil
+                          || model.tabs.isEmpty)
+
+                Button("Close Split Pane") {
+                    NotificationCenter.default.post(name: .ctPaneClose, object: nil)
+                }
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+                .disabled(model.sessionManager.role != .host
+                          || model.activeTabForView?.splitPane == nil)
+
+                Button("Focus Next Pane") {
+                    NotificationCenter.default.post(name: .ctPaneNext, object: nil)
+                }
+                .keyboardShortcut("\t", modifiers: [.command, .option])
+                .disabled(model.activeTabForView?.splitPane == nil)
             }
 
             // Edit menu: clipboard + find. We replace .pasteboard so our
