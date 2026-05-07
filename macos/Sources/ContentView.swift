@@ -1925,14 +1925,71 @@ final class TerminalModel: ObservableObject {
             return
         }
         syncSharedInputParticipants(tabId: tabId, broadcast: false)
-        let (col, row) = grid.term.cursor()
+        let cursor = grid.term.cursor()
         var state = sharedInputs[tabId] ?? SharedInputState()
+
+        // Detect history navigation: the previous anchor (preserved through
+        // deactivate) is to the LEFT of the current cursor on the same row,
+        // and no text is in the shared input yet. Read what the shell placed
+        // between the anchor and the cursor from the terminal grid so users
+        // can delete, arrow through, and edit the recalled command normally.
+        let anchorCol: UInt16
+        let anchorRow: UInt16
+        let initialText: String
+        let cols = Int(grid.cols)
+        let anchorLinear = Int(state.anchorRow) * cols + Int(state.anchorCol)
+        let cursorLinear = Int(cursor.y) * cols + Int(cursor.x)
+        if !state.isActive,
+           state.anchorRow == cursor.y,          // same terminal row
+           anchorLinear < cursorLinear,           // anchor is left of cursor
+           state.textScalars.isEmpty             // no existing shared text
+        {
+            // Extract the text the shell placed on the line between the saved
+            // anchor position and the cursor (the recalled history command).
+            let snap = grid.snapshot()
+            if anchorLinear < snap.count {
+                var extracted = ""
+                for i in anchorLinear..<min(cursorLinear, snap.count) {
+                    let cell = snap[i]
+                    if cell.width == 0 { continue }
+                    let cp = cell.codepoint
+                    if cp == 0 { extracted.append(" ") }
+                    else if let sc = UnicodeScalar(cp) { extracted.append(Character(sc)) }
+                }
+                // Remove trailing padding spaces the terminal fills blank cells with.
+                initialText = extracted.replacingOccurrences(
+                    of: "\\s+$", with: "", options: .regularExpression)
+            } else {
+                initialText = ""
+            }
+            // Keep the saved anchor (start of user-editable area) so the
+            // overlay is positioned correctly over the history command text.
+            anchorCol = state.anchorCol
+            anchorRow = state.anchorRow
+        } else {
+            // Normal activation: fresh prompt, cursor IS the anchor.
+            anchorCol = cursor.x
+            anchorRow = cursor.y
+            initialText = ""
+        }
+
         let changed = state.activate(
-            anchorCol: col,
-            anchorRow: row,
+            anchorCol: anchorCol,
+            anchorRow: anchorRow,
+            initialText: initialText,
             participants: sharedInputParticipants(forTabId: tabId),
             bumpRevision: true)
         sharedInputs[tabId] = state
+        // Move all participants' cursors to the end of the pre-populated text
+        // so they start after the recalled command (natural editing position).
+        if !initialText.isEmpty {
+            let endOffset = state.textScalars.count
+            for identity in sharedInputParticipants(forTabId: tabId) {
+                if sharedInputs[tabId]?.cursors[identity] != nil {
+                    sharedInputs[tabId]?.restoreCursor(for: identity, to: endOffset)
+                }
+            }
+        }
         syncGridSharedInputOverlay(tabId: tabId)
         if broadcast && changed {
             broadcastSharedInputSnapshot(tabId: tabId)

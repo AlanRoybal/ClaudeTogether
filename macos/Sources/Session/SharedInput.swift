@@ -185,6 +185,7 @@ struct SharedInputState {
 
     mutating func activate(anchorCol: UInt16,
                            anchorRow: UInt16,
+                           initialText: String = "",
                            participants: [UserIdentity],
                            bumpRevision: Bool = true) -> Bool
     {
@@ -192,7 +193,13 @@ struct SharedInputState {
         isActive = true
         self.anchorCol = anchorCol
         self.anchorRow = anchorRow
-        if syncParticipants(participants) {
+        // Pre-populate text when the caller recovered content from the
+        // terminal grid (e.g. after history navigation with ↑).
+        if !initialText.isEmpty && textScalars.isEmpty {
+            textScalars = Array(initialText.unicodeScalars)
+            changed = true
+        }
+        if syncParticipants(participants, bumpRevision: false) {
             changed = true
         }
         if changed && bumpRevision {
