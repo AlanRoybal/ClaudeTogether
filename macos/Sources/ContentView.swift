@@ -1864,7 +1864,12 @@ final class TerminalModel: ObservableObject {
                let pty = tabs.first(where: { $0.id == tabId })?.pty
             {
                 sharedInputPromptTimers.removeValue(forKey: tabId)?.invalidate()
-                let payload = Array(line.utf8) + [0x0D]
+                // Ctrl+U (0x15) clears the shell's readline buffer before we
+                // send the committed text. When the user pressed ↑ to recall
+                // a history entry the shell's readline held that text; without
+                // the clear the committed line would be appended to it.
+                // On a fresh empty prompt Ctrl+U is a no-op in bash/zsh.
+                let payload = [0x15 as UInt8] + Array(line.utf8) + [0x0D]
                 pty.send(payload)
             }
         case .interrupt:
@@ -1942,8 +1947,9 @@ final class TerminalModel: ObservableObject {
         let cursorLinear = Int(cursor.y) * cols + Int(cursor.x)
         if existingState != nil,                  // must have a real prior state
            !state.isActive,
-           state.anchorRow == cursor.y,           // same terminal row
-           anchorLinear < cursorLinear,            // anchor is left of cursor
+           cursor.y >= state.anchorRow,           // cursor on same or later row
+           anchorLinear < cursorLinear,            // anchor is linearly before cursor
+           cursorLinear - anchorLinear <= cols * 3, // within 3 rows (handles wrapping)
            state.textScalars.isEmpty              // no existing shared text
         {
             // Extract the text the shell placed on the line between the saved
