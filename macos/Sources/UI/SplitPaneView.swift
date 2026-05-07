@@ -66,6 +66,9 @@ struct SplitPaneView: View {
                 grid: pane.grid,
                 onKey: { bytes in
                     model.setActivePaneIndex(tabId: tab.id, index: 1)
+                    // Broadcast this participant's cursor into the split pane
+                    // so all peers see where each user is typing.
+                    model.broadcastSplitPaneCursor(paneId: pane.id, grid: pane.grid)
                     model.handleKey(bytes, forTabId: tab.id, paneIndex: 1)
                 },
                 onResize: { cols, rows in

@@ -567,27 +567,32 @@ final class TerminalModel: ObservableObject {
     /// Split the active tab's primary pane along `axis`. On the host a new PTY
     /// is spawned; on peers the split is display-only until the host announces
     /// it via a `paneOpen` frame. Ignored if the tab is already split.
+    /// Only the host can split. The split is broadcast to all peers so every
+    /// participant shares the same two terminals side-by-side.
     func splitActivePane(axis: SplitAxis) {
+        guard sessionManager.role == .host else { return }
         guard let activeTabId,
               let idx = tabs.firstIndex(where: { $0.id == activeTabId }),
               tabs[idx].splitPane == nil
         else { return }
 
-        // Split panes are always local-only: each participant gets their own
-        // independent private shell next to the shared primary pane. This
-        // keeps the shared session isolated in pane 0 so peer cursors remain
-        // unique and clearly scoped to the collaborative terminal.
         let paneId = nextPaneId
         nextPaneId &+= 1
+        let tabId  = activeTabId
         let spawnCols = max(tabs[idx].grid.cols / (axis == .horizontal ? 2 : 1), 20)
         let spawnRows = max(tabs[idx].grid.rows / (axis == .vertical   ? 2 : 1), 6)
         guard let grid = GridModel(cols: spawnCols, rows: spawnRows) else { return }
 
-        // Use the session root dir for the host, home dir for peers / solo use.
-        let cwd = rootPath ?? FileManager.default.homeDirectoryForCurrentUser.path
+        guard let cwd = rootPath else { return }
         let p = PTYSession()
-        p.onOutput = { grid.feed($0) }  // local-only: no broadcast
-        p.onExit   = { grid.feed(Array("\r\n[process exited]\r\n".utf8)) }
+        p.onOutput = { [weak self] bytes in
+            guard let self else { return }
+            grid.feed(bytes)
+            if self.sessionManager.state == .running {
+                self.sessionManager.sendPanePtyOutput(paneId: paneId, data: Data(bytes))
+            }
+        }
+        p.onExit = { grid.feed(Array("\r\n[process exited]\r\n".utf8)) }
         guard p.spawn(cwd: cwd, cols: spawnCols, rows: spawnRows) else { return }
 
         let pane = SplitPaneState(id: paneId, pty: p, grid: grid)
@@ -595,12 +600,15 @@ final class TerminalModel: ObservableObject {
         tabs[idx].splitPane = pane
         tabs[idx].splitAxis = axis
         tabs[idx].activePaneIndex = 1
+
+        if sessionManager.state == .running {
+            sessionManager.sendPaneOpen(tabId: tabId, paneId: paneId, axis: axis)
+        }
     }
 
-    /// Close the split pane of the active tab, returning it to a single-pane
-    /// layout. The primary pane retains its PTY and grid state. Does nothing
-    /// if the active tab is not currently split.
+    /// Host only: close the split pane and broadcast the teardown.
     func closeSplitPane() {
+        guard sessionManager.role == .host else { return }
         guard let activeTabId,
               let idx = tabs.firstIndex(where: { $0.id == activeTabId }),
               let pane = tabs[idx].splitPane
@@ -608,8 +616,13 @@ final class TerminalModel: ObservableObject {
 
         pane.pty?.terminate()
         splitPaneGrids.removeValue(forKey: pane.id)
+        let paneId = pane.id
         tabs[idx].splitPane = nil
         tabs[idx].activePaneIndex = 0
+
+        if sessionManager.state == .running {
+            sessionManager.sendPaneClose(tabId: activeTabId, paneId: paneId)
+        }
     }
 
     /// Cycle focus between the primary and split pane of the active tab.
@@ -627,6 +640,19 @@ final class TerminalModel: ObservableObject {
         guard let idx = tabs.firstIndex(where: { $0.id == tabId }) else { return }
         guard tabs[idx].activePaneIndex != index else { return }
         tabs[idx].activePaneIndex = index
+    }
+
+    /// Broadcast the local participant's terminal cursor position inside the
+    /// split pane so every peer can render their unique cursor there.
+    func broadcastSplitPaneCursor(paneId: UInt32, grid: GridModel) {
+        guard sessionManager.state == .running else { return }
+        var col: UInt16 = 0
+        var row: UInt16 = 0
+        if let local = grid.cursors.first(where: { $0.isLocal }) {
+            col = local.col
+            row = local.row
+        }
+        sessionManager.sendPaneCursor(paneId: paneId, col: col, row: row)
     }
 
     /// Resize a specific split pane's grid and PTY independently of the
@@ -1151,12 +1177,16 @@ final class TerminalModel: ObservableObject {
             return
         }
         // Route to the split pane when paneIndex == 1 and the tab is split.
-        // Split pane is always local: route directly to its PTY.
+        // Route to the split pane (host: local PTY; peer: send to host).
         if paneIndex == 1,
            let pane = tabs.first(where: { $0.id == tabId })?.splitPane
         {
             pane.grid.scrollToBottom()
-            pane.pty?.send(bytes)
+            if let pty = pane.pty {
+                pty.send(bytes)
+            } else if sessionManager.role == .peer, sessionManager.state == .running {
+                sessionManager.sendPaneInput(paneId: pane.id, data: Data(bytes))
+            }
             return
         }
         // Primary pane (unchanged behavior).
@@ -1469,9 +1499,55 @@ final class TerminalModel: ObservableObject {
                 closeEditor(docId: docId, broadcast: false)
             }
 
-        // Pane frames are reserved for future use; splits are local-only now.
-        case .paneOpen, .paneClose, .panePtyOutput, .paneInput, .paneCursorPos:
-            break
+        // MARK: split-pane inbound
+        case .paneOpen(let tabId, let paneId, let axis):
+            guard sessionManager.role == .peer else { return }
+            guard let tabIdx = tabs.firstIndex(where: { $0.id == tabId }) else { return }
+            // Replace any stale local split so the host's layout wins.
+            if let existing = tabs[tabIdx].splitPane {
+                existing.pty?.terminate()
+                splitPaneGrids.removeValue(forKey: existing.id)
+            }
+            let cols = max(tabs[tabIdx].grid.cols / (axis == .horizontal ? 2 : 1), 20)
+            let rows = max(tabs[tabIdx].grid.rows / (axis == .vertical   ? 2 : 1), 6)
+            guard let grid = GridModel(cols: cols, rows: rows) else { return }
+            let pane = SplitPaneState(id: paneId, pty: nil, grid: grid)
+            splitPaneGrids[paneId] = grid
+            tabs[tabIdx].splitPane = pane
+            tabs[tabIdx].splitAxis = axis
+
+        case .paneClose(let tabId, let paneId):
+            guard sessionManager.role == .peer else { return }
+            guard let tabIdx = tabs.firstIndex(where: { $0.id == tabId }),
+                  tabs[tabIdx].splitPane?.id == paneId
+            else { return }
+            splitPaneGrids.removeValue(forKey: paneId)
+            tabs[tabIdx].splitPane = nil
+            tabs[tabIdx].activePaneIndex = 0
+
+        case .panePtyOutput(let paneId, let data):
+            guard sessionManager.role == .peer else { return }
+            splitPaneGrids[paneId]?.feed(Array(data))
+
+        case .paneInput(let paneId, let data):
+            guard sessionManager.role == .host, !data.isEmpty else { return }
+            for tab in tabs {
+                if let pane = tab.splitPane, pane.id == paneId, let pty = pane.pty {
+                    pty.send(Array(data))
+                    return
+                }
+            }
+
+        case .paneCursorPos(let identity, let paneId, let col, let row):
+            guard identity != sessionManager.localIdentity,
+                  let participant = sessionManager.participants.first(where: { $0.identity == identity }),
+                  let grid = splitPaneGrids[paneId]
+            else { return }
+            grid.upsertPeerCursor(
+                id: identity.uuidValue, col: col, row: row, color: participant.color)
+            if sessionManager.role == .host {
+                sessionManager.relayPaneCursor(from: identity, paneId: paneId, col: col, row: row)
+            }
 
         default:
             break
@@ -1956,7 +2032,18 @@ final class TerminalModel: ObservableObject {
                 .inputOp(SharedInputCodec.encode(
                     .snapshot(tabId: tab.id, sharedSnapshot))),
                 toTransportPeerID: peerID)
-            // Split panes are local-only and are not included in join snapshots.
+            // If the tab is currently split, announce the pane and send its content.
+            if let pane = tab.splitPane {
+                sessionManager.sendPaneOpen(
+                    tabId: tab.id, paneId: pane.id, axis: tab.splitAxis,
+                    toTransportPeerID: peerID)
+                let snap = encodeTerminalSnapshot(from: pane.grid)
+                if !snap.isEmpty {
+                    sessionManager.sendPanePtyOutput(
+                        paneId: pane.id, data: Data(snap),
+                        toTransportPeerID: peerID)
+                }
+            }
         }
         if let activeId = activeTabId {
             sessionManager.sendTabFocus(
