@@ -194,6 +194,10 @@ final class SessionManager: ObservableObject {
         lastError = nil
         sessionKey = nil
         state = .idle
+        // Always return to host role so the user can start a new session after
+        // leaving a peer session. The role is re-assigned correctly by
+        // startHost() / joinPeer() whenever a new session begins.
+        role = .host
     }
 
     // MARK: bore tunnel (host only)
