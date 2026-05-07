@@ -363,6 +363,56 @@ final class SessionManager: ObservableObject {
         broadcast(.tabInput(tabId: tabId, data: data))
     }
 
+    // MARK: split-pane send helpers
+
+    /// Host only: announce a new split pane inside a tab.
+    func sendPaneOpen(tabId: UInt32, paneId: UInt32, axis: SplitAxis,
+                      toTransportPeerID peerID: UInt32? = nil)
+    {
+        guard role == .host, state == .running else { return }
+        let frame = Frame.paneOpen(tabId: tabId, paneId: paneId, axis: axis)
+        if let peerID { send(frame, toTransportPeerID: peerID) }
+        else { broadcast(frame) }
+    }
+
+    /// Host only: announce that a split pane was closed.
+    func sendPaneClose(tabId: UInt32, paneId: UInt32) {
+        guard role == .host, state == .running else { return }
+        broadcast(.paneClose(tabId: tabId, paneId: paneId))
+    }
+
+    /// Host only: fan PTY output for a specific split pane to peers.
+    func sendPanePtyOutput(paneId: UInt32, data: Data,
+                           toTransportPeerID peerID: UInt32? = nil)
+    {
+        guard role == .host, state == .running, !data.isEmpty else { return }
+        let frame = Frame.panePtyOutput(paneId: paneId, data: data)
+        if let peerID { send(frame, toTransportPeerID: peerID) }
+        else { broadcast(frame) }
+    }
+
+    /// Peer only: send keystrokes for a specific split pane to the host.
+    func sendPaneInput(paneId: UInt32, data: Data) {
+        guard role == .peer, state == .running, !data.isEmpty else { return }
+        guard accessMode == .full else { return }
+        broadcast(.paneInput(paneId: paneId, data: data))
+    }
+
+    /// Broadcast the local user's cursor position within a pane.
+    func sendPaneCursor(paneId: UInt32, col: UInt16, row: UInt16) {
+        guard state == .running else { return }
+        broadcast(.paneCursorPos(localIdentity, paneId: paneId, col: col, row: row))
+    }
+
+    /// Host only: relay a peer's pane cursor update to all peers (including
+    /// the originator, which will filter its own identity on receipt).
+    func relayPaneCursor(from identity: UserIdentity, paneId: UInt32,
+                         col: UInt16, row: UInt16)
+    {
+        guard role == .host, state == .running else { return }
+        broadcast(.paneCursorPos(identity, paneId: paneId, col: col, row: row))
+    }
+
     /// Host only: change the access policy and announce it to all peers.
     /// Persisted via `UserDefaults` so subsequent sessions remember the
     /// last preference. Safe to call before any peer has connected — the

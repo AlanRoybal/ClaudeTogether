@@ -40,29 +40,8 @@ struct ContentView: View {
                     VStack(spacing: 0) {
                         TabStripView(model: model)
                         if let tab = model.activeTabForView {
-                            ZStack(alignment: .topLeading) {
-                                MetalTerminalView(
-                                    grid: tab.grid,
-                                    onKey: { bytes in
-                                        model.handleKey(bytes, forTabId: tab.id)
-                                    },
-                                    onResize: { cols, rows in
-                                        model.handleResize(cols: cols, rows: rows)
-                                    },
-                                    onMouseCell: { col, row in
-                                        model.handleTerminalMouseCell(
-                                            col: col,
-                                            row: row,
-                                            forTabId: tab.id)
-                                    },
-                                    inputEnabled: model.inputEnabled,
-                                    fontSize: model.fontSize,
-                                    mouseModeEnabled: model.mouseMode)
-                                SharedInputAutocompleteOverlay(
-                                    grid: tab.grid,
-                                    autocomplete: model.inputAutocomplete)
-                            }
-                            .frame(minWidth: 500, minHeight: 300)
+                            SplitPaneView(tab: tab, model: model)
+                                .frame(minWidth: 500, minHeight: 300)
                         }
                     }
                 } else {
@@ -94,6 +73,16 @@ struct ContentView: View {
     }
 }
 
+/// A secondary terminal pane created by splitting the primary pane of a tab.
+struct SplitPaneState: Identifiable {
+    /// Unique pane identifier used in wire frames.
+    let id: UInt32
+    /// Host: the PTY backing this pane. Peer: nil (display-only mirror).
+    var pty: PTYSession?
+    /// Render target for this pane. Independent from the primary pane grid.
+    var grid: GridModel
+}
+
 /// One tab in a session. Each tab owns its own grid; on the host each tab
 /// also owns a PTY shell (peer tabs are display-only and have nil pty).
 struct TabState: Identifiable {
@@ -104,6 +93,12 @@ struct TabState: Identifiable {
     /// Render target for this tab. The active tab's grid is the one that
     /// `MetalTerminalView` is currently rendering.
     let grid: GridModel
+    /// Non-nil when this tab has been split into two panes.
+    var splitPane: SplitPaneState? = nil
+    /// Whether the split is side-by-side or stacked.
+    var splitAxis: SplitAxis = .horizontal
+    /// 0 = primary pane, 1 = split pane. Determines where keystrokes go.
+    var activePaneIndex: Int = 0
 }
 
 extension Notification.Name {
@@ -111,6 +106,10 @@ extension Notification.Name {
     static let ctTabsClose = Notification.Name("ct.tabs.close")
     static let ctTabsNext = Notification.Name("ct.tabs.next")
     static let ctTabsPrevious = Notification.Name("ct.tabs.previous")
+    static let ctPaneSplitH = Notification.Name("ct.pane.splitH")
+    static let ctPaneSplitV = Notification.Name("ct.pane.splitV")
+    static let ctPaneClose = Notification.Name("ct.pane.close")
+    static let ctPaneNext = Notification.Name("ct.pane.next")
 }
 
 @MainActor
@@ -185,6 +184,14 @@ final class TerminalModel: ObservableObject {
     }
     var activeTabForView: TabState? { activeTab }
     private var nextTabId: UInt32 = 1
+    /// Pane IDs start above the tab-ID range so they never collide on the wire.
+    private var nextPaneId: UInt32 = 10_000
+    /// Tracks which pane ID each participant is currently focused in, for
+    /// routing paneCursorPos updates to the correct GridModel.
+    private var participantFocusedPane: [UserIdentity: UInt32] = [:]
+    /// paneId → the grid that owns it (split pane grids only; primary pane
+    /// grids are looked up via the TabState they belong to).
+    private var splitPaneGrids: [UInt32: GridModel] = [:]
 
     /// Keep the tab strip visible from the first tab onward so adding the
     /// second tab does not shrink the terminal viewport and drop visible
@@ -291,6 +298,26 @@ final class TerminalModel: ObservableObject {
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.previousTab() }
         }
+        NotificationCenter.default.addObserver(
+            forName: .ctPaneSplitH, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.splitActivePane(axis: .horizontal) }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .ctPaneSplitV, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.splitActivePane(axis: .vertical) }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .ctPaneClose, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.closeSplitPane() }
+        }
+        NotificationCenter.default.addObserver(
+            forName: .ctPaneNext, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.focusNextPane() }
+        }
     }
 
     private var cancellables = Set<AnyCancellable>()
@@ -371,10 +398,14 @@ final class TerminalModel: ObservableObject {
     func endSession() {
         for tab in tabs {
             tab.pty?.terminate()
+            tab.splitPane?.pty?.terminate()
         }
         tabs.removeAll()
         activeTabId = nil
         nextTabId = 1
+        nextPaneId = 10_000
+        splitPaneGrids.removeAll()
+        participantFocusedPane.removeAll()
         participantFocusedTab.removeAll()
         for timer in sharedInputTransientOutputTimers.values {
             timer.invalidate()
@@ -529,6 +560,104 @@ final class TerminalModel: ObservableObject {
         let count = tabs.count
         let prev = tabs[(idx - 1 + count) % count]
         focusTab(id: prev.id)
+    }
+
+    // MARK: panes
+
+    /// Split the active tab's primary pane along `axis`. On the host a new PTY
+    /// is spawned; on peers the split is display-only until the host announces
+    /// it via a `paneOpen` frame. Ignored if the tab is already split.
+    func splitActivePane(axis: SplitAxis) {
+        guard let activeTabId,
+              let idx = tabs.firstIndex(where: { $0.id == activeTabId }),
+              tabs[idx].splitPane == nil
+        else { return }
+
+        let paneId = nextPaneId
+        nextPaneId &+= 1
+        let tabId = activeTabId
+        let cols = tabs[idx].grid.cols / (axis == .horizontal ? 2 : 1)
+        let rows = tabs[idx].grid.rows / (axis == .vertical ? 2 : 1)
+        guard let grid = GridModel(cols: max(cols, 20), rows: max(rows, 6))
+        else { return }
+
+        var pty: PTYSession? = nil
+        if sessionManager.role == .host, let cwd = rootPath {
+            let p = PTYSession()
+            let spawnCols = max(cols, 20)
+            let spawnRows = max(rows, 6)
+            p.onOutput = { [weak self] bytes in
+                guard let self = self else { return }
+                grid.feed(bytes)
+                if self.sessionManager.state == .running {
+                    self.sessionManager.sendPanePtyOutput(
+                        paneId: paneId, data: Data(bytes))
+                }
+            }
+            p.onExit = { grid.feed(Array("\r\n[process exited]\r\n".utf8)) }
+            guard p.spawn(cwd: cwd, cols: spawnCols, rows: spawnRows) else { return }
+            pty = p
+        }
+
+        let pane = SplitPaneState(id: paneId, pty: pty, grid: grid)
+        splitPaneGrids[paneId] = grid
+        tabs[idx].splitPane = pane
+        tabs[idx].splitAxis = axis
+        tabs[idx].activePaneIndex = 1  // focus the new pane
+
+        if sessionManager.role == .host, sessionManager.state == .running {
+            sessionManager.sendPaneOpen(tabId: tabId, paneId: paneId, axis: axis)
+        }
+    }
+
+    /// Close the split pane of the active tab, returning it to a single-pane
+    /// layout. The primary pane retains its PTY and grid state. Does nothing
+    /// if the active tab is not currently split.
+    func closeSplitPane() {
+        guard let activeTabId,
+              let idx = tabs.firstIndex(where: { $0.id == activeTabId }),
+              let pane = tabs[idx].splitPane
+        else { return }
+
+        pane.pty?.terminate()
+        splitPaneGrids.removeValue(forKey: pane.id)
+        let paneId = pane.id
+        tabs[idx].splitPane = nil
+        tabs[idx].activePaneIndex = 0
+
+        if sessionManager.role == .host, sessionManager.state == .running {
+            sessionManager.sendPaneClose(tabId: activeTabId, paneId: paneId)
+        }
+    }
+
+    /// Cycle focus between the primary and split pane of the active tab.
+    func focusNextPane() {
+        guard let activeTabId,
+              let idx = tabs.firstIndex(where: { $0.id == activeTabId }),
+              tabs[idx].splitPane != nil
+        else { return }
+        tabs[idx].activePaneIndex = tabs[idx].activePaneIndex == 0 ? 1 : 0
+    }
+
+    /// Update which pane is active locally (called from the `onKey` closures
+    /// so clicking / typing in a pane makes it the target).
+    func setActivePaneIndex(tabId: UInt32, index: Int) {
+        guard let idx = tabs.firstIndex(where: { $0.id == tabId }) else { return }
+        guard tabs[idx].activePaneIndex != index else { return }
+        tabs[idx].activePaneIndex = index
+    }
+
+    /// Resize a specific split pane's grid and PTY independently of the
+    /// primary pane. Called from the split pane's `MetalTerminalView.onResize`.
+    func handleSplitPaneResize(tabId: UInt32, paneId: UInt32,
+                               cols: UInt16, rows: UInt16)
+    {
+        guard let idx = tabs.firstIndex(where: { $0.id == tabId }),
+              tabs[idx].splitPane?.id == paneId
+        else { return }
+        let pane = tabs[idx].splitPane!
+        pane.pty?.resize(cols: cols, rows: rows)
+        pane.grid.resize(cols: cols, rows: rows, preserveTop: true)
     }
 
     private func makeHostTab(id: UInt32,
@@ -1029,7 +1158,7 @@ final class TerminalModel: ObservableObject {
     /// Called by MetalTerminalView when the user types. The tab id is
     /// supplied so each per-tab view writes only to its own PTY — no central
     /// "active session" lookup that could leak keystrokes across tabs.
-    func handleKey(_ bytes: [UInt8], forTabId tabId: UInt32) {
+    func handleKey(_ bytes: [UInt8], forTabId tabId: UInt32, paneIndex: Int = 0) {
         guard tabId == activeTabId else { return }
         startPendingHostTabIfNeeded(tabId: tabId)
         // View-only enforcement: the MetalTerminalNSView already gates via
@@ -1039,6 +1168,21 @@ final class TerminalModel: ObservableObject {
             NSSound.beep()
             return
         }
+        // Route to the split pane when paneIndex == 1 and the tab is split.
+        if paneIndex == 1,
+           let pane = tabs.first(where: { $0.id == tabId })?.splitPane
+        {
+            pane.grid.scrollToBottom()
+            if let pty = pane.pty {
+                pty.send(bytes)
+                return
+            }
+            if sessionManager.role == .peer, sessionManager.state == .running {
+                sessionManager.sendPaneInput(paneId: pane.id, data: Data(bytes))
+            }
+            return
+        }
+        // Primary pane (unchanged behavior).
         tabs.first(where: { $0.id == tabId })?.grid.scrollToBottom()
         if handleSharedInputKey(bytes, tabId: tabId) {
             return
@@ -1271,6 +1415,19 @@ final class TerminalModel: ObservableObject {
                   let pty = tab.pty
             else { return }
             pty.send(Array(data))
+        case .cursorPos(let identity, let col, let row):
+            // Update the peer's cursor in the active tab's primary pane grid.
+            guard identity != sessionManager.localIdentity,
+                  let participant = sessionManager.participants.first(where: { $0.identity == identity }),
+                  let grid = tabs.first(where: { $0.id == activeTabId })?.grid
+            else { return }
+            grid.upsertPeerCursor(
+                id: identity.uuidValue,
+                col: col, row: row,
+                color: participant.color)
+            if sessionManager.role == .host {
+                sessionManager.broadcast(.cursorPos(identity, col: col, row: row))
+            }
         case .fsDelta(let delta):
             guard sessionManager.role == .peer else { return }
             fileSyncApplier.apply(delta)
@@ -1334,6 +1491,69 @@ final class TerminalModel: ObservableObject {
             } else {
                 closeEditor(docId: docId, broadcast: false)
             }
+
+        // MARK: split-pane inbound
+        case .paneOpen(let tabId, let paneId, let axis):
+            guard sessionManager.role == .peer else { return }
+            guard let tabIdx = tabs.firstIndex(where: { $0.id == tabId }),
+                  tabs[tabIdx].splitPane == nil
+            else { return }
+            let cols = tabs[tabIdx].grid.cols / (axis == .horizontal ? 2 : 1)
+            let rows = tabs[tabIdx].grid.rows / (axis == .vertical ? 2 : 1)
+            guard let grid = GridModel(cols: max(cols, 20), rows: max(rows, 6))
+            else { return }
+            let pane = SplitPaneState(id: paneId, pty: nil, grid: grid)
+            splitPaneGrids[paneId] = grid
+            tabs[tabIdx].splitPane = pane
+            tabs[tabIdx].splitAxis = axis
+
+        case .paneClose(let tabId, let paneId):
+            guard sessionManager.role == .peer else { return }
+            guard let tabIdx = tabs.firstIndex(where: { $0.id == tabId }),
+                  tabs[tabIdx].splitPane?.id == paneId
+            else { return }
+            splitPaneGrids.removeValue(forKey: paneId)
+            tabs[tabIdx].splitPane = nil
+            tabs[tabIdx].activePaneIndex = 0
+
+        case .panePtyOutput(let paneId, let data):
+            guard sessionManager.role == .peer else { return }
+            if let grid = splitPaneGrids[paneId] {
+                grid.feed(Array(data))
+            }
+
+        case .paneInput(let paneId, let data):
+            guard sessionManager.role == .host, !data.isEmpty else { return }
+            for tab in tabs {
+                if let pane = tab.splitPane, pane.id == paneId, let pty = pane.pty {
+                    pty.send(Array(data))
+                    return
+                }
+            }
+
+        case .paneCursorPos(let identity, let paneId, let col, let row):
+            participantFocusedPane[identity] = paneId
+            // Update the cursor in the grid that owns this pane.
+            let targetGrid: GridModel?
+            if let splitGrid = splitPaneGrids[paneId] {
+                targetGrid = splitGrid
+            } else {
+                targetGrid = tabs.first(where: { $0.id == paneId })?.grid
+            }
+            if let grid = targetGrid,
+               let participant = sessionManager.participants.first(where: { $0.identity == identity }),
+               identity != sessionManager.localIdentity
+            {
+                grid.upsertPeerCursor(
+                    id: identity.uuidValue,
+                    col: col, row: row,
+                    color: participant.color)
+            }
+            // Host relays cursor updates so all peers see each other.
+            if sessionManager.role == .host {
+                sessionManager.relayPaneCursor(from: identity, paneId: paneId, col: col, row: row)
+            }
+
         default:
             break
         }
@@ -1817,6 +2037,21 @@ final class TerminalModel: ObservableObject {
                 .inputOp(SharedInputCodec.encode(
                     .snapshot(tabId: tab.id, sharedSnapshot))),
                 toTransportPeerID: peerID)
+            // Announce any active split pane and send its current content.
+            if let pane = tab.splitPane {
+                sessionManager.sendPaneOpen(
+                    tabId: tab.id,
+                    paneId: pane.id,
+                    axis: tab.splitAxis,
+                    toTransportPeerID: peerID)
+                let paneBytes = encodeTerminalSnapshot(from: pane.grid)
+                if !paneBytes.isEmpty {
+                    sessionManager.sendPanePtyOutput(
+                        paneId: pane.id,
+                        data: Data(paneBytes),
+                        toTransportPeerID: peerID)
+                }
+            }
         }
         if let activeId = activeTabId {
             sessionManager.sendTabFocus(
