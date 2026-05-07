@@ -45,17 +45,12 @@ struct ContentView: View {
                         }
                     }
                 } else {
-                    VStack(spacing: 16) {
-                        Text("CoTTY")
-                            .font(.largeTitle)
-                            .bold()
-                        Text("Host: pick a folder to start a session.\nPeer: join a shared session from the sidebar.")
-                            .multilineTextAlignment(.center)
-                            .foregroundStyle(.secondary)
-                        Button("Choose folder…") { model.startSession() }
-                            .controlSize(.large)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    // Tabs are empty — auto-open the initial terminal. This
+                    // state is only visible briefly on first launch or after a
+                    // peer session ends while the tab is being created.
+                    Color.clear
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .onAppear { model.openInitialTab() }
                 }
 
                 if model.activeEditor == nil, model.showRawBanner {
@@ -382,18 +377,38 @@ final class TerminalModel: ObservableObject {
 
     // MARK: host session
 
-    func startSession() {
-        guard let folder = FolderPicker.pick() else { return }
-        rootPath = folder
-        fileSyncWatcher = nil
-        fileSyncApplier.configure(rootPath: nil)
-        // Default to one tab so the single-session UX matches the pre-tabs
-        // experience. Subsequent tabs are user-initiated (⌘T / +).
-        openNewTab()
+    /// Open a terminal at the home directory without requiring a project folder.
+    /// Called automatically on launch and whenever the tab list becomes empty.
+    func openInitialTab() {
+        guard sessionManager.role == .host, tabs.isEmpty else { return }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let tabId = nextTabId
+        nextTabId &+= 1
+        let title = TabTitleResolver.initialTitle(cwd: home, sessionRootPath: nil)
+        let shouldDefer = lastKnownTerminalGridSize == nil
+        guard let tab = makeHostTab(id: tabId, title: title, cwd: home,
+                                    spawnImmediately: !shouldDefer)
+        else { return }
+        tabs.append(tab)
+        if shouldDefer { pendingHostTabStartCwds[tabId] = home }
+        activeTabId = tabId
+        recordLocalTabFocus(tabId, broadcast: false)
         startTitlePolling()
         startModeProbe()
         syncAllGridSharedInputOverlays()
     }
+
+    /// Let the host choose a project root folder for file sync. Does not open
+    /// a new terminal tab. Required before starting a shared session.
+    func pickProjectFolder() {
+        guard let folder = FolderPicker.pick() else { return }
+        rootPath = folder
+        fileSyncWatcher = nil
+        fileSyncApplier.configure(rootPath: nil)
+    }
+
+    /// Kept for call-sites that still reference startSession by name.
+    func startSession() { pickProjectFolder() }
 
     func endSession() {
         for tab in tabs {
@@ -426,19 +441,17 @@ final class TerminalModel: ObservableObject {
         stopFileSyncPolling()
         fileSyncApplier.configure(rootPath: nil)
         resetSharedInputState()
+        // Reopen a terminal at home so the user is never left with a blank window.
+        openInitialTab()
     }
 
     // MARK: tabs
 
-    /// Host: spawn a new PTY at the current rootPath, allocate a tab id,
-    /// broadcast TabOpen + TabFocus, and switch to the new tab.
+    /// Host: spawn a new PTY, allocate a tab id, broadcast TabOpen + TabFocus,
+    /// and switch to the new tab. Uses rootPath when set; falls back to home.
     func openNewTab() {
         guard sessionManager.role == .host else { return }
-        guard let folder = rootPath ?? activeTab.flatMap({ _ in rootPath }) else {
-            // No session yet — bootstrap one.
-            startSession()
-            return
-        }
+        let folder = rootPath ?? FileManager.default.homeDirectoryForCurrentUser.path
         let tabId = nextTabId
         nextTabId &+= 1
         let title = TabTitleResolver.initialTitle(
@@ -583,7 +596,7 @@ final class TerminalModel: ObservableObject {
         let spawnRows = max(tabs[idx].grid.rows / (axis == .vertical   ? 2 : 1), 6)
         guard let grid = GridModel(cols: spawnCols, rows: spawnRows) else { return }
 
-        guard let cwd = rootPath else { return }
+        let cwd = rootPath ?? FileManager.default.homeDirectoryForCurrentUser.path
         let p = PTYSession()
         p.onOutput = { [weak self] bytes in
             guard let self else { return }
@@ -1050,6 +1063,13 @@ final class TerminalModel: ObservableObject {
     // MARK: sharing
 
     func startSharing() {
+        // Sharing requires an explicit project root for file sync. If none has
+        // been chosen yet, prompt the user before proceeding.
+        if rootPath == nil {
+            guard let folder = FolderPicker.pick() else { return }
+            rootPath = folder
+            fileSyncApplier.configure(rootPath: nil)
+        }
         let size = currentTerminalGridSize()
         startPendingHostTabs(cols: size.cols, rows: size.rows)
         sessionManager.startHost()

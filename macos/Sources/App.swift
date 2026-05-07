@@ -24,19 +24,22 @@ struct CoTTYApp: App {
         .commands {
             // File menu: standard Mac terminal session lifecycle and tabs.
             CommandGroup(replacing: .newItem) {
-                Button("New Session") { model.startSession() }
-                    .keyboardShortcut("n", modifiers: .command)
-
                 Button("New Tab") { model.openNewTab() }
-                .keyboardShortcut("t", modifiers: .command)
+                    .keyboardShortcut("t", modifiers: .command)
 
                 Button("Close Tab") { model.closeActiveTab() }
-                .keyboardShortcut("w", modifiers: .command)
-                .disabled(model.tabs.isEmpty)
+                    .keyboardShortcut("w", modifiers: .command)
+                    .disabled(model.tabs.isEmpty)
 
                 Divider()
 
-                Button("Close Session") { model.endSession() }
+                Button("Choose Project Folder…") { model.pickProjectFolder() }
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
+                    .disabled(model.sessionManager.state == .running)
+
+                Divider()
+
+                Button("End Session") { model.endSession() }
                     .keyboardShortcut("w", modifiers: [.command, .shift])
                     .disabled(!model.hasActiveSession)
 
