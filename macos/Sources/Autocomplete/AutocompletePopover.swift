@@ -64,6 +64,68 @@ final class AutocompleteState: ObservableObject {
     }
 }
 
+/// Renders completion hints one row below the shared-input cursor, styled as
+/// plain terminal output — like zsh/bash Tab completion display.
+/// Dismissed by a second Tab or when typing narrows to zero matches.
+struct SharedInputCompletionHintsOverlay: View {
+    @ObservedObject var grid: GridModel
+    @ObservedObject var autocomplete: AutocompleteState
+
+    var body: some View {
+        GeometryReader { geo in
+            if autocomplete.visible,
+               !autocomplete.items.isEmpty,
+               let local = grid.cursors.first(where: { $0.isLocal })
+            {
+                let cols = max(CGFloat(grid.cols), 1)
+                let rows = max(CGFloat(grid.rows), 1)
+                let cellW = geo.size.width / cols
+                let cellH = geo.size.height / rows
+                // One row below the cursor — same as zsh Tab display
+                let y = CGFloat(local.row + 1) * cellH
+
+                completionLine(cellW: cellW, cellH: cellH, width: geo.size.width)
+                    .offset(x: 0, y: y)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func completionLine(cellW: CGFloat, cellH: CGFloat, width: CGFloat) -> some View {
+        let colWidth = max(1, Int(width / cellW))
+        // Compute column width: longest item + 2-space gap, at least 8
+        let maxLen = autocomplete.items.prefix(50).map(\.count).max() ?? 0
+        let itemCols = max(8, maxLen + 2)
+        let perRow = max(1, colWidth / itemCols)
+        let displayItems = Array(autocomplete.items.prefix(50))
+        let overflow = autocomplete.items.count > 50
+
+        return VStack(alignment: .leading, spacing: 0) {
+            let rows = stride(from: 0, to: displayItems.count, by: perRow).map {
+                Array(displayItems[$0 ..< min($0 + perRow, displayItems.count)])
+            }
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, rowItems in
+                HStack(spacing: 0) {
+                    ForEach(Array(rowItems.enumerated()), id: \.offset) { _, item in
+                        Text(item)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundColor(.primary)
+                            .frame(width: CGFloat(itemCols) * cellW, alignment: .leading)
+                    }
+                }
+                .frame(height: cellH)
+            }
+            if overflow {
+                Text("… \(autocomplete.items.count - 50) more")
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(.primary.opacity(0.6))
+                    .frame(height: cellH)
+            }
+        }
+        .frame(width: width, alignment: .leading)
+    }
+}
+
 /// SwiftUI suggestion list. The caller positions it (typically with
 /// `.position` or `.offset`) — this view only draws the list and tracks
 /// selection through the bound `AutocompleteState`.

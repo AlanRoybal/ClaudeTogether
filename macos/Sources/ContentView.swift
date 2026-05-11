@@ -235,8 +235,9 @@ final class TerminalModel: ObservableObject {
     /// shared input mutates; consumed by ContentView's overlay.
     let inputAutocomplete = AutocompleteState()
 
-    /// Cap on the number of history suggestions surfaced at once.
-    private static let inputAutocompleteMaxItems = 5
+    /// CWD used for the currently-visible filesystem completion hints.
+    /// Non-nil iff filesystem hints are showing; nil otherwise.
+    private var filesystemCompletionCwd: String?
 
     /// Terminal text point size. Driven by the View menu (⌘+/⌘-/⌘0).
     /// `MetalTerminalView` observes this and rebuilds the GlyphAtlas when
@@ -1323,9 +1324,26 @@ final class TerminalModel: ObservableObject {
     func stopSharing() {
         stopFileSyncPolling()
         sessionManager.stop()
+        // Deactivate jail before spawning so new shells don't inherit ZDOTDIR/CT_SESSION_ROOT
+        let wasJailed = SessionRootJail.activeRoot != nil
+        SessionRootJail.deactivate()
+        // Respawn any live PTYs at home so they escape the session-root jail.
+        // Mirrors what session-start does (respawn into root) but in reverse.
+        if wasJailed {
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            for tab in tabs {
+                if let pty = tab.pty, pty.pid > 0 {
+                    respawnPty(pty: pty, grid: tab.grid, root: home,
+                               notice: "[CoTTY] session ended — returning to home")
+                }
+                if let pane = tab.splitPane, let pty = pane.pty, pty.pid > 0 {
+                    respawnPty(pty: pty, grid: pane.grid, root: home,
+                               notice: "[CoTTY] session ended — returning to home")
+                }
+            }
+        }
         resetSharedInputState()
         freshlyRespawnedTabs.removeAll()
-        SessionRootJail.deactivate()
     }
 
     /// Walk every host PTY (primary + split panes) and respawn any whose
@@ -1941,31 +1959,18 @@ final class TerminalModel: ObservableObject {
     }
 
     private func handleSharedInputKey(_ bytes: [UInt8], tabId: UInt32) -> Bool {
-        if (canUseHostSharedInput(tabId: tabId) || canUsePeerSharedInput(tabId: tabId)),
-           inputAutocomplete.visible
+        // Tab: filesystem completion (or dismiss existing hints on second Tab)
+        if bytes == [0x09],
+           canUseHostSharedInput(tabId: tabId) || canUsePeerSharedInput(tabId: tabId)
         {
-            switch bytes {
-            case [0x09]:
-                acceptInputAutocompleteSelection(tabId: tabId)
-                return true
-            case [0x1B]:
+            if inputAutocomplete.visible {
                 inputAutocomplete.dismiss()
-                return true
-            case Array("\u{1B}[A".utf8):
-                inputAutocomplete.moveSelection(by: -1)
-                return true
-            case Array("\u{1B}[B".utf8):
-                inputAutocomplete.moveSelection(by: +1)
-                return true
-            case [0x0D]:
-                if inputAutocomplete.userHasNavigated {
-                    acceptInputAutocompleteSelection(tabId: tabId)
-                }
-            default:
-                break
+                filesystemCompletionCwd = nil
+            } else {
+                handleFilesystemTab(tabId: tabId)
             }
+            return true
         }
-
 
         let actor = sessionManager.localIdentity
         guard let request = sharedInputRequest(for: bytes, actor: actor) else {
@@ -2600,35 +2605,189 @@ final class TerminalModel: ObservableObject {
     // MARK: shared-input autocomplete
 
     private func refreshInputAutocomplete() {
+        guard inputAutocomplete.visible, let cwd = filesystemCompletionCwd else {
+            inputAutocomplete.dismiss()
+            filesystemCompletionCwd = nil
+            return
+        }
         guard let tabId = activeTabId,
-              (isHostSharedLineSession(tabId: tabId) || isPeerSharedLineSession(tabId: tabId)),
-              sharedInputs[tabId]?.isActive == true
+              let text = sharedInputs[tabId]?.text
         else {
             inputAutocomplete.dismiss()
+            filesystemCompletionCwd = nil
             return
         }
-        let text = sharedInputs[tabId]?.text ?? ""
-        guard !text.isEmpty else {
+        let token = lastPathToken(in: text)
+        if let result = computeFilesystemMatches(token: token, cwd: cwd) {
+            inputAutocomplete.update(items: result.items, prefix: token)
+        } else {
             inputAutocomplete.dismiss()
-            return
+            filesystemCompletionCwd = nil
         }
-        let matches = FuzzyMatcher.rank(
-            candidates: commandHistory.entries,
-            needle: text,
-            recencyRank: commandHistory.recencyRank,
-            limit: Self.inputAutocompleteMaxItems)
-        let filtered = matches.filter { $0 != text }
-        if filtered.isEmpty {
-            inputAutocomplete.dismiss()
-            return
-        }
-        inputAutocomplete.update(items: filtered, prefix: text)
     }
 
     private func acceptInputAutocompleteSelection(tabId: UInt32) {
         guard let suggestion = inputAutocomplete.currentSelection else { return }
         replaceSharedInputLine(tabId: tabId, with: suggestion)
         inputAutocomplete.dismiss()
+    }
+
+    // MARK: Filesystem tab completion
+
+    private func handleFilesystemTab(tabId: UInt32) {
+        guard sharedInputs[tabId]?.isActive == true else { return }
+        let text = sharedInputs[tabId]?.text ?? ""
+        let token = lastPathToken(in: text)
+
+        // Handle bare `~` → complete to `~/`
+        if token == "~" {
+            insertTextIntoSharedInput(tabId: tabId, text: "/")
+            return
+        }
+
+        let cwd: String
+        if let pty = tabs.first(where: { $0.id == tabId })?.pty, pty.pid > 0,
+           let resolved = TabTitleResolver.cwd(pid: pty.pid) {
+            cwd = resolved
+        } else {
+            cwd = NSHomeDirectory()
+        }
+
+        // Merge filesystem matches with command matches when completing the first token
+        let fileResult = computeFilesystemMatches(token: token, cwd: cwd)
+        let cmds: [String] = isCommandPosition(in: text) && !token.isEmpty
+            ? commandCompletions(prefix: token)
+            : []
+
+        // Combine: commands first, then file/dir matches not already in commands
+        var combined: [String] = cmds
+        let cmdSet = Set(cmds)
+        if let fr = fileResult {
+            for item in fr.items where !cmdSet.contains(item) {
+                combined.append(item)
+            }
+        }
+        guard !combined.isEmpty else { return }
+
+        let filePrefix = fileResult?.filePrefix ?? token
+
+        if combined.count == 1 {
+            let suffix = String(combined[0].dropFirst(filePrefix.count))
+            if !suffix.isEmpty { insertTextIntoSharedInput(tabId: tabId, text: suffix) }
+            inputAutocomplete.dismiss()
+            filesystemCompletionCwd = nil
+        } else {
+            // Insert longest-common-prefix suffix, then show hints
+            let lcp = longestCommonPrefix(of: combined)
+            let lcpSuffix = String(lcp.dropFirst(filePrefix.count))
+            if !lcpSuffix.isEmpty { insertTextIntoSharedInput(tabId: tabId, text: lcpSuffix) }
+            filesystemCompletionCwd = cwd
+            let updatedToken = lastPathToken(in: (sharedInputs[tabId]?.text ?? ""))
+            inputAutocomplete.update(items: combined, prefix: updatedToken)
+        }
+    }
+
+    private func computeFilesystemMatches(token: String, cwd: String)
+        -> (items: [String], filePrefix: String)?
+    {
+        let expanded: String
+        if token.hasPrefix("~/") {
+            expanded = NSHomeDirectory() + String(token.dropFirst(1))
+        } else {
+            expanded = token
+        }
+
+        let dir: String
+        let filePrefix: String
+        if expanded.isEmpty {
+            // Empty token (e.g. after `ls `): list CWD with no filter
+            dir = cwd.hasSuffix("/") ? cwd : cwd + "/"
+            filePrefix = ""
+        } else if let slashIdx = expanded.lastIndex(of: "/") {
+            let afterSlash = expanded.index(after: slashIdx)
+            let dirPart = String(expanded[...slashIdx])
+            filePrefix = String(expanded[afterSlash...])
+            dir = expanded.hasPrefix("/")
+                ? dirPart
+                : (cwd.hasSuffix("/") ? cwd : cwd + "/") + dirPart
+        } else {
+            dir = cwd.hasSuffix("/") ? cwd : cwd + "/"
+            filePrefix = expanded
+        }
+
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir) else {
+            return nil
+        }
+        let matches: [String] = entries
+            .filter { $0.hasPrefix(filePrefix) }
+            .sorted()
+            .map { entry -> String in
+                var isDir: ObjCBool = false
+                FileManager.default.fileExists(
+                    atPath: (dir as NSString).appendingPathComponent(entry),
+                    isDirectory: &isDir)
+                return isDir.boolValue ? entry + "/" : entry
+            }
+        guard !matches.isEmpty else { return nil }
+        return (matches, filePrefix)
+    }
+
+    private func insertTextIntoSharedInput(tabId: UInt32, text: String) {
+        let actor = sessionManager.localIdentity
+        let request = SharedInputRequest(actor: actor, kind: .insertText, text: text)
+        if canUseHostSharedInput(tabId: tabId) {
+            applyAuthoritativeSharedInputRequest(tabId: tabId, request)
+        } else if canUsePeerSharedInput(tabId: tabId) {
+            applyOptimisticSharedInputRequest(tabId: tabId, request)
+            let payload = SharedInputCodec.encode(.request(tabId: tabId, request))
+            if tabId == TerminalModel.placeholderTabId {
+                sessionManager.sendInputBytes(payload)
+            } else {
+                sessionManager.sendTabInput(tabId: tabId, data: payload)
+            }
+        }
+    }
+
+    private func lastPathToken(in text: String) -> String {
+        text.components(separatedBy: .whitespaces).last ?? ""
+    }
+
+    /// True when the token being completed is the command word (no prior
+    /// non-whitespace tokens), so we should also search $PATH.
+    private func isCommandPosition(in text: String) -> Bool {
+        let parts = text.components(separatedBy: .whitespaces)
+        return parts.dropLast().allSatisfy { $0.isEmpty }
+    }
+
+    /// Executables in $PATH whose name starts with `prefix`, sorted.
+    private func commandCompletions(prefix: String) -> [String] {
+        guard !prefix.isEmpty else { return [] }
+        let pathDirs = (ProcessInfo.processInfo.environment["PATH"] ?? "")
+            .components(separatedBy: ":")
+        var seen = Set<String>()
+        var results: [String] = []
+        for dir in pathDirs where !dir.isEmpty {
+            guard let entries = try? FileManager.default.contentsOfDirectory(atPath: dir)
+            else { continue }
+            for entry in entries where entry.hasPrefix(prefix) {
+                let full = (dir as NSString).appendingPathComponent(entry)
+                if FileManager.default.isExecutableFile(atPath: full),
+                   seen.insert(entry).inserted {
+                    results.append(entry)
+                }
+            }
+        }
+        return results.sorted()
+    }
+
+    private func longestCommonPrefix(of strings: [String]) -> String {
+        guard let first = strings.first else { return "" }
+        var prefix = first
+        for s in strings.dropFirst() {
+            while !s.hasPrefix(prefix) { prefix = String(prefix.dropLast()) }
+            if prefix.isEmpty { break }
+        }
+        return prefix
     }
 
     private func replaceSharedInputLine(tabId: UInt32, with text: String) {
