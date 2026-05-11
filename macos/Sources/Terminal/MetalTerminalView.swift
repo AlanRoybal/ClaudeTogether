@@ -3,6 +3,7 @@ import AppKit
 import Metal
 import MetalKit
 import Carbon.HIToolbox
+import UniformTypeIdentifiers
 
 /// NSView subclass: MTKView wrapper that owns the `TerminalRenderer` and
 /// routes keystrokes through a caller-supplied closure. The grid is also
@@ -15,6 +16,11 @@ final class MetalTerminalNSView: NSView {
     private var onKey: ([UInt8]) -> Void
     private var onResize: (UInt16, UInt16) -> Void
     private var onMouseCell: (UInt16, UInt16) -> Bool
+    /// Called with the sanitized paste string instead of `onKey` when set.
+    /// Lets the model own bracket-wrapping and safe-paste confirmation.
+    var onPaste: ((String) -> Void)?
+    /// Called when the user drops a file onto the terminal.
+    var onFileDrop: ((URL) -> Void)?
     private var lastPropagatedGridSize: (cols: UInt16, rows: UInt16)?
     /// When true, keystrokes are dropped (peer in raw mode: creator-only input).
     var inputEnabled: Bool = true
@@ -64,6 +70,7 @@ final class MetalTerminalNSView: NSView {
         super.init(frame: .zero)
 
         renderer.grid = grid
+        registerForDraggedTypes([.fileURL])
 
         addSubview(view)
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -101,11 +108,35 @@ final class MetalTerminalNSView: NSView {
 
     func updateHandlers(onKey: @escaping ([UInt8]) -> Void,
                         onResize: @escaping (UInt16, UInt16) -> Void,
-                        onMouseCell: @escaping (UInt16, UInt16) -> Bool)
+                        onMouseCell: @escaping (UInt16, UInt16) -> Bool,
+                        onPaste: ((String) -> Void)? = nil,
+                        onFileDrop: ((URL) -> Void)? = nil)
     {
         self.onKey = onKey
         self.onResize = onResize
         self.onMouseCell = onMouseCell
+        self.onPaste = onPaste
+        self.onFileDrop = onFileDrop
+    }
+
+    // MARK: drag and drop
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        guard inputEnabled,
+              sender.draggingPasteboard.canReadObject(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]) else { return [] }
+        return .copy
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        guard inputEnabled,
+              let urls = sender.draggingPasteboard.readObjects(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]) as? [URL],
+              let url = urls.first else { return false }
+        onFileDrop?(url)
+        return true
     }
 
     /// Rebuilds the renderer's glyph atlas if the requested point size has
@@ -173,7 +204,11 @@ final class MetalTerminalNSView: NSView {
             if let s = NSPasteboard.general.string(forType: .string) {
                 let sanitized = TerminalPasteSanitizer.sanitize(s)
                 if !sanitized.isEmpty {
-                    onKey(Array(sanitized.utf8))
+                    if let onPaste {
+                        onPaste(sanitized)
+                    } else {
+                        onKey(Array(sanitized.utf8))
+                    }
                 }
                 return true
             }
@@ -733,6 +768,8 @@ struct MetalTerminalView: NSViewRepresentable {
     let onKey: ([UInt8]) -> Void
     let onResize: (UInt16, UInt16) -> Void
     let onMouseCell: (UInt16, UInt16) -> Bool
+    let onPaste: ((String) -> Void)?
+    let onFileDrop: ((URL) -> Void)?
     let inputEnabled: Bool
     let isActive: Bool
     let fontSize: CGFloat
@@ -746,6 +783,8 @@ struct MetalTerminalView: NSViewRepresentable {
          onKey: @escaping ([UInt8]) -> Void,
          onResize: @escaping (UInt16, UInt16) -> Void = { _, _ in },
          onMouseCell: @escaping (UInt16, UInt16) -> Bool = { _, _ in false },
+         onPaste: ((String) -> Void)? = nil,
+         onFileDrop: ((URL) -> Void)? = nil,
          inputEnabled: Bool = true,
          isActive: Bool = true,
          fontSize: CGFloat = 13,
@@ -756,6 +795,8 @@ struct MetalTerminalView: NSViewRepresentable {
         self.onKey = onKey
         self.onResize = onResize
         self.onMouseCell = onMouseCell
+        self.onPaste = onPaste
+        self.onFileDrop = onFileDrop
         self.inputEnabled = inputEnabled
         self.isActive = isActive
         self.fontSize = fontSize
@@ -780,6 +821,8 @@ struct MetalTerminalView: NSViewRepresentable {
                 pointSize: fontSize)!
         }
         v.inputEnabled = inputEnabled
+        v.onPaste = onPaste
+        v.onFileDrop = onFileDrop
         v.mtkView.isPaused = !isActive
         v.mouseModeEnabled = mouseModeEnabled
         v.theme = theme
@@ -791,7 +834,9 @@ struct MetalTerminalView: NSViewRepresentable {
         nsView.updateHandlers(
             onKey: onKey,
             onResize: onResize,
-            onMouseCell: onMouseCell)
+            onMouseCell: onMouseCell,
+            onPaste: onPaste,
+            onFileDrop: onFileDrop)
         nsView.inputEnabled = inputEnabled
         nsView.updatePointSize(fontSize)
         nsView.mtkView.isPaused = !isActive

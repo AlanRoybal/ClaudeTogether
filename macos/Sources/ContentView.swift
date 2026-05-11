@@ -89,6 +89,7 @@ struct ContentView: View {
                     .transition(.opacity.combined(with: .move(edge: .top)))
                     .allowsHitTesting(false)
             }
+
         }
         .ignoresSafeArea(edges: .top)
         .frame(minWidth: 800, minHeight: 550)
@@ -317,6 +318,17 @@ final class TerminalModel: ObservableObject {
     /// Brief auto-dismissing status message shown as an overlay banner.
     @Published var sessionNotificationMessage: String? = nil
     private var notificationDismissTask: Task<Void, Never>?
+
+    /// A placeholder token currently live in the terminal input line.
+    /// Carries the actual bytes so it can be expanded on demand or on Enter.
+    private struct ActivePlaceholder {
+        let text: String      // literal text sent to the terminal (e.g. "[Pasted text #1 + 5 lines]")
+        let bytes: [UInt8]    // real bytes to substitute when expanding
+        var cursorAfter: Bool // true = terminal cursor is positioned after the placeholder
+    }
+    private var activePlaceholder: ActivePlaceholder? = nil
+    private var pasteCounter: Int = 0
+    private var imageDropCounter: Int = 0
 
     /// Snapshot of participants from the previous roster update, used to
     /// detect joins and leaves without a dedicated diff frame.
@@ -1201,7 +1213,69 @@ final class TerminalModel: ObservableObject {
         else { return }
         let sanitized = TerminalPasteSanitizer.sanitize(s)
         guard !sanitized.isEmpty else { return }
-        handleKey(Array(sanitized.utf8), forTabId: activeTabId)
+        handlePaste(sanitized, forTabId: activeTabId)
+    }
+
+    func handlePaste(_ sanitized: String, forTabId tabId: UInt32, paneIndex: Int = 0) {
+        guard tabId == activeTabId else { return }
+
+        // "Paste again" — expand the active placeholder with the real content
+        if let ph = activePlaceholder {
+            expandActivePlaceholder(ph, forTabId: tabId, paneIndex: paneIndex)
+            return
+        }
+
+        let bracketedPaste = activeTab?.grid.term.bracketedPasteMode == true
+        let body = Array(sanitized.utf8)
+        let bytes: [UInt8] = bracketedPaste
+            ? Array("\u{1b}[200~".utf8) + body + Array("\u{1b}[201~".utf8)
+            : body
+
+        if sanitized.contains("\n") {
+            pasteCounter += 1
+            let extraLines = sanitized.components(separatedBy: "\n").count - 1
+            let text = "[Pasted text #\(pasteCounter) + \(extraLines) lines]"
+            activePlaceholder = ActivePlaceholder(text: text, bytes: bytes, cursorAfter: true)
+            handleKey(Array(text.utf8), forTabId: tabId, paneIndex: paneIndex)
+        } else {
+            handleKey(bytes, forTabId: tabId, paneIndex: paneIndex)
+        }
+    }
+
+    private func expandActivePlaceholder(_ ph: ActivePlaceholder, forTabId tabId: UInt32, paneIndex: Int, thenSend extra: [UInt8] = []) {
+        activePlaceholder = nil
+        let n = ph.text.utf8.count
+        if !ph.cursorAfter {
+            handleKey((0..<n).flatMap { _ in [0x1b, 0x5b, 0x43] as [UInt8] }, forTabId: tabId, paneIndex: paneIndex)
+        }
+        handleKey(Array(repeating: 0x7f, count: n), forTabId: tabId, paneIndex: paneIndex)
+        handleKey(ph.bytes, forTabId: tabId, paneIndex: paneIndex)
+        if !extra.isEmpty {
+            handleKey(extra, forTabId: tabId, paneIndex: paneIndex)
+        }
+    }
+
+    func handleFileDrop(_ url: URL, forTabId tabId: UInt32, paneIndex: Int = 0) {
+        guard tabId == activeTabId else { return }
+        let isImage: Bool
+        if let contentType = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType {
+            isImage = contentType.conforms(to: .image)
+        } else {
+            let imageExts: Set<String> = ["png", "jpg", "jpeg", "gif", "tiff", "bmp", "webp", "heic", "svg", "ico"]
+            isImage = imageExts.contains(url.pathExtension.lowercased())
+        }
+        if isImage {
+            imageDropCounter += 1
+            let text = "[Image #\(imageDropCounter)]"
+            let path = url.path
+            let expandBytes = Array(path.utf8)
+            activePlaceholder = ActivePlaceholder(text: text, bytes: expandBytes, cursorAfter: true)
+            handleKey(Array(text.utf8), forTabId: tabId, paneIndex: paneIndex)
+        } else {
+            let path = url.path
+            let text = path.contains(" ") ? "'\(path)'" : path
+            handleKey(Array(text.utf8), forTabId: tabId, paneIndex: paneIndex)
+        }
     }
 
     func formatWithPrettier() {
@@ -1624,6 +1698,38 @@ final class TerminalModel: ObservableObject {
     /// "active session" lookup that could leak keystrokes across tabs.
     func handleKey(_ bytes: [UInt8], forTabId tabId: UInt32, paneIndex: Int = 0) {
         guard tabId == activeTabId else { return }
+
+        // Intercepts while a placeholder is live in the terminal input line
+        if var ph = activePlaceholder {
+            let n = ph.text.utf8.count
+            let leftArrow:  [UInt8] = [0x1b, 0x5b, 0x44]
+            let rightArrow: [UInt8] = [0x1b, 0x5b, 0x43]
+            if bytes == [0x0d] || bytes == [0x0a] {
+                // Enter → expand placeholder then submit
+                expandActivePlaceholder(ph, forTabId: tabId, paneIndex: paneIndex, thenSend: bytes)
+                return
+            } else if bytes == [0x7f] {
+                // Backspace → erase entire placeholder without expanding
+                let wasAfter = ph.cursorAfter
+                activePlaceholder = nil
+                if !wasAfter {
+                    handleKey((0..<n).flatMap { _ in rightArrow as [UInt8] }, forTabId: tabId, paneIndex: paneIndex)
+                }
+                handleKey(Array(repeating: 0x7f, count: n), forTabId: tabId, paneIndex: paneIndex)
+                return
+            } else if bytes == leftArrow && ph.cursorAfter {
+                ph.cursorAfter = false
+                activePlaceholder = ph
+                handleKey((0..<n).flatMap { _ in leftArrow as [UInt8] }, forTabId: tabId, paneIndex: paneIndex)
+                return
+            } else if bytes == rightArrow && !ph.cursorAfter {
+                ph.cursorAfter = true
+                activePlaceholder = ph
+                handleKey((0..<n).flatMap { _ in rightArrow as [UInt8] }, forTabId: tabId, paneIndex: paneIndex)
+                return
+            }
+        }
+
         startPendingHostTabIfNeeded(tabId: tabId)
         // View-only enforcement: the MetalTerminalNSView already gates via
         // `inputEnabled`, but defend in depth so a programmatic call site

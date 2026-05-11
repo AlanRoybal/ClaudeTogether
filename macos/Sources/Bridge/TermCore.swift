@@ -132,6 +132,12 @@ final class TermCore {
     /// True if any mouse-reporting mode is active.
     var mouseEnabled: Bool { mouseModeBits != 0 }
 
+    /// True when the running app has enabled bracketed paste mode (DECSET ?2004h).
+    var bracketedPasteMode: Bool {
+        guard let h = handle else { return false }
+        return ct_term_bracketed_paste_mode(h) == 1
+    }
+
     /// DECSET 1006 — xterm SGR encoding. The only encoding we currently
     /// emit; if this bit is missing the running app likely expects the
     /// legacy X10 byte format which we don't synthesize today.
