@@ -98,7 +98,7 @@ struct CoTTYApp: App {
                     .disabled(model.grid == nil)
             }
 
-            // View menu: clear screen, font size, sidebar.
+            // View menu: clear screen, font size, theme.
             CommandGroup(after: .toolbar) {
                 Button("Clear Screen") { model.clearScreen() }
                     .keyboardShortcut("k", modifiers: .command)
@@ -111,44 +111,254 @@ struct CoTTYApp: App {
                 Button("Reset Font Size") { model.resetFontSize() }
                     .keyboardShortcut("0", modifiers: .command)
                 Divider()
-                Button(model.sidebarVisible ? "Hide Sidebar" : "Show Sidebar") {
-                    model.sidebarVisible.toggle()
+                Picker("Theme", selection: Binding(
+                    get: { model.terminalTheme.name },
+                    set: { name in
+                        if name == "Custom" {
+                            model.terminalTheme = TerminalTheme.custom(
+                                background: model.customThemeBg,
+                                foreground: model.customThemeFg)
+                        } else {
+                            model.terminalTheme = TerminalTheme.named(name)
+                        }
+                    }
+                )) {
+                    ForEach(TerminalTheme.allBuiltin, id: \.name) { t in
+                        Text(t.name).tag(t.name)
+                    }
+                    Divider()
+                    Text("Custom").tag("Custom")
                 }
-                .keyboardShortcut("s", modifiers: [.command, .shift])
+            }
+
+            // Session menu: sharing controls, mouse mode, participants.
+            CommandMenu("Session") {
+                Toggle("Mouse Mode", isOn: $model.mouseMode)
+
+                Divider()
+
+                sessionMenuItems(model: model)
             }
         }
 
         // Settings scene -> automatically wires Preferences… (⌘,) into the
         // app menu on macOS 13+.
         Settings {
-            PreferencesView()
+            PreferencesView(model: model)
         }
     }
 }
 
-/// Placeholder Preferences window. Tabs are intentionally empty so the
-/// scaffolding is in place but no behavior changes are advertised yet.
 struct PreferencesView: View {
+    @ObservedObject var model: TerminalModel
+
     var body: some View {
         TabView {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("General preferences will appear here.")
-                    .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 16) {
+                GroupBox("Your name") {
+                    TextField(
+                        "Display name",
+                        text: Binding(
+                            get: { model.sessionManager.localName },
+                            set: { model.sessionManager.localName = $0 }),
+                        onCommit: { model.sessionManager.persistName() })
+                        .textFieldStyle(.roundedBorder)
+                }
+
+                GroupBox("Diagnostics") {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("core v\(model.coreVersion)")
+                            .font(.caption)
+                        if let tool = model.tunnelTool {
+                            let label = tool.server.isEmpty ? "tunnel: ngrok" : "tunnel: bore relay"
+                            Text(label).font(.caption).foregroundStyle(.green)
+                            Text(tool.path)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                                .truncationMode(.middle)
+                        } else {
+                            Text("tunnel: not found").font(.caption).foregroundStyle(.red)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
                 Spacer()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .padding(20)
             .tabItem { Label("General", systemImage: "gear") }
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Appearance preferences will appear here.")
-                    .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Terminal Theme")
+                    .font(.headline)
+                Picker("Theme", selection: Binding(
+                    get: { model.terminalTheme.name },
+                    set: { name in
+                        if name == "Custom" {
+                            model.terminalTheme = TerminalTheme.custom(
+                                background: model.customThemeBg,
+                                foreground: model.customThemeFg)
+                        } else {
+                            model.terminalTheme = TerminalTheme.named(name)
+                        }
+                    }
+                )) {
+                    ForEach(TerminalTheme.allBuiltin, id: \.name) { t in
+                        Text(t.name).tag(t.name)
+                    }
+                    Divider()
+                    Text("Custom").tag("Custom")
+                }
+                .pickerStyle(.radioGroup)
+
+                if model.terminalTheme.name == "Custom" {
+                    Divider()
+                    Text("Custom Colors")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    HexColorField(label: "Background", color: $model.customThemeBg)
+                    HexColorField(label: "Foreground", color: $model.customThemeFg)
+                }
+
                 Spacer()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .padding(20)
             .tabItem { Label("Appearance", systemImage: "paintbrush") }
         }
-        .frame(width: 480, height: 240)
+        .frame(width: 480, height: 300)
     }
 }
+
+/// State-dependent session menu items used inside `CommandMenu("Session")`.
+/// Extracted to a function so the switch/if-else tree is readable and
+/// compiles cleanly under @ViewBuilder.
+@MainActor @ViewBuilder
+private func sessionMenuItems(model: TerminalModel) -> some View {
+    switch model.sessionManager.state {
+    case .idle:
+        Button("Start Shared Session") { model.startSharing() }
+        Button("Join Shared Session…") { model.promptJoin() }
+
+    case .starting:
+        Button("Starting…") {}.disabled(true)
+
+    case .running:
+        let statusLabel = model.sessionManager.role == .host
+            ? "Hosting on port \(model.sessionManager.localPort)"
+            : "Connected as peer"
+        Button(statusLabel) {}.disabled(true)
+
+        if model.sessionManager.role == .host {
+            if let url = model.sessionManager.publicURL {
+                Button("Copy Session URL") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(url, forType: .string)
+                }
+                .keyboardShortcut("u", modifiers: [.command, .shift])
+            } else if let err = model.sessionManager.lastError {
+                Button("Tunnel Error: \(err)") {}.disabled(true)
+                Button("Retry Tunnel") { model.retryBoreTunnel() }
+            } else {
+                Button("Connecting to relay…") {}.disabled(true)
+            }
+        } else if let url = model.sessionManager.publicURL {
+            Button("Copy Session URL") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(url, forType: .string)
+            }
+        }
+
+        if !model.sessionManager.participants.isEmpty {
+            Divider()
+            ForEach(model.sessionManager.participants) { p in
+                let suffix = p.identity == model.sessionManager.localIdentity ? " (you)" : ""
+                Button(p.name + suffix) {}.disabled(true)
+            }
+        }
+
+        Divider()
+
+        if model.sessionManager.role == .host {
+            Picker("Access Mode", selection: Binding(
+                get: { model.sessionManager.accessMode },
+                set: { model.sessionManager.setAccessMode($0) }
+            )) {
+                Text("Full Access").tag(AccessMode.full)
+                Text("View Only").tag(AccessMode.viewOnly)
+            }
+        } else {
+            let accessLabel = model.sessionManager.accessMode == .full
+                ? "Access: Full" : "Access: View Only"
+            Button(accessLabel) {}.disabled(true)
+        }
+
+        Divider()
+
+        Button("Leave Session") {
+            if model.sessionManager.role == .peer {
+                model.endSession()
+            } else {
+                model.stopSharing()
+            }
+        }
+
+    case .disconnected:
+        Button("Host Disconnected") {}.disabled(true)
+        Button("Dismiss") { model.endSession() }
+
+    case .failed(let msg):
+        Button("Error: \(msg)") {}.disabled(true)
+        Button("Reset Session") { model.stopSharing() }
+    }
+}
+
+// MARK: - Hex color input
+
+/// Labeled hex color field with a live color swatch. Accepts 6-digit hex
+/// with or without a leading '#'. Updates the binding on every valid change.
+struct HexColorField: View {
+    let label: String
+    @Binding var color: UInt32
+    @State private var text: String = ""
+    @State private var isValid: Bool = true
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text(label)
+                .frame(width: 80, alignment: .leading)
+            RoundedRectangle(cornerRadius: 3)
+                .fill(Color(packedRGB: color))
+                .frame(width: 22, height: 18)
+                .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.secondary.opacity(0.4)))
+            TextField("#RRGGBB", text: $text)
+                .frame(width: 90)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(.body, design: .monospaced))
+                .foregroundColor(isValid ? nil : Color.red)
+                .onChange(of: text) { val in
+                    if let parsed = parseHex(val) {
+                        color = parsed
+                        isValid = true
+                    } else {
+                        isValid = text.trimmingCharacters(in: .init(charactersIn: "#")).isEmpty || false
+                        isValid = false
+                    }
+                }
+                .onAppear { text = String(format: "#%06X", color) }
+                .onChange(of: color) { newColor in
+                    let expected = String(format: "#%06X", newColor)
+                    if parseHex(text) != newColor { text = expected }
+                }
+        }
+    }
+
+    private func parseHex(_ s: String) -> UInt32? {
+        let clean = s.trimmingCharacters(in: .whitespaces).replacingOccurrences(of: "#", with: "")
+        guard clean.count == 6, let value = UInt32(clean, radix: 16) else { return nil }
+        return value
+    }
+}
+

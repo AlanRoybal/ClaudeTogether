@@ -38,7 +38,8 @@ struct CursorOverlay {
         cursors: [UserCursor],
         time: Double,
         blinkStart: Double,
-        cursorVisible: Bool
+        cursorVisible: Bool,
+        localCursorColor: SIMD4<UInt8>? = nil
     ) -> CursorOverlay {
         let phase = fmod(time - blinkStart, blinkPeriod)
         let blinkOn = phase < blinkPeriod * 0.5
@@ -48,10 +49,8 @@ struct CursorOverlay {
             if c.isLocal && (!cursorVisible || !blinkOn) {
                 continue
             }
-            rects.append(blockRect(
-                col: c.col,
-                row: c.row,
-                color: unpackRGBA(c.color)))
+            let color = (c.isLocal ? localCursorColor : nil) ?? unpackRGBA(c.color)
+            rects.append(blockRect(col: c.col, row: c.row, color: color))
         }
         return CursorOverlay(rects: rects)
     }

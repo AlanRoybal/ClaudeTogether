@@ -62,6 +62,10 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     weak var view: MTKView?
     var grid: GridModel?
 
+    private(set) var theme: TerminalTheme = .defaultDark
+    private var fgColorMap: [UInt32: UInt32] = [:]
+    private var bgColorMap: [UInt32: UInt32] = [:]
+
     private(set) var cols: UInt16 = 80
     private(set) var rows: UInt16 = 24
 
@@ -181,10 +185,22 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         self.view = view
         view.delegate = self
         view.colorPixelFormat = .bgra8Unorm
-        view.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         view.isPaused = false
         view.enableSetNeedsDisplay = false
         view.preferredFramesPerSecond = 60
+        setTheme(.defaultDark)
+    }
+
+    func setTheme(_ newTheme: TerminalTheme) {
+        theme = newTheme
+        fgColorMap = newTheme.fgColorMap
+        bgColorMap = newTheme.bgColorMap
+        let bg = newTheme.background
+        view?.clearColor = MTLClearColor(
+            red:   Double((bg >> 16) & 0xFF) / 255,
+            green: Double((bg >>  8) & 0xFF) / 255,
+            blue:  Double( bg        & 0xFF) / 255,
+            alpha: 1)
     }
 
     // MARK: MTKViewDelegate
@@ -239,7 +255,8 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             cursors: grid.cursors,
             time: now,
             blinkStart: blinkStart,
-            cursorVisible: cursorVisible)
+            cursorVisible: cursorVisible,
+            localCursorColor: unpack(theme.foreground))
 
         let cellW = Float(atlas.cellWidthPx)
         let cellH = Float(atlas.cellHeightPx)
@@ -255,7 +272,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         cursorTextInstances.reserveCapacity(overlay.rects.count)
 
         let selectionSnapshot = selection   // snapshot so rendering is consistent
-        let selectionColor = SIMD4<UInt8>(70, 130, 200, 255)  // #4682C8
+        let selectionColor = unpack(theme.selectionBg)
 
         if snap.count >= cellCount {
             let atlasW = Float(atlas.atlasWidthPx)
@@ -267,8 +284,8 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                     // We still emit a BG quad for every cell so selection
                     // highlighting is solid; only the text glyph pass skips
                     // trailing halves.
-                    let fg = unpack(c.fg)
-                    let bg = unpack(c.bg)
+                    let fg = unpack(fgColorMap[c.fg] ?? c.fg)
+                    let bg = unpack(bgColorMap[c.bg] ?? c.bg)
 
                     // BG: render the terminal's actual background. Colored
                     // collaborator blocks are composited in the cursor pass.

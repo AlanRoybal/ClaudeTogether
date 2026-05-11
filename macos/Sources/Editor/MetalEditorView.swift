@@ -11,6 +11,12 @@ final class MetalEditorNSView: NSView {
     private(set) var controller: EditorController
     private(set) var grid: EditorGridModel
     var mouseModeEnabled: Bool = false
+    var theme: TerminalTheme = .defaultDark {
+        didSet {
+            renderer.setTheme(background: theme.background)
+            grid.setTheme(background: theme.background, foreground: theme.foreground)
+        }
+    }
     private var dragSelectionAnchor: Int?
 
     init?(controller: EditorController) {
@@ -280,10 +286,14 @@ final class MetalEditorNSView: NSView {
 struct MetalEditorView: NSViewRepresentable {
     let controller: EditorController
     let mouseModeEnabled: Bool
+    let theme: TerminalTheme
 
-    init(controller: EditorController, mouseModeEnabled: Bool = false) {
+    init(controller: EditorController,
+         mouseModeEnabled: Bool = false,
+         theme: TerminalTheme = .defaultDark) {
         self.controller = controller
         self.mouseModeEnabled = mouseModeEnabled
+        self.theme = theme
     }
 
     func makeNSView(context: Context) -> MetalEditorNSView {
@@ -291,11 +301,13 @@ struct MetalEditorView: NSViewRepresentable {
             fatalError("MetalEditorNSView init failed")
         }
         view.mouseModeEnabled = mouseModeEnabled
+        view.theme = theme
         return view
     }
 
     func updateNSView(_ nsView: MetalEditorNSView, context: Context) {
         nsView.updateController(controller)
         nsView.mouseModeEnabled = mouseModeEnabled
+        nsView.theme = theme
     }
 }

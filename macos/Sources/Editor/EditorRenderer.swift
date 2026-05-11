@@ -139,6 +139,13 @@ final class EditorRenderer: NSObject, MTKViewDelegate {
         view.preferredFramesPerSecond = 60
     }
 
+    func setTheme(background: UInt32) {
+        let r = Double((background >> 16) & 0xFF) / 255
+        let g = Double((background >>  8) & 0xFF) / 255
+        let b = Double( background        & 0xFF) / 255
+        view?.clearColor = MTLClearColor(red: r, green: g, blue: b, alpha: 1)
+    }
+
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {
         if view.bounds.width > 0 {
             let actual = size.width / view.bounds.width

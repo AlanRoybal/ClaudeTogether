@@ -24,6 +24,9 @@ final class MetalTerminalNSView: NSView {
     var mouseModeEnabled: Bool = false {
         didSet { refreshTrackingArea() }
     }
+    var theme: TerminalTheme = .defaultDark {
+        didSet { renderer.setTheme(theme) }
+    }
 
     /// Bookkeeping for SGR mouse encoding.
     private var mouseTrackingArea: NSTrackingArea?
@@ -725,6 +728,7 @@ struct MetalTerminalView: NSViewRepresentable {
     /// toggle). When false, mouse events fall through to default NSView
     /// behavior even if the running app has DECSET 1000/1002/1003.
     let mouseModeEnabled: Bool
+    let theme: TerminalTheme
 
     init(grid: GridModel,
          onKey: @escaping ([UInt8]) -> Void,
@@ -733,7 +737,8 @@ struct MetalTerminalView: NSViewRepresentable {
          inputEnabled: Bool = true,
          isActive: Bool = true,
          fontSize: CGFloat = 13,
-         mouseModeEnabled: Bool = false)
+         mouseModeEnabled: Bool = false,
+         theme: TerminalTheme = .defaultDark)
     {
         self.grid = grid
         self.onKey = onKey
@@ -743,6 +748,7 @@ struct MetalTerminalView: NSViewRepresentable {
         self.isActive = isActive
         self.fontSize = fontSize
         self.mouseModeEnabled = mouseModeEnabled
+        self.theme = theme
     }
 
     func makeNSView(context: Context) -> MetalTerminalNSView {
@@ -764,6 +770,7 @@ struct MetalTerminalView: NSViewRepresentable {
         v.inputEnabled = inputEnabled
         v.mtkView.isPaused = !isActive
         v.mouseModeEnabled = mouseModeEnabled
+        v.theme = theme
         return v
     }
 
@@ -778,6 +785,7 @@ struct MetalTerminalView: NSViewRepresentable {
         nsView.mtkView.isPaused = !isActive
         nsView.mouseModeEnabled = mouseModeEnabled
         nsView.refreshTrackingArea()
+        nsView.theme = theme
     }
 
     static func dismantleNSView(_ nsView: MetalTerminalNSView, coordinator: ()) {
