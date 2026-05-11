@@ -225,7 +225,7 @@ final class MetalEditorNSView: NSView {
         case kVK_End:
             intent = .moveDocEnd
         case kVK_Return:
-            intent = .insert("\n")
+            intent = .insert("\n" + controller.autoIndentForNewline())
         case kVK_Tab:
             intent = .insert("    ")
         case kVK_Delete:

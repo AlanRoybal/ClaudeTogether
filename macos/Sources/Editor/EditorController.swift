@@ -691,6 +691,49 @@ final class EditorController {
         return i
     }
 
+    /// Returns the whitespace to insert after a newline: current line's
+    /// leading whitespace, plus one extra indent level when the line ends
+    /// with a block-opener ({ ( [ :).
+    func autoIndentForNewline() -> String {
+        let scalars = scalarArray
+        let caret = state.localCaret
+        var lineStart = caret
+        while lineStart > 0, scalars[lineStart - 1] != "\n" { lineStart -= 1 }
+        var baseIndent = ""
+        var i = lineStart
+        while i < scalars.count, scalars[i] == " " || scalars[i] == "\t" {
+            baseIndent.unicodeScalars.append(scalars[i])
+            i += 1
+        }
+        var j = caret - 1
+        while j >= lineStart, scalars[j] == " " || scalars[j] == "\t" { j -= 1 }
+        let needsExtra = j >= lineStart && "{([:".unicodeScalars.contains(scalars[j])
+        return needsExtra ? baseIndent + indentUnit(scalars: scalars) : baseIndent
+    }
+
+    /// Sniff the file's indent unit from the first indented line.
+    private func indentUnit(scalars: [Unicode.Scalar]) -> String {
+        var i = 0
+        while i < scalars.count {
+            while i < scalars.count, scalars[i] != "\n" { i += 1 }
+            i += 1
+            if i < scalars.count, scalars[i] == "\t" { return "\t" }
+            if i < scalars.count, scalars[i] == " " { return "    " }
+        }
+        return "    "
+    }
+
+    /// Replace the entire document content with `text`. Used by external
+    /// formatters (e.g. Prettier) that rewrite the file on disk.
+    func replaceText(_ text: String) throws {
+        guard let data = text.data(using: .utf8) else { return }
+        try core.loadSnapshot(data)
+        state.localCaret = 0
+        state.localSelectionAnchor = nil
+        refreshText()
+        state.dirty = true
+    }
+
     // MARK: - Presence debounce
 
     /// Debounce 50 ms after the last caret motion, then broadcast.
