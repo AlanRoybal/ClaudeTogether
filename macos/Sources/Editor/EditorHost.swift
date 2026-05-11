@@ -3,11 +3,15 @@ import SwiftUI
 struct EditorHost: View {
     let controller: EditorController
     let mouseModeEnabled: Bool
+    let theme: TerminalTheme
     @ObservedObject private var state: EditorState
 
-    init(controller: EditorController, mouseModeEnabled: Bool = false) {
+    init(controller: EditorController,
+         mouseModeEnabled: Bool = false,
+         theme: TerminalTheme = .defaultDark) {
         self.controller = controller
         self.mouseModeEnabled = mouseModeEnabled
+        self.theme = theme
         self._state = ObservedObject(wrappedValue: controller.state)
     }
 
@@ -17,28 +21,33 @@ struct EditorHost: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(state.path)
                         .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                        .foregroundColor(theme.swiftUIForeground)
                     Text(statusLine)
                         .font(.system(size: 11, weight: .medium, design: .rounded))
-                        .foregroundStyle(.secondary)
+                        .foregroundColor(theme.swiftUIForeground.opacity(0.55))
                 }
 
                 Spacer(minLength: 16)
 
-                Button("Save") { controller.requestSave() }
+                EditorButton("Save", theme: theme) { controller.requestSave() }
                     .keyboardShortcut("s", modifiers: [.command])
-                Button("Close") { controller.requestClose() }
+                EditorButton("Close", theme: theme) { controller.requestClose() }
                     .keyboardShortcut("w", modifiers: [.command])
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
-            .background(Color(nsColor: .windowBackgroundColor))
-
-            Divider()
+            .background(theme.swiftUIBackground)
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(theme.swiftUIForeground.opacity(0.12))
+                    .frame(height: 1)
+            }
 
             ZStack(alignment: .topLeading) {
                 MetalEditorView(
                     controller: controller,
-                    mouseModeEnabled: mouseModeEnabled)
+                    mouseModeEnabled: mouseModeEnabled,
+                    theme: theme)
                 EditorAutocompleteOverlay(
                     autocomplete: controller.autocomplete,
                     gridModel: controller.gridModel)
@@ -101,5 +110,35 @@ struct EditorAutocompleteOverlay: View {
         let px = min(max(0, caretX),
                      max(0, geo.size.width - estWidth))
         return CGPoint(x: px, y: py)
+    }
+}
+
+/// A small labeled button styled to match the active terminal theme.
+/// Uses `.plain` style with a pill-shaped background so it looks at home on
+/// any background color rather than drawing a system-blue default button.
+private struct EditorButton: View {
+    let label: String
+    let theme: TerminalTheme
+    let action: () -> Void
+
+    init(_ label: String, theme: TerminalTheme, action: @escaping () -> Void) {
+        self.label = label
+        self.theme = theme
+        self.action = action
+    }
+
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(theme.swiftUIForeground)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(theme.swiftUIForeground.opacity(0.12))
+                )
+        }
+        .buttonStyle(.plain)
     }
 }

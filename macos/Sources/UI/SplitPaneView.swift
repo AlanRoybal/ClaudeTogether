@@ -46,7 +46,8 @@ struct SplitPaneView: View {
                 inputEnabled: model.inputEnabled,
                 isActive: true,
                 fontSize: model.fontSize,
-                mouseModeEnabled: model.mouseMode)
+                mouseModeEnabled: model.mouseMode,
+                theme: model.terminalTheme)
             SharedInputAutocompleteOverlay(
                 grid: tab.grid,
                 autocomplete: model.inputAutocomplete)
@@ -78,7 +79,8 @@ struct SplitPaneView: View {
                 inputEnabled: model.inputEnabled,
                 isActive: true,
                 fontSize: model.fontSize,
-                mouseModeEnabled: model.mouseMode)
+                mouseModeEnabled: model.mouseMode,
+                theme: model.terminalTheme)
             paneFocusIndicator(active: tab.activePaneIndex == 1)
         }
         .frame(minWidth: 200, minHeight: 100)
@@ -86,12 +88,16 @@ struct SplitPaneView: View {
 
     // MARK: - Focus border
 
-    /// Thin accent border showing which pane currently receives keyboard input.
+    /// Thin border showing which pane currently receives keyboard input.
+    /// Color matches the theme foreground so it's always visible on the
+    /// terminal background regardless of which theme is active.
     @ViewBuilder
     private func paneFocusIndicator(active: Bool) -> some View {
         if active {
             RoundedRectangle(cornerRadius: 2)
-                .strokeBorder(Color.accentColor.opacity(0.6), lineWidth: 2)
+                .strokeBorder(
+                    model.terminalTheme.swiftUIForeground.opacity(0.55),
+                    lineWidth: 2)
                 .allowsHitTesting(false)
         }
     }

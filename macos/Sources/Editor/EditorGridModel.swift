@@ -20,12 +20,11 @@ struct UserSelection: Equatable {
 /// `EditorController`.
 @MainActor
 final class EditorGridModel: ObservableObject {
-    private enum Theme {
-        static let background: UInt32 = 0x141821
-        static let foreground: UInt32 = 0xE8ECF3
-    }
-
     let controller: EditorController
+
+    // Colors used for blank cells and default text. Updated via setTheme().
+    private var themeFg: UInt32 = 0xE8ECF3
+    private var themeBg: UInt32 = 0x141821
     let localCursorID = UUID()
 
     @Published private(set) var epoch: UInt64 = 0
@@ -46,8 +45,8 @@ final class EditorGridModel: ObservableObject {
         self.cells = Self.blankCells(
             cols: Int(cols),
             rows: Int(rows),
-            fg: Theme.foreground,
-            bg: Theme.background)
+            fg: themeFg,
+            bg: themeBg)
 
         controller.state.$epoch
             .sink { [weak self] _ in
@@ -76,6 +75,13 @@ final class EditorGridModel: ObservableObject {
         let next = min(max(0, scrollRow + delta), maxScroll)
         guard next != scrollRow else { return }
         scrollRow = next
+        rebuild(preserveScroll: true)
+    }
+
+    func setTheme(background: UInt32, foreground: UInt32) {
+        guard background != themeBg || foreground != themeFg else { return }
+        themeBg = background
+        themeFg = foreground
         rebuild(preserveScroll: true)
     }
 
@@ -131,8 +137,8 @@ final class EditorGridModel: ObservableObject {
         var nextCells = Self.blankCells(
             cols: colCount,
             rows: rowCount,
-            fg: Theme.foreground,
-            bg: Theme.background)
+            fg: themeFg,
+            bg: themeBg)
 
         var row = 0
         var col = 0
@@ -166,7 +172,7 @@ final class EditorGridModel: ObservableObject {
                         highlights: highlights,
                         sourceLine: sourceLine,
                         sourceCol: sourceCol,
-                        defaultFg: Theme.foreground)
+                        defaultFg: themeFg)
                 }
             }
 
@@ -194,8 +200,8 @@ final class EditorGridModel: ObservableObject {
             nextCells = Self.blankCells(
                 cols: colCount,
                 rows: rowCount,
-                fg: Theme.foreground,
-                bg: Theme.background)
+                fg: themeFg,
+                bg: themeBg)
             row = 0
             col = 0
             sourceLine = 0
@@ -221,7 +227,7 @@ final class EditorGridModel: ObservableObject {
                             highlights: highlights,
                             sourceLine: sourceLine,
                             sourceCol: sourceCol,
-                            defaultFg: Theme.foreground)
+                            defaultFg: themeFg)
                     }
                 }
                 col += 1

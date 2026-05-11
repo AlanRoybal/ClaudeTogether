@@ -22,49 +22,150 @@ private class EditableTextField: NSTextField {
 
 struct ContentView: View {
     @ObservedObject var model: TerminalModel
+    // Explicit title bar inset: SwiftUI doesn't observe our imperative
+    // titlebarAppearsTransparent call, so we bypass safe-area and manage
+    // the inset ourselves. WindowThemeNSView writes the real value here.
+    @State private var titleBarInset: CGFloat = 28
 
     var body: some View {
-        HSplitView {
-            if model.sidebarVisible {
-                SessionSidebar(model: model)
-                    .frame(minWidth: 220, idealWidth: 260, maxWidth: 360)
+        ZStack(alignment: .top) {
+            if let controller = model.activeEditor {
+                EditorHost(
+                    controller: controller,
+                    mouseModeEnabled: model.mouseMode,
+                    theme: model.terminalTheme)
+                    .frame(minWidth: 500, minHeight: 300)
+                    .padding(.top, titleBarInset)
+            } else if !model.tabs.isEmpty {
+                VStack(spacing: 0) {
+                    TabStripView(model: model)
+                    if let tab = model.activeTabForView {
+                        SplitPaneView(tab: tab, model: model)
+                            .frame(minWidth: 500, minHeight: 300)
+                    }
+                }
+                .padding(.top, titleBarInset)
+            } else {
+                // Tabs are empty — auto-open the initial terminal. This
+                // state is only visible briefly on first launch or after a
+                // peer session ends while the tab is being created.
+                Color.clear
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .onAppear { model.openInitialTab() }
             }
 
-            ZStack(alignment: .top) {
-                if let controller = model.activeEditor {
-                    EditorHost(
-                        controller: controller,
-                        mouseModeEnabled: model.mouseMode)
-                        .frame(minWidth: 500, minHeight: 300)
-                } else if !model.tabs.isEmpty {
-                    VStack(spacing: 0) {
-                        TabStripView(model: model)
-                        if let tab = model.activeTabForView {
-                            SplitPaneView(tab: tab, model: model)
-                                .frame(minWidth: 500, minHeight: 300)
-                        }
-                    }
-                } else {
-                    // Tabs are empty — auto-open the initial terminal. This
-                    // state is only visible briefly on first launch or after a
-                    // peer session ends while the tab is being created.
-                    Color.clear
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .onAppear { model.openInitialTab() }
-                }
-
-                if model.activeEditor == nil, model.showRawBanner {
-                    Text("Creator is running a full-screen app. Use /edit for shared file editing; terminal input is disabled here.")
-                        .font(.callout)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(.orange.opacity(0.85), in: Capsule())
-                        .foregroundStyle(.white)
-                        .padding(.top, 8)
-                }
+            if model.activeEditor == nil, model.showRawBanner {
+                Text("Creator is running a full-screen app. Use /edit for shared file editing; terminal input is disabled here.")
+                    .font(.callout)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.orange.opacity(0.85), in: Capsule())
+                    .foregroundStyle(.white)
+                    .padding(.top, titleBarInset + 8)
             }
         }
-        .frame(minWidth: 900, minHeight: 550)
+        .ignoresSafeArea(edges: .top)
+        .frame(minWidth: 800, minHeight: 550)
+        .background(WindowThemeSetter(theme: model.terminalTheme, titleBarInset: $titleBarInset))
+    }
+}
+
+/// Applies theme colors to the NSWindow (background + title bar) whenever
+/// the theme changes. Uses a custom NSView subclass so `viewDidMoveToWindow`
+/// fires reliably — the plain-`NSView` + `DispatchQueue.main.async` approach
+/// is fragile because the view may not yet be in a window when the block runs.
+private struct WindowThemeSetter: NSViewRepresentable {
+    let theme: TerminalTheme
+    @Binding var titleBarInset: CGFloat
+
+    func makeNSView(context: Context) -> WindowThemeNSView {
+        WindowThemeNSView(theme: theme, titleBarInset: $titleBarInset)
+    }
+
+    func updateNSView(_ nsView: WindowThemeNSView, context: Context) {
+        nsView.theme = theme
+        nsView.titleBarInset = $titleBarInset
+    }
+}
+
+private final class WindowThemeNSView: NSView {
+    var theme: TerminalTheme {
+        didSet { applyToWindow() }
+    }
+    var titleBarInset: Binding<CGFloat>
+
+    private var windowObservers: [NSObjectProtocol] = []
+
+    init(theme: TerminalTheme, titleBarInset: Binding<CGFloat>) {
+        self.theme = theme
+        self.titleBarInset = titleBarInset
+        super.init(frame: .zero)
+    }
+
+    required init?(coder: NSCoder) { fatalError("not used") }
+
+    deinit {
+        windowObservers.forEach { NotificationCenter.default.removeObserver($0) }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        windowObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        windowObservers = []
+        guard let window else { return }
+        applyToWindow()
+        // Belt-and-suspenders: re-apply after the run loop so any SwiftUI
+        // post-setup window changes are overridden by our theme.
+        DispatchQueue.main.async { [weak self] in self?.applyToWindow() }
+        let reapply: (Notification) -> Void = { [weak self] _ in self?.applyToWindow() }
+        windowObservers = [
+            // Reapply after deminiaturize: macOS rebuilds the titlebar layer.
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.didDeminiaturizeNotification,
+                object: window, queue: .main, using: reapply),
+            // Reapply (and restore inset) when returning from full screen.
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.didExitFullScreenNotification,
+                object: window, queue: .main, using: reapply),
+            // Zero the inset when entering full screen (no title bar).
+            NotificationCenter.default.addObserver(
+                forName: NSWindow.didEnterFullScreenNotification,
+                object: window, queue: .main) { [weak self] _ in
+                    self?.titleBarInset.wrappedValue = 0
+                },
+        ]
+    }
+
+    private func applyToWindow() {
+        guard let window else { return }
+        let color = theme.nsBackground
+        window.titlebarAppearsTransparent = true
+        window.backgroundColor = color
+        window.appearance = NSAppearance(named: theme.isDark ? .darkAqua : .aqua)
+
+        // Walk up from the close button by class name until we reach
+        // NSTitlebarContainerView. Fixed-depth .superview chains break when
+        // Apple changes the view hierarchy between macOS releases.
+        if let closeButton = window.standardWindowButton(.closeButton) {
+            var candidate: NSView? = closeButton.superview
+            while let v = candidate {
+                if String(describing: type(of: v)).contains("TitlebarContainer") {
+                    v.wantsLayer = true
+                    v.layer?.backgroundColor = color.cgColor
+                    break
+                }
+                candidate = v.superview
+            }
+        }
+
+        // Compute actual title bar height: contentLayoutRect is the usable area
+        // below chrome; the difference from the window frame height is the inset.
+        let raw = window.frame.height - window.contentLayoutRect.height
+        // Sanity-clamp: ignore absurd values (e.g. window not yet sized).
+        let inset = (raw > 0 && raw < 100) ? raw : 28
+        if titleBarInset.wrappedValue != inset {
+            titleBarInset.wrappedValue = inset
+        }
     }
 }
 
@@ -137,15 +238,6 @@ final class TerminalModel: ObservableObject {
     /// Cap on the number of history suggestions surfaced at once.
     private static let inputAutocompleteMaxItems = 5
 
-    /// Whether the SessionSidebar is visible. Toggled by the View menu
-    /// (⌘⇧S). Persisted across launches so the user's choice survives.
-    @Published var sidebarVisible: Bool = true {
-        didSet {
-            guard sidebarVisible != oldValue else { return }
-            UserDefaults.standard.set(sidebarVisible, forKey: TerminalModel.sidebarDefaultsKey)
-        }
-    }
-
     /// Terminal text point size. Driven by the View menu (⌘+/⌘-/⌘0).
     /// `MetalTerminalView` observes this and rebuilds the GlyphAtlas when
     /// it changes. Persisted to UserDefaults under `ClaudeTogether.fontSize`.
@@ -163,7 +255,35 @@ final class TerminalModel: ObservableObject {
     static let fontSizeStep: CGFloat = 1
 
     fileprivate static let fontSizeDefaultsKey = "CoTTY.fontSize"
-    fileprivate static let sidebarDefaultsKey = "CoTTY.sidebarVisible"
+    fileprivate static let themeDefaultsKey = "CoTTY.terminalTheme"
+    fileprivate static let customThemeBgKey = "CoTTY.customThemeBg"
+    fileprivate static let customThemeFgKey = "CoTTY.customThemeFg"
+
+    @Published var terminalTheme: TerminalTheme = .defaultDark {
+        didSet {
+            guard terminalTheme != oldValue else { return }
+            UserDefaults.standard.set(terminalTheme.name, forKey: TerminalModel.themeDefaultsKey)
+        }
+    }
+
+    // Hex color values backing the "Custom" theme. Changing either one while
+    // Custom is active rebuilds and re-applies the theme immediately.
+    @Published var customThemeBg: UInt32 = 0x1E1E2E {
+        didSet {
+            UserDefaults.standard.set(customThemeBg, forKey: TerminalModel.customThemeBgKey)
+            if terminalTheme.name == "Custom" {
+                terminalTheme = TerminalTheme.custom(background: customThemeBg, foreground: customThemeFg)
+            }
+        }
+    }
+    @Published var customThemeFg: UInt32 = 0xCDD6F4 {
+        didSet {
+            UserDefaults.standard.set(customThemeFg, forKey: TerminalModel.customThemeFgKey)
+            if terminalTheme.name == "Custom" {
+                terminalTheme = TerminalTheme.custom(background: customThemeBg, foreground: customThemeFg)
+            }
+        }
+    }
 
     let sessionManager = SessionManager()
 
@@ -249,8 +369,18 @@ final class TerminalModel: ObservableObject {
             let raw = CGFloat(defaults.double(forKey: TerminalModel.fontSizeDefaultsKey))
             fontSize = TerminalModel.clampFontSize(raw)
         }
-        if defaults.object(forKey: TerminalModel.sidebarDefaultsKey) != nil {
-            sidebarVisible = defaults.bool(forKey: TerminalModel.sidebarDefaultsKey)
+        if let rawBg = defaults.object(forKey: TerminalModel.customThemeBgKey) as? UInt32 {
+            customThemeBg = rawBg
+        }
+        if let rawFg = defaults.object(forKey: TerminalModel.customThemeFgKey) as? UInt32 {
+            customThemeFg = rawFg
+        }
+        if let name = defaults.string(forKey: TerminalModel.themeDefaultsKey) {
+            if name == "Custom" {
+                terminalTheme = TerminalTheme.custom(background: customThemeBg, foreground: customThemeFg)
+            } else {
+                terminalTheme = TerminalTheme.named(name)
+            }
         }
         // Re-publish child ObservableObject changes.
         sessionManager.objectWillChange.sink { [weak self] _ in
