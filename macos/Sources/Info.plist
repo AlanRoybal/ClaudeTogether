@@ -30,5 +30,16 @@
     <string>$(BORE_SERVER)</string>
     <key>CTBoreSecret</key>
     <string>$(BORE_SECRET)</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>com.claudetogether.join</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>cotty</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>

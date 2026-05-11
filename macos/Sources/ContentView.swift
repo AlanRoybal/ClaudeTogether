@@ -63,6 +63,32 @@ struct ContentView: View {
                     .foregroundStyle(.white)
                     .padding(.top, titleBarInset + 8)
             }
+
+            if model.isViewOnlyPeer {
+                HStack {
+                    Spacer()
+                    Text("View Only")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(.secondary.opacity(0.85), in: Capsule())
+                        .foregroundStyle(.white)
+                        .padding(.trailing, 12)
+                }
+                .padding(.top, titleBarInset + 8)
+            }
+
+            if let msg = model.sessionNotificationMessage {
+                Text(msg)
+                    .font(.callout)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.indigo.opacity(0.85), in: Capsule())
+                    .foregroundStyle(.white)
+                    .padding(.top, titleBarInset + 8)
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .allowsHitTesting(false)
+            }
         }
         .ignoresSafeArea(edges: .top)
         .frame(minWidth: 800, minHeight: 550)
@@ -288,6 +314,17 @@ final class TerminalModel: ObservableObject {
 
     let sessionManager = SessionManager()
 
+    /// Brief auto-dismissing status message shown as an overlay banner.
+    @Published var sessionNotificationMessage: String? = nil
+    private var notificationDismissTask: Task<Void, Never>?
+
+    /// Snapshot of participants from the previous roster update, used to
+    /// detect joins and leaves without a dedicated diff frame.
+    private var previousParticipants: [SessionManager.Participant] = []
+
+    /// Guards the one-time "view only" hint so it doesn't spam on every blocked key.
+    private var hasShownViewOnlyHint = false
+
     /// Compatibility shim: returns the active tab's grid. Kept so existing
     /// call sites that read `model.grid` (renderer, sidebar, snapshot helpers)
     /// continue to work after the multi-tab refactor.
@@ -387,16 +424,34 @@ final class TerminalModel: ObservableObject {
         sessionManager.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }.store(in: &cancellables)
-        sessionManager.$participants.sink { [weak self] _ in
+        sessionManager.$participants.sink { [weak self] newParticipants in
             guard let self = self else { return }
             self.syncSharedInputParticipants(
                 broadcast: self.sessionManager.role == .host)
             self.syncAllGridSharedInputOverlays()
             self.syncEditorParticipants()
+            for p in newParticipants
+                where !self.previousParticipants.contains(where: { $0.identity == p.identity })
+                   && p.identity != self.sessionManager.localIdentity {
+                self.showSessionNotification("\(p.name) joined")
+            }
+            for p in self.previousParticipants
+                where !newParticipants.contains(where: { $0.identity == p.identity })
+                   && p.identity != self.sessionManager.localIdentity {
+                self.showSessionNotification("\(p.name) left")
+            }
+            self.previousParticipants = newParticipants
         }.store(in: &cancellables)
         sessionManager.$accessMode.sink { [weak self] _ in
             self?.syncEditorReadOnlyState()
+            self?.hasShownViewOnlyHint = false
         }.store(in: &cancellables)
+        sessionManager.$publicURL
+            .compactMap { $0.flatMap(URL.init) }
+            .removeDuplicates()
+            .sink { [weak self] url in
+                self?.showShareSheet(for: url)
+            }.store(in: &cancellables)
 
         // Route inbound frames.
         sessionManager.onFrame = { [weak self] frame, peerID in
@@ -1405,10 +1460,10 @@ final class TerminalModel: ObservableObject {
     func promptJoin() {
         let alert = NSAlert()
         alert.messageText = "Join shared session"
-        alert.informativeText = "Paste the share URL (e.g. bore.pub:12345#k=...)"
+        alert.informativeText = "Paste the share URL"
         alert.alertStyle = .informational
         let input = EditableTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
-        input.placeholderString = "host:port#k=..."
+        input.placeholderString = "cotty://join?... or host:port#k=..."
         alert.accessoryView = input
         alert.addButton(withTitle: "Join")
         alert.addButton(withTitle: "Cancel")
@@ -1416,6 +1471,12 @@ final class TerminalModel: ObservableObject {
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
         let raw = input.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Handle claudetogether:// deep-link URLs pasted directly into the dialog.
+        if let parsed = URL(string: raw), parsed.scheme == "cotty" {
+            joinFromURL(parsed)
+            return
+        }
         // Strip optional #k=<base64url> fragment and extract session key.
         let (hostPort, extractedKey): (String, SessionKey?) = {
             if let hashIdx = raw.firstIndex(of: "#") {
@@ -1472,6 +1533,64 @@ final class TerminalModel: ObservableObject {
     /// Replaced as soon as the host announces a real tab via TabOpen.
     static let placeholderTabId: UInt32 = .max
 
+    /// Handles `claudetogether://join?addr=host:port&k=...` URLs opened by
+    /// the system (e.g. clicking a shared link in Messages or Mail).
+    func joinFromURL(_ url: URL) {
+        guard url.scheme == "cotty", url.host == "join",
+              let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let addr = comps.queryItems?.first(where: { $0.name == "addr" })?.value
+        else { return }
+        let keyStr = comps.queryItems?.first(where: { $0.name == "k" })?.value
+        let extractedKey = keyStr.flatMap { SessionKey(base64url: $0) }
+        guard let colon = addr.lastIndex(of: ":"),
+              let port = UInt16(addr[addr.index(after: colon)...]),
+              !addr[..<colon].isEmpty
+        else {
+            NSLog("[ct] joinFromURL: malformed addr \(addr)")
+            return
+        }
+        let host = String(addr[..<colon])
+        guard let peerRoot = FolderPicker.pick(
+            prompt: "Choose the local folder this peer should use as the session root"
+        ) else { return }
+        endSession()
+        sessionManager.stop()
+        guard let placeholder = makePeerTab(id: TerminalModel.placeholderTabId, title: "Shell")
+        else {
+            NSLog("[ct] joinFromURL: placeholder tab create failed")
+            return
+        }
+        tabs = [placeholder]
+        activeTabId = placeholder.id
+        rootPath = peerRoot
+        fileSyncApplier.configure(rootPath: peerRoot)
+        resetSharedInputState()
+        sessionManager.sessionKey = extractedKey
+        DispatchQueue.main.async { [weak self] in
+            self?.sessionManager.joinPeer(host: host, port: port)
+        }
+    }
+
+    /// Presents the native macOS share sheet pre-loaded with the session URL.
+    func showShareSheet(for url: URL) {
+        guard let window = NSApplication.shared.keyWindow
+                        ?? NSApplication.shared.windows.first,
+              let anchor = window.contentView else { return }
+        let picker = NSSharingServicePicker(items: [url])
+        picker.show(relativeTo: .zero, of: anchor, preferredEdge: .minY)
+    }
+
+    /// Shows a brief auto-dismissing notification banner overlay.
+    func showSessionNotification(_ message: String) {
+        notificationDismissTask?.cancel()
+        withAnimation { sessionNotificationMessage = message }
+        notificationDismissTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(3))
+            guard !Task.isCancelled else { return }
+            withAnimation { self.sessionNotificationMessage = nil }
+        }
+    }
+
     // MARK: keystroke + resize handling
 
     /// Called by MetalTerminalView when the user types. The tab id is
@@ -1485,6 +1604,10 @@ final class TerminalModel: ObservableObject {
         // can't bypass the policy. The host always types locally.
         if isViewOnlyPeer {
             NSSound.beep()
+            if !hasShownViewOnlyHint {
+                hasShownViewOnlyHint = true
+                showSessionNotification("View only — contact the host to request edit access")
+            }
             return
         }
         // Route to the split pane when paneIndex == 1 and the tab is split.
