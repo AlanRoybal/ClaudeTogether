@@ -48,7 +48,7 @@ struct SplitPaneView: View {
                 fontSize: model.fontSize,
                 mouseModeEnabled: model.mouseMode,
                 theme: model.terminalTheme)
-            SharedInputAutocompleteOverlay(
+            SharedInputCompletionHintsOverlay(
                 grid: tab.grid,
                 autocomplete: model.inputAutocomplete)
             if tab.splitPane != nil {
