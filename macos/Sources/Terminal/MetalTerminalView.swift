@@ -626,11 +626,23 @@ final class MetalTerminalNSView: NSView {
     }
 
     private func currentAuthoritativeGridSize() -> (cols: UInt16, rows: UInt16)? {
-        guard let size = currentLayoutDrawableSize() else { return nil }
+        // Must use the same size source AND the same formula as
+        // recomputeGrid so that authoritative rows == renderer.rows and
+        // propagateResizeIfAuthoritative can fire.
+        let drawableSize = mtkView.drawableSize
+        let size: CGSize
+        if drawableSize.width > 0, drawableSize.height > 0 {
+            size = drawableSize
+        } else if let layout = currentLayoutDrawableSize() {
+            size = layout
+        } else {
+            return nil
+        }
         let cellWidth = max(1, renderer.atlas.cellWidthPx)
         let cellHeight = max(1, renderer.atlas.cellHeightPx)
         let cols = max(1, Int(size.width) / cellWidth)
-        let rows = max(1, Int(size.height) / cellHeight)
+        let cornerInsetPx = Int(10.0 * renderer.atlas.scale)
+        let rows = max(1, (Int(size.height) - cornerInsetPx) / cellHeight)
         return (
             cols: UInt16(min(Int(UInt16.max), cols)),
             rows: UInt16(min(Int(UInt16.max), rows))
@@ -652,14 +664,14 @@ final class MetalTerminalNSView: NSView {
     }
 
     private func currentDrawableSizeForSync() -> CGSize? {
-        if let size = currentLayoutDrawableSize() {
-            return size
-        }
+        // Prefer the Metal drawable size — it's what the render uniforms use,
+        // so the row/col count stays consistent and cells never render outside
+        // the viewport. Fall back to layout bounds before Metal sets up.
         let drawableSize = mtkView.drawableSize
         if drawableSize.width > 0, drawableSize.height > 0 {
             return drawableSize
         }
-        return nil
+        return currentLayoutDrawableSize()
     }
 }
 

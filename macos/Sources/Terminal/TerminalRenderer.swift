@@ -429,7 +429,12 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         let cw = max(1, atlas.cellWidthPx)
         let ch = max(1, atlas.cellHeightPx)
         let cols = max(1, Int(drawableSize.width) / cw)
-        let rows = max(1, Int(drawableSize.height) / ch)
+        // Reserve one corner-radius worth of pixels at the bottom so the last
+        // row is never clipped by macOS window rounded corners (~10 pt on
+        // Sonoma/Sequoia). Full-screen has no corners so the only cost there is
+        // a few pixels of background at the bottom — imperceptible at that size.
+        let cornerInsetPx = Int(10.0 * atlas.scale)
+        let rows = max(1, (Int(drawableSize.height) - cornerInsetPx) / ch)
         let newCols = UInt16(min(Int(UInt16.max), cols))
         let newRows = UInt16(min(Int(UInt16.max), rows))
         if newCols != self.cols || newRows != self.rows {

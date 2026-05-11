@@ -67,14 +67,11 @@ final class GridModel: ObservableObject {
     var isUsingAlternateScreen: Bool { term.isUsingAlternateScreen }
 
     func feed(_ bytes: [UInt8]) {
-        let previousScrollbackLength = term.scrollbackLength
         term.feed(bytes)
-        if term.isUsingAlternateScreen {
-            scrollOffsetRows = 0
-        } else if scrollOffsetRows > 0 {
-            let addedRows = max(0, term.scrollbackLength - previousScrollbackLength)
-            scrollOffsetRows = min(scrollOffsetRows + addedRows, maxScrollOffset)
-        }
+        // Always follow new output: snap back to the live view so the terminal
+        // auto-scrolls. Users who want to read history can scroll up manually;
+        // the scroll-back indicator lets them return to the live view.
+        scrollOffsetRows = 0
         if overlay == nil {
             syncTerminalCursors()
         } else {
