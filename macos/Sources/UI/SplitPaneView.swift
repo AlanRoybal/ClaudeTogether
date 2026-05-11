@@ -43,6 +43,14 @@ struct SplitPaneView: View {
                 onMouseCell: { col, row in
                     model.handleTerminalMouseCell(col: col, row: row, forTabId: tab.id)
                 },
+                onPaste: { sanitized in
+                    model.setActivePaneIndex(tabId: tab.id, index: 0)
+                    model.handlePaste(sanitized, forTabId: tab.id, paneIndex: 0)
+                },
+                onFileDrop: { url in
+                    model.setActivePaneIndex(tabId: tab.id, index: 0)
+                    model.handleFileDrop(url, forTabId: tab.id, paneIndex: 0)
+                },
                 inputEnabled: model.inputEnabled,
                 isActive: true,
                 fontSize: model.fontSize,
@@ -75,6 +83,16 @@ struct SplitPaneView: View {
                 onResize: { cols, rows in
                     model.handleSplitPaneResize(
                         tabId: tab.id, paneId: pane.id, cols: cols, rows: rows)
+                },
+                onPaste: { sanitized in
+                    model.setActivePaneIndex(tabId: tab.id, index: 1)
+                    model.broadcastSplitPaneCursor(paneId: pane.id, grid: pane.grid)
+                    model.handlePaste(sanitized, forTabId: tab.id, paneIndex: 1)
+                },
+                onFileDrop: { url in
+                    model.setActivePaneIndex(tabId: tab.id, index: 1)
+                    model.broadcastSplitPaneCursor(paneId: pane.id, grid: pane.grid)
+                    model.handleFileDrop(url, forTabId: tab.id, paneIndex: 1)
                 },
                 inputEnabled: model.inputEnabled,
                 isActive: true,

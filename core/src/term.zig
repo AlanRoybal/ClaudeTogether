@@ -153,6 +153,14 @@ export fn ct_term_mouse_mode(t: ?*Term) u32 {
     return 0;
 }
 
+/// Returns 1 when the running app has enabled bracketed paste mode (DECSET ?2004h),
+/// 0 otherwise. Swift paste handlers wrap clipboard bytes in \x1b[200~ / \x1b[201~
+/// when this is set.
+export fn ct_term_bracketed_paste_mode(t: ?*Term) c_int {
+    if (t) |p| return if (p.grid.bracketed_paste_mode) 1 else 0;
+    return 0;
+}
+
 test "C ABI exposes terminal scrollback rows" {
     const testing = std.testing;
     var term = try Term.init(testing.allocator, 4, 2);

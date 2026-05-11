@@ -87,6 +87,7 @@ uint32_t ct_term_dirty_epoch(ct_term *t);
 #define CT_MOUSE_SGR   (1u << 3) /* DECSET 1006  — xterm SGR encoding        */
 #define CT_MOUSE_URXVT (1u << 4) /* DECSET 1015  — urxvt encoding (rarely)   */
 uint32_t ct_term_mouse_mode(ct_term *t);
+int      ct_term_bracketed_paste_mode(ct_term *t);
 
 /* ---- Session (Phase 3) ----------------------------------------------- */
 

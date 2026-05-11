@@ -135,6 +135,8 @@ pub const Grid = struct {
     /// macOS mouse events to the PTY.
     mouse_mode: u32 = 0,
 
+    bracketed_paste_mode: bool = true,
+
     pub fn init(alloc: std.mem.Allocator, cols: u16, rows: u16) !Grid {
         const sz: usize = @as(usize, cols) * @as(usize, rows);
         const primary = try alloc.alloc(Cell, sz);
@@ -460,6 +462,7 @@ pub const Grid = struct {
                         self.restoreCursor();
                     }
                 },
+                2004 => self.bracketed_paste_mode = set,
                 else => {},
             }
         }
@@ -479,6 +482,7 @@ pub const Grid = struct {
         self.cells = if (to_alt) self.alt else self.primary;
         self.scroll_top = 0;
         self.scroll_bottom = self.rows - 1;
+        self.bracketed_paste_mode = false;
     }
 
     fn clearActive(self: *Grid) void {
