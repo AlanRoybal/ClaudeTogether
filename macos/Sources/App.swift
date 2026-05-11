@@ -99,6 +99,12 @@ struct CoTTYApp: App {
                     .disabled(model.grid == nil)
             }
 
+            CommandMenu("Format") {
+                Button("Format with Prettier") { model.formatWithPrettier() }
+                    .keyboardShortcut("p", modifiers: [.command, .option])
+                    .disabled(model.activeEditor == nil || model.sessionManager.role != .host)
+            }
+
             // View menu: clear screen, font size, theme.
             CommandGroup(after: .toolbar) {
                 Button("Clear Screen") { model.clearScreen() }

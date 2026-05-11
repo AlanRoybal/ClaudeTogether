@@ -1204,6 +1204,32 @@ final class TerminalModel: ObservableObject {
         handleKey(Array(sanitized.utf8), forTabId: activeTabId)
     }
 
+    func formatWithPrettier() {
+        guard sessionManager.role == .host,
+              let editor = activeEditor,
+              let url = resolveEditorURL(sessionPath: editor.state.path) else { return }
+        saveEditor(docId: editor.state.docId)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["prettier", "--write", url.path]
+        process.terminationHandler = { [weak self] proc in
+            guard proc.terminationStatus == 0 else {
+                if proc.terminationStatus == 127 {
+                    DispatchQueue.main.async {
+                        self?.postTerminalNotice("prettier not found — install with: npm i -g prettier")
+                    }
+                }
+                return
+            }
+            guard let formatted = try? String(contentsOf: url, encoding: .utf8) else { return }
+            DispatchQueue.main.async {
+                try? editor.replaceText(formatted)
+                self?.saveEditor(docId: editor.state.docId)
+            }
+        }
+        try? process.run()
+    }
+
     /// Decode the visible cells into a String (one line per row, no trailing
     /// blanks) and push it to NSPasteboard.
     func copyVisibleTerminalToPasteboard() {
