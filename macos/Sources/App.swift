@@ -20,6 +20,7 @@ struct CoTTYApp: App {
                         }
                     }
                 }
+                .onOpenURL { url in model.joinFromURL(url) }
         }
         .commands {
             // File menu: standard Mac terminal session lifecycle and tabs.
@@ -252,23 +253,19 @@ private func sessionMenuItems(model: TerminalModel) -> some View {
         Button(statusLabel) {}.disabled(true)
 
         if model.sessionManager.role == .host {
-            if let url = model.sessionManager.publicURL {
-                Button("Copy Session URL") {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(url, forType: .string)
-                }
-                .keyboardShortcut("u", modifiers: [.command, .shift])
+            if let urlStr = model.sessionManager.publicURL,
+               let url = URL(string: urlStr) {
+                ShareLink("Share Session URL", item: url)
+                    .keyboardShortcut("u", modifiers: [.command, .shift])
             } else if let err = model.sessionManager.lastError {
                 Button("Tunnel Error: \(err)") {}.disabled(true)
                 Button("Retry Tunnel") { model.retryBoreTunnel() }
             } else {
                 Button("Connecting to relay…") {}.disabled(true)
             }
-        } else if let url = model.sessionManager.publicURL {
-            Button("Copy Session URL") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(url, forType: .string)
-            }
+        } else if let urlStr = model.sessionManager.publicURL,
+                  let url = URL(string: urlStr) {
+            ShareLink("Share Session URL", item: url)
         }
 
         if !model.sessionManager.participants.isEmpty {

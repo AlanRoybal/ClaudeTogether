@@ -554,7 +554,9 @@ final class SessionManager: ObservableObject {
                 if n > 0 {
                     var url = String(bytes: buf.prefix(min(n, buf.count)), encoding: .utf8)
                     if let keyFrag = self.sessionKey?.base64url {
-                        url = url.map { "\($0)#k=\(keyFrag)" }
+                        url = url.map { "cotty://join?addr=\($0)&k=\(keyFrag)" }
+                    } else {
+                        url = url.map { "cotty://join?addr=\($0)" }
                     }
                     self.publicURL = url
                     NSLog("[ct] bore url ready: %@", url ?? "<nil>")
