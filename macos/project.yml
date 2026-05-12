@@ -34,6 +34,7 @@ targets:
       - path: Sources
         excludes:
           - "Assets.xcassets"
+          - "Fonts"        # handled by postBuildScript; not a Swift source folder
       - path: Resources/AppIcon.icns
         buildPhase: resources
     settings:
@@ -70,4 +71,29 @@ targets:
           codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" "$DST"
           rm -f "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/bore"
           echo "bundled bore helper -> $DST"
+        shell: /bin/bash
+      - name: Bundle Fira Code fonts
+        inputFiles:
+          - $(SRCROOT)/Sources/Fonts/FiraCode-Regular.ttf
+          - $(SRCROOT)/Sources/Fonts/FiraCode-Bold.ttf
+          - $(SRCROOT)/Sources/Fonts/FiraCode-Light.ttf
+          - $(SRCROOT)/Sources/Fonts/FiraCode-Medium.ttf
+          - $(SRCROOT)/Sources/Fonts/FiraCode-Retina.ttf
+          - $(SRCROOT)/Sources/Fonts/FiraCode-SemiBold.ttf
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Fonts/FiraCode-Regular.ttf
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Fonts/FiraCode-Bold.ttf
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Fonts/FiraCode-Light.ttf
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Fonts/FiraCode-Medium.ttf
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Fonts/FiraCode-Retina.ttf
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/Fonts/FiraCode-SemiBold.ttf
+        script: |
+          set -euo pipefail
+          SRC="$SRCROOT/Sources/Fonts"
+          DST="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/Fonts"
+          mkdir -p "$DST"
+          for f in FiraCode-Regular FiraCode-Bold FiraCode-Light FiraCode-Medium FiraCode-Retina FiraCode-SemiBold; do
+            cp -f "$SRC/$f.ttf" "$DST/$f.ttf"
+          done
+          echo "bundled Fira Code fonts -> $DST"
         shell: /bin/bash

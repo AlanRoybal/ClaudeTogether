@@ -35,6 +35,8 @@ struct SharedInputSnapshot {
     var anchorRow: UInt16
     var text: String
     var cursors: [SharedInputCursorState]
+    /// Host's shell working directory at snapshot time. Empty string when unknown.
+    var cwd: String = ""
 }
 
 enum SharedInputPacket {
@@ -90,6 +92,10 @@ enum SharedInputCodec {
                 out.append(contentsOf: cursor.identity.bytes)
                 appendU16(&out, UInt16(min(cursor.offset, Int(UInt16.max))))
             }
+            // cwd appended last so older receivers tolerate missing field via truncated guard
+            let cwdUtf8 = Array(snap.cwd.utf8)
+            appendU16(&out, UInt16(min(cwdUtf8.count, Int(UInt16.max))))
+            out.append(contentsOf: cwdUtf8.prefix(Int(UInt16.max)))
         }
         return out
     }
@@ -146,13 +152,20 @@ enum SharedInputCodec {
                     identity: identity,
                     offset: offset))
             }
+            // cwd is optional trailing field — older senders won't include it
+            var cwd = ""
+            if let cwdLen = try? r.readU16(),
+               let cwdData = try? r.readBytes(Int(cwdLen)) {
+                cwd = String(data: cwdData, encoding: .utf8) ?? ""
+            }
             return .snapshot(tabId: tabId, SharedInputSnapshot(
                 revision: revision,
                 isActive: isActive,
                 anchorCol: anchorCol,
                 anchorRow: anchorRow,
                 text: text,
-                cursors: cursors))
+                cursors: cursors,
+                cwd: cwd))
         default:
             throw SharedInputCodecError.invalidEnum
         }
@@ -178,6 +191,9 @@ struct SharedInputState {
     private(set) var anchorRow: UInt16 = 0
     private(set) var textScalars: [UnicodeScalar] = []
     private(set) var cursors: [UserIdentity: Int] = [:]
+    /// Host's shell CWD as of the last received snapshot. Empty for the host itself
+    /// (which reads CWD directly from the PTY) and for old peers without the field.
+    private(set) var lastKnownCwd: String = ""
 
     var text: String {
         textScalars.map(String.init).joined()
@@ -331,6 +347,9 @@ struct SharedInputState {
         for cursor in snapshot.cursors {
             self.cursors[cursor.identity] = clamp(cursor.offset, max: textScalars.count)
         }
+        if !snapshot.cwd.isEmpty {
+            lastKnownCwd = snapshot.cwd
+        }
     }
 
     mutating func overrideAnchor(anchorCol: UInt16,
@@ -349,7 +368,7 @@ struct SharedInputState {
         cursors[identity] = min(max(0, offset), textScalars.count)
     }
 
-    func snapshot(participants: [UserIdentity]) -> SharedInputSnapshot {
+    func snapshot(participants: [UserIdentity], cwd: String = "") -> SharedInputSnapshot {
         let activeCursors: [SharedInputCursorState]
         if isActive {
             activeCursors = participants.compactMap { identity in
@@ -367,7 +386,8 @@ struct SharedInputState {
             anchorCol: anchorCol,
             anchorRow: anchorRow,
             text: isActive ? text : "",
-            cursors: activeCursors)
+            cursors: activeCursors,
+            cwd: cwd)
     }
 
     private mutating func shiftOtherCursors(startingAt threshold: Int,

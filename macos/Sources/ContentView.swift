@@ -286,6 +286,11 @@ final class TerminalModel: ObservableObject {
     fileprivate static let themeDefaultsKey = "CoTTY.terminalTheme"
     fileprivate static let customThemeBgKey = "CoTTY.customThemeBg"
     fileprivate static let customThemeFgKey = "CoTTY.customThemeFg"
+    fileprivate static let ligaturesEnabledKey = "CoTTY.ligaturesEnabled"
+    fileprivate static let fontNameKey = "CoTTY.fontName"
+    /// PostScript name of the preferred font. Falls back to system monospace if
+    /// the named font is not installed.
+    static let defaultFontName = "FiraCode-Regular"
 
     @Published var terminalTheme: TerminalTheme = .defaultDark {
         didSet {
@@ -310,6 +315,20 @@ final class TerminalModel: ObservableObject {
             if terminalTheme.name == "Custom" {
                 terminalTheme = TerminalTheme.custom(background: customThemeBg, foreground: customThemeFg)
             }
+        }
+    }
+
+    @Published var fontName: String = TerminalModel.defaultFontName {
+        didSet {
+            guard fontName != oldValue else { return }
+            UserDefaults.standard.set(fontName, forKey: TerminalModel.fontNameKey)
+        }
+    }
+
+    @Published var ligaturesEnabled: Bool = true {
+        didSet {
+            guard ligaturesEnabled != oldValue else { return }
+            UserDefaults.standard.set(ligaturesEnabled, forKey: TerminalModel.ligaturesEnabledKey)
         }
     }
 
@@ -431,6 +450,14 @@ final class TerminalModel: ObservableObject {
             } else {
                 terminalTheme = TerminalTheme.named(name)
             }
+        }
+        if let savedFont = defaults.string(forKey: TerminalModel.fontNameKey) {
+            fontName = savedFont
+        }
+        // ligaturesEnabled defaults to true; only override if the user has
+        // explicitly saved a false value.
+        if defaults.object(forKey: TerminalModel.ligaturesEnabledKey) != nil {
+            ligaturesEnabled = defaults.bool(forKey: TerminalModel.ligaturesEnabledKey)
         }
         // Re-publish child ObservableObject changes.
         sessionManager.objectWillChange.sink { [weak self] _ in
@@ -1131,6 +1158,16 @@ final class TerminalModel: ObservableObject {
         }
     }
 
+    /// SwiftUI font matching the current terminal font settings. Used by
+    /// overlays that render text over the terminal (autocomplete hints, etc.)
+    /// so each user sees hints in their own chosen font.
+    var terminalFont: Font {
+        if !fontName.isEmpty, NSFont(name: fontName, size: fontSize) != nil {
+            return .custom(fontName, size: fontSize)
+        }
+        return .system(size: fontSize, design: .monospaced)
+    }
+
     // MARK: menu / hotkey actions
 
     /// True when there's something for ⌘W to close (host PTY, peer grid,
@@ -1671,14 +1708,21 @@ final class TerminalModel: ObservableObject {
         }
     }
 
-    /// Presents the native macOS share sheet pre-loaded with the session URL.
+    /// Presents the native macOS share sheet pre-loaded with the session URL,
+    /// with "Copy Link" prepended as the first option.
     func showShareSheet(for url: URL) {
         guard let window = NSApplication.shared.keyWindow
                         ?? NSApplication.shared.windows.first,
               let anchor = window.contentView else { return }
         let picker = NSSharingServicePicker(items: [url])
+        let delegate = CopyLinkPickerDelegate(url: url)
+        picker.delegate = delegate
+        _sharePickerDelegate = delegate
         picker.show(relativeTo: .zero, of: anchor, preferredEdge: .minY)
     }
+
+    // Held strongly so the picker delegate lives as long as the model.
+    private var _sharePickerDelegate: NSObject?
 
     /// Shows a brief auto-dismissing notification banner overlay.
     func showSessionNotification(_ message: String) {
@@ -2632,8 +2676,11 @@ final class TerminalModel: ObservableObject {
             return
         }
         let state = sharedInputs[tabId] ?? SharedInputState()
+        let ptyPid = tabs.first(where: { $0.id == tabId })?.pty?.pid ?? 0
+        let currentCwd = ptyPid > 0 ? (TabTitleResolver.cwd(pid: ptyPid) ?? "") : ""
         let snapshot = state.snapshot(
-            participants: sharedInputParticipants(forTabId: tabId))
+            participants: sharedInputParticipants(forTabId: tabId),
+            cwd: currentCwd)
         sessionManager.broadcast(.inputOp(
             SharedInputCodec.encode(.snapshot(tabId: tabId, snapshot))))
     }
@@ -2860,12 +2907,12 @@ final class TerminalModel: ObservableObject {
     // MARK: shared-input autocomplete
 
     private func refreshInputAutocomplete() {
-        guard inputAutocomplete.visible, let cwd = filesystemCompletionCwd else {
-            inputAutocomplete.dismiss()
-            filesystemCompletionCwd = nil
-            return
-        }
-        guard let tabId = activeTabId,
+        // Overlay not shown yet — skip rather than clearing filesystemCompletionCwd.
+        // This prevents mid-setup calls (e.g. from insertTextIntoSharedInput) from
+        // tearing down state that handleFilesystemTab is about to use.
+        guard inputAutocomplete.visible else { return }
+        guard let cwd = filesystemCompletionCwd,
+              let tabId = activeTabId,
               let text = sharedInputs[tabId]?.text
         else {
             inputAutocomplete.dismiss()
@@ -2904,6 +2951,8 @@ final class TerminalModel: ObservableObject {
         if let pty = tabs.first(where: { $0.id == tabId })?.pty, pty.pid > 0,
            let resolved = TabTitleResolver.cwd(pid: pty.pid) {
             cwd = resolved
+        } else if let peerCwd = sharedInputs[tabId]?.lastKnownCwd, !peerCwd.isEmpty {
+            cwd = peerCwd   // use host's CWD broadcast via snapshot (peer/guest path)
         } else {
             cwd = NSHomeDirectory()
         }
@@ -3614,5 +3663,32 @@ struct SharedInputAutocompleteOverlay: View {
         let px = min(max(0, caretX),
                      max(0, geo.size.width - estWidth))
         return CGPoint(x: px, y: py)
+    }
+}
+
+// MARK: - Share sheet helpers
+
+private final class CopyLinkPickerDelegate: NSObject, NSSharingServicePickerDelegate {
+    private let url: URL
+    init(url: URL) { self.url = url }
+
+    func sharingServicePicker(
+        _ sharingServicePicker: NSSharingServicePicker,
+        sharingServicesForItems items: [Any],
+        proposedSharingServices proposedServices: [NSSharingService]
+    ) -> [NSSharingService] {
+        let icon = NSImage(systemSymbolName: "link", accessibilityDescription: nil)
+            ?? NSImage(named: NSImage.networkName)
+            ?? NSImage()
+        let copyService = NSSharingService(
+            title: "Copy Link",
+            image: icon,
+            alternateImage: nil
+        ) { [weak self] in
+            guard let self else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(self.url.absoluteString, forType: .string)
+        }
+        return [copyService] + proposedServices
     }
 }

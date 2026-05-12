@@ -55,10 +55,13 @@ struct SplitPaneView: View {
                 isActive: true,
                 fontSize: model.fontSize,
                 mouseModeEnabled: model.mouseMode,
-                theme: model.terminalTheme)
+                theme: model.terminalTheme,
+                fontName: model.fontName,
+                ligaturesEnabled: model.ligaturesEnabled)
             SharedInputCompletionHintsOverlay(
                 grid: tab.grid,
-                autocomplete: model.inputAutocomplete)
+                autocomplete: model.inputAutocomplete,
+                terminalFont: model.terminalFont)
             if tab.splitPane != nil {
                 paneFocusIndicator(active: tab.activePaneIndex == 0)
             }
@@ -98,7 +101,8 @@ struct SplitPaneView: View {
                 isActive: true,
                 fontSize: model.fontSize,
                 mouseModeEnabled: model.mouseMode,
-                theme: model.terminalTheme)
+                theme: model.terminalTheme,
+                ligaturesEnabled: model.ligaturesEnabled)
             paneFocusIndicator(active: tab.activePaneIndex == 1)
         }
         .frame(minWidth: 200, minHeight: 100)

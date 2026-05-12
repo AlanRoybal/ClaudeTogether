@@ -26,6 +26,8 @@
     <string>AppIcon</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>ATSApplicationFontsPath</key>
+    <string>Fonts</string>
     <key>CTBoreServer</key>
     <string>$(BORE_SERVER)</string>
     <key>CTBoreSecret</key>

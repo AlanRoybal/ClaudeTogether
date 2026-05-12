@@ -229,13 +229,35 @@ struct PreferencesView: View {
                     HexColorField(label: "Foreground", color: $model.customThemeFg)
                 }
 
+                Divider()
+                Text("Font")
+                    .font(.headline)
+                HStack(spacing: 6) {
+                    TextField("PostScript font name", text: $model.fontName)
+                        .textFieldStyle(.roundedBorder)
+                    let installed = NSFont(name: model.fontName, size: 13) != nil
+                    Image(systemName: installed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                        .foregroundStyle(installed ? Color.green : Color.red)
+                        .help(installed ? "Font found" : "Font not installed — falling back to system monospace")
+                }
+                Text("Leave blank or enter a PostScript font name (e.g. FiraCode-Regular).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                Divider()
+
+                Toggle("Enable Ligatures", isOn: $model.ligaturesEnabled)
+                Text("Renders programming sequences (→, ⇒, ≠, …) as combined glyphs when your font supports them.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 Spacer()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             .padding(20)
             .tabItem { Label("Appearance", systemImage: "paintbrush") }
         }
-        .frame(width: 480, height: 300)
+        .frame(width: 480, height: 420)
     }
 }
 
