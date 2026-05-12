@@ -43,8 +43,10 @@ final class GlyphAtlas {
     private let padding: Int = 1
 
     private var cache: [UInt32: Entry] = [:]
+    private var ligatureCache: [String: Entry?] = [:]
 
     init?(device: MTLDevice,
+          fontName: String? = nil,
           pointSize: CGFloat = 13,
           scale: CGFloat = 2,
           atlasSize: Int = 2048)
@@ -54,7 +56,13 @@ final class GlyphAtlas {
         self.atlasWidthPx = atlasSize
         self.atlasHeightPx = atlasSize
 
-        let nsFont = NSFont.monospacedSystemFont(ofSize: pointSize, weight: .regular)
+        let nsFont: NSFont
+        if let name = fontName, !name.isEmpty,
+           let custom = NSFont(name: name, size: pointSize) {
+            nsFont = custom
+        } else {
+            nsFont = NSFont.monospacedSystemFont(ofSize: pointSize, weight: .regular)
+        }
         let font = nsFont as CTFont
 
         let ascent = CTFontGetAscent(font)
@@ -94,6 +102,15 @@ final class GlyphAtlas {
         self.texture = tex
     }
 
+    /// Look up or rasterize a multi-character ligature sequence. Returns nil if
+    /// the sequence produces an empty glyph (e.g. the font has no coverage).
+    func entry(forSequence seq: String) -> Entry? {
+        if let cached = ligatureCache[seq] { return cached }
+        let result = rasterize(sequence: seq)
+        ligatureCache[seq] = result   // cache miss (nil) too, to avoid re-shaping
+        return result
+    }
+
     func entry(for codepoint: UInt32, cellsWide: Int) -> Entry? {
         if let hit = cache[codepoint] { return hit }
         guard let e = rasterize(codepoint: codepoint, cellsWide: cellsWide) else {
@@ -101,6 +118,61 @@ final class GlyphAtlas {
         }
         cache[codepoint] = e
         return e
+    }
+
+    private func rasterize(sequence: String) -> Entry? {
+        let cellsWide = sequence.unicodeScalars.count
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: CGColor(gray: 1, alpha: 1),
+        ]
+        let line = CTLineCreateWithAttributedString(
+            NSAttributedString(string: sequence, attributes: attrs))
+        let bounds = CTLineGetBoundsWithOptions(line, .useGlyphPathBounds)
+        if bounds.size.width < 0.25 || bounds.size.height < 0.25 {
+            return Entry(atlasX: 0, atlasY: 0,
+                         pixelW: 0, pixelH: 0,
+                         bearingX: 0, bearingYTop: 0,
+                         cellsWide: cellsWide)
+        }
+        let pxW = max(1, Int(ceil(bounds.size.width * scale)))
+        let pxH = max(1, Int(ceil(bounds.size.height * scale)))
+        guard let (ax, ay) = reserve(w: pxW, h: pxH) else { return nil }
+        let bytesPerRow = pxW
+        var bytes = [UInt8](repeating: 0, count: bytesPerRow * pxH)
+        bytes.withUnsafeMutableBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            guard let ctx = CGContext(
+                data: base,
+                width: pxW, height: pxH,
+                bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+                space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGImageAlphaInfo.alphaOnly.rawValue)
+            else { return }
+            ctx.setShouldAntialias(true)
+            ctx.setAllowsFontSmoothing(true)
+            ctx.setShouldSmoothFonts(true)
+            ctx.setAllowsFontSubpixelPositioning(true)
+            ctx.setShouldSubpixelPositionFonts(true)
+            ctx.setAllowsFontSubpixelQuantization(false)
+            ctx.setShouldSubpixelQuantizeFonts(false)
+            ctx.textMatrix = .identity
+            ctx.scaleBy(x: scale, y: scale)
+            ctx.textPosition = CGPoint(x: -bounds.origin.x, y: -bounds.origin.y)
+            CTLineDraw(line, ctx)
+        }
+        let region = MTLRegionMake2D(ax, ay, pxW, pxH)
+        bytes.withUnsafeBytes { raw in
+            texture.replace(region: region, mipmapLevel: 0,
+                            withBytes: raw.baseAddress!, bytesPerRow: bytesPerRow)
+        }
+        let bearingX = Int(floor(bounds.origin.x * scale))
+        let topAboveBaselinePt = bounds.origin.y + bounds.size.height
+        let bearingYTop = cellBaselinePx + Int(ceil(topAboveBaselinePt * scale))
+        return Entry(atlasX: ax, atlasY: ay,
+                     pixelW: pxW, pixelH: pxH,
+                     bearingX: bearingX, bearingYTop: bearingYTop,
+                     cellsWide: cellsWide)
     }
 
     private func rasterize(codepoint: UInt32, cellsWide: Int) -> Entry? {

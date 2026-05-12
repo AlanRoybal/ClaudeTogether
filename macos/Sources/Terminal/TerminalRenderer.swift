@@ -73,6 +73,26 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     /// at runtime — the atlas is rebuilt and the grid is re-measured.
     private(set) var pointSize: CGFloat = 13
 
+    /// PostScript font name passed to GlyphAtlas. Empty string = system monospace.
+    /// Use `setFontName(_:)` to change at runtime.
+    private(set) var fontName: String = ""
+
+    /// When true the draw loop attempts ligature substitution for known
+    /// programming sequences before falling back to individual-glyph rendering.
+    var ligaturesEnabled: Bool = true
+
+    private static let ligatureSequences: [String] = [
+        // longest first so greedy matching picks the longest match
+        "!==", "===", "<->", "<=>", ">>>", "<<<",
+        "->",  "=>",  "<-",  "<|",  "|>",  "!=",
+        "==",  ">=",  "<=",  "&&",  "||",  "??",
+        "::",  "++",  "--",  "..",  "//",  "/*",
+        "*/",  "**",  ">>",  "<<",
+    ]
+    private static let ligatureStarters: Set<UInt32> = {
+        Set(ligatureSequences.compactMap { $0.unicodeScalars.first?.value })
+    }()
+
     /// Cell size in view points (NOT pixels). MetalTerminalNSView uses this
     /// to translate `event.locationInWindow` → grid (col, row) for mouse
     /// reporting. Returns the atlas pixel size divided by the view's backing
@@ -101,12 +121,13 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     /// inclusive and `start` is always <= `end` (row-major order).
     var selection: (start: (col: Int, row: Int), end: (col: Int, row: Int))? = nil
 
-    init?(view: MTKView, pointSize: CGFloat = 13) {
+    init?(view: MTKView, fontName: String = "", pointSize: CGFloat = 13) {
         guard let device = view.device ?? MTLCreateSystemDefaultDevice() else {
             return nil
         }
         view.device = device
         self.device = device
+        self.fontName = fontName
 
         guard let queue = device.makeCommandQueue() else { return nil }
         self.commandQueue = queue
@@ -116,7 +137,10 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         let scale = view.window?.backingScaleFactor
             ?? NSScreen.main?.backingScaleFactor
             ?? 2.0
-        guard let atlas = GlyphAtlas(device: device, pointSize: pointSize, scale: scale) else {
+        guard let atlas = GlyphAtlas(device: device,
+                                     fontName: fontName.isEmpty ? nil : fontName,
+                                     pointSize: pointSize,
+                                     scale: scale) else {
             return nil
         }
         self.atlas = atlas
@@ -212,6 +236,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             let actual = size.width / view.bounds.width
             if abs(actual - atlas.scale) > 0.1,
                let newAtlas = GlyphAtlas(device: device,
+                                         fontName: fontName.isEmpty ? nil : fontName,
                                          pointSize: pointSize,
                                          scale: actual)
             {
@@ -231,7 +256,25 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         let scale = view?.window?.backingScaleFactor
             ?? atlas.scale
         if let newAtlas = GlyphAtlas(device: device,
+                                     fontName: fontName.isEmpty ? nil : fontName,
                                      pointSize: newPointSize,
+                                     scale: scale)
+        {
+            self.atlas = newAtlas
+        }
+        if let v = view {
+            recomputeGrid(for: v.drawableSize)
+            v.setNeedsDisplay(v.bounds)
+        }
+    }
+
+    func setFontName(_ newName: String) {
+        guard newName != fontName else { return }
+        fontName = newName
+        let scale = view?.window?.backingScaleFactor ?? atlas.scale
+        if let newAtlas = GlyphAtlas(device: device,
+                                     fontName: newName.isEmpty ? nil : newName,
+                                     pointSize: pointSize,
                                      scale: scale)
         {
             self.atlas = newAtlas
@@ -278,6 +321,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             let atlasW = Float(atlas.atlasWidthPx)
             let atlasH = Float(atlas.atlasHeightPx)
             for y in 0..<rows {
+                var skipUntilX = 0
                 for x in 0..<cols {
                     let c = snap[y * cols + x]
                     // width==0 marks the trailing half of a CJK wide glyph.
@@ -294,8 +338,24 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                     bi.color = selectionSnapshot.map { isCellSelected(col: x, row: y, sel: $0) ? selectionColor : bg } ?? bg
                     bgInstances.append(bi)
 
-                    // TEXT: skip wide-glyph trailing halves and blanks.
+                    // TEXT: skip wide-glyph trailing halves, blanks, and interior
+                    // cells already consumed by a ligature rendered to their left.
                     if c.width == 0 { continue }
+                    if x < skipUntilX { continue }
+
+                    // Ligature lookahead: try to match a multi-char sequence
+                    // and shape it as a single glyph spanning N cells.
+                    if ligaturesEnabled && TerminalRenderer.ligatureStarters.contains(c.codepoint) {
+                        if let ti = makeLigatureTextInstance(
+                            snap: snap, x: x, y: y, cols: cols,
+                            atlasW: atlasW, atlasH: atlasH,
+                            skipUntilX: &skipUntilX)
+                        {
+                            textInstances.append(ti)
+                            continue
+                        }
+                    }
+
                     if let ti = makeTextInstance(
                         cell: c,
                         col: UInt16(x),
@@ -524,6 +584,46 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             Float(entry.pixelH) / atlasH)
         ti.fg = color
         return ti
+    }
+
+    private func makeLigatureTextInstance(
+        snap: UnsafeBufferPointer<ct_cell>,
+        x: Int, y: Int, cols: Int,
+        atlasW: Float, atlasH: Float,
+        skipUntilX: inout Int
+    ) -> TextInstance? {
+        let startCell = snap[y * cols + x]
+        for seq in TerminalRenderer.ligatureSequences {
+            let scalars = Array(seq.unicodeScalars)
+            guard scalars.first?.value == startCell.codepoint else { continue }
+            guard x + scalars.count <= cols else { continue }
+            var ok = true
+            for i in 1..<scalars.count {
+                let cell = snap[y * cols + x + i]
+                if cell.codepoint != scalars[i].value || cell.width == 0
+                    || cell.fg != startCell.fg || cell.attrs != startCell.attrs {
+                    ok = false; break
+                }
+            }
+            guard ok else { continue }
+            guard let entry = atlas.entry(forSequence: seq),
+                  entry.pixelW > 0, entry.pixelH > 0 else { continue }
+
+            let fg = unpack(fgColorMap[startCell.fg] ?? startCell.fg)
+            var ti = TextInstance()
+            ti.gridPos   = SIMD2<UInt16>(UInt16(x), UInt16(y))
+            ti.offset    = SIMD2<Int16>(Int16(entry.bearingX),
+                                        Int16(atlas.cellHeightPx - entry.bearingYTop))
+            ti.glyphSize = SIMD2<UInt16>(UInt16(entry.pixelW), UInt16(entry.pixelH))
+            ti.uvOrigin  = SIMD2<Float>(Float(entry.atlasX) / atlasW,
+                                        Float(entry.atlasY) / atlasH)
+            ti.uvSize    = SIMD2<Float>(Float(entry.pixelW) / atlasW,
+                                        Float(entry.pixelH) / atlasH)
+            ti.fg = fg
+            skipUntilX = x + scalars.count
+            return ti
+        }
+        return nil
     }
 
     private func isCellSelected(

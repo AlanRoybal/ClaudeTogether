@@ -55,12 +55,13 @@ final class MetalTerminalNSView: NSView {
           onKey: @escaping ([UInt8]) -> Void,
           onResize: @escaping (UInt16, UInt16) -> Void,
           onMouseCell: @escaping (UInt16, UInt16) -> Bool = { _, _ in false },
+          fontName: String = "",
           pointSize: CGFloat = 13)
     {
         let view = MTKView(frame: .zero)
         self.mtkView = view
         self.grid = grid
-        guard let renderer = TerminalRenderer(view: view, pointSize: pointSize) else {
+        guard let renderer = TerminalRenderer(view: view, fontName: fontName, pointSize: pointSize) else {
             return nil
         }
         self.renderer = renderer
@@ -144,6 +145,14 @@ final class MetalTerminalNSView: NSView {
     /// in sync.
     func updatePointSize(_ pointSize: CGFloat) {
         renderer.setPointSize(pointSize)
+    }
+
+    func updateFontName(_ name: String) {
+        renderer.setFontName(name)
+    }
+
+    func updateLigaturesEnabled(_ on: Bool) {
+        renderer.ligaturesEnabled = on
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -778,6 +787,8 @@ struct MetalTerminalView: NSViewRepresentable {
     /// behavior even if the running app has DECSET 1000/1002/1003.
     let mouseModeEnabled: Bool
     let theme: TerminalTheme
+    let fontName: String
+    let ligaturesEnabled: Bool
 
     init(grid: GridModel,
          onKey: @escaping ([UInt8]) -> Void,
@@ -789,7 +800,9 @@ struct MetalTerminalView: NSViewRepresentable {
          isActive: Bool = true,
          fontSize: CGFloat = 13,
          mouseModeEnabled: Bool = false,
-         theme: TerminalTheme = .defaultDark)
+         theme: TerminalTheme = .defaultDark,
+         fontName: String = "",
+         ligaturesEnabled: Bool = true)
     {
         self.grid = grid
         self.onKey = onKey
@@ -802,6 +815,8 @@ struct MetalTerminalView: NSViewRepresentable {
         self.fontSize = fontSize
         self.mouseModeEnabled = mouseModeEnabled
         self.theme = theme
+        self.fontName = fontName
+        self.ligaturesEnabled = ligaturesEnabled
     }
 
     func makeNSView(context: Context) -> MetalTerminalNSView {
@@ -810,6 +825,7 @@ struct MetalTerminalView: NSViewRepresentable {
             onKey: onKey,
             onResize: onResize,
             onMouseCell: onMouseCell,
+            fontName: fontName,
             pointSize: fontSize)
         else {
             NSLog("MetalTerminalNSView init failed — Metal unavailable")
@@ -818,6 +834,7 @@ struct MetalTerminalView: NSViewRepresentable {
                 onKey: { _ in },
                 onResize: { _, _ in },
                 onMouseCell: { _, _ in false },
+                fontName: fontName,
                 pointSize: fontSize)!
         }
         v.inputEnabled = inputEnabled
@@ -839,6 +856,8 @@ struct MetalTerminalView: NSViewRepresentable {
             onFileDrop: onFileDrop)
         nsView.inputEnabled = inputEnabled
         nsView.updatePointSize(fontSize)
+        nsView.updateFontName(fontName)
+        nsView.updateLigaturesEnabled(ligaturesEnabled)
         nsView.mtkView.isPaused = !isActive
         nsView.mouseModeEnabled = mouseModeEnabled
         nsView.refreshTrackingArea()

@@ -70,6 +70,7 @@ final class AutocompleteState: ObservableObject {
 struct SharedInputCompletionHintsOverlay: View {
     @ObservedObject var grid: GridModel
     @ObservedObject var autocomplete: AutocompleteState
+    var terminalFont: Font = .system(size: 12, design: .monospaced)
 
     var body: some View {
         GeometryReader { geo in
@@ -84,14 +85,16 @@ struct SharedInputCompletionHintsOverlay: View {
                 // One row below the cursor — same as zsh Tab display
                 let y = CGFloat(local.row + 1) * cellH
 
-                completionLine(cellW: cellW, cellH: cellH, width: geo.size.width)
+                completionLine(cellW: cellW, cellH: cellH, width: geo.size.width,
+                               font: terminalFont)
                     .offset(x: 0, y: y)
             }
         }
         .allowsHitTesting(false)
     }
 
-    private func completionLine(cellW: CGFloat, cellH: CGFloat, width: CGFloat) -> some View {
+    private func completionLine(cellW: CGFloat, cellH: CGFloat, width: CGFloat,
+                                font: Font) -> some View {
         let colWidth = max(1, Int(width / cellW))
         // Compute column width: longest item + 2-space gap, at least 8
         let maxLen = autocomplete.items.prefix(50).map(\.count).max() ?? 0
@@ -108,7 +111,7 @@ struct SharedInputCompletionHintsOverlay: View {
                 HStack(spacing: 0) {
                     ForEach(Array(rowItems.enumerated()), id: \.offset) { _, item in
                         Text(item)
-                            .font(.system(size: 12, design: .monospaced))
+                            .font(font)
                             .foregroundColor(.primary)
                             .frame(width: CGFloat(itemCols) * cellW, alignment: .leading)
                     }
@@ -117,7 +120,7 @@ struct SharedInputCompletionHintsOverlay: View {
             }
             if overflow {
                 Text("… \(autocomplete.items.count - 50) more")
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(font)
                     .foregroundColor(.primary.opacity(0.6))
                     .frame(height: cellH)
             }
