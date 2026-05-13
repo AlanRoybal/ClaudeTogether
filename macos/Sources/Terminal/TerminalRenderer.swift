@@ -310,9 +310,11 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         var bgInstances: [BgInstance] = []
         var textInstances: [TextInstance] = []
         var cursorTextInstances: [TextInstance] = []
+        var cursorInstances: [CursorInstance] = []
         bgInstances.reserveCapacity(cellCount)
         textInstances.reserveCapacity(cellCount)
         cursorTextInstances.reserveCapacity(overlay.rects.count)
+        cursorInstances.reserveCapacity(overlay.rects.count)
 
         let selectionSnapshot = selection   // snapshot so rendering is consistent
         let selectionColor = unpack(theme.selectionBg)
@@ -337,6 +339,19 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                     bi.gridPos = SIMD2<UInt16>(UInt16(x), UInt16(y))
                     bi.color = selectionSnapshot.map { isCellSelected(col: x, row: y, sel: $0) ? selectionColor : bg } ?? bg
                     bgInstances.append(bi)
+
+                    // LINK UNDERLINE: thin strip at the cell baseline for OSC 8
+                    // hyperlink cells, drawn in the cell's fg color.
+                    if c.url_id != 0 {
+                        let cellHPx = Float(atlas.cellHeightPx)
+                        let ulH = max(1.0, cellHPx * 0.07)
+                        var li = CursorInstance()
+                        li.gridPos    = SIMD2<UInt16>(UInt16(x), UInt16(y))
+                        li.originFrac = SIMD2<Float>(0, (cellHPx - ulH - 0.5) / cellHPx)
+                        li.sizeFrac   = SIMD2<Float>(1, ulH / cellHPx)
+                        li.color      = fg
+                        cursorInstances.append(li)
+                    }
 
                     // TEXT: skip wide-glyph trailing halves, blanks, and interior
                     // cells already consumed by a ligature rendered to their left.
@@ -393,8 +408,6 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         }
 
         // Full colored block cursors for all visible collaborators.
-        var cursorInstances: [CursorInstance] = []
-        cursorInstances.reserveCapacity(overlay.rects.count)
         for r in overlay.rects {
             var ci = CursorInstance()
             ci.gridPos = SIMD2<UInt16>(r.col, r.row)

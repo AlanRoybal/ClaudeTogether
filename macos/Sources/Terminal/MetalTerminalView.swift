@@ -46,6 +46,9 @@ final class MetalTerminalNSView: NSView {
     /// grid. We don't want to spam clamped (col=0,row=0) reports when the
     /// pointer leaves the cell area.
     private var lastMotionInside: Bool = false
+    /// Last known mouse position in cell coords, used by flagsChanged to
+    /// update the cursor when cmd is pressed/released without moving the mouse.
+    private var lastHoverCell: (col: Int, row: Int) = (-1, -1)
 
     // MARK: selection
     private var selectionAnchor: (col: Int, row: Int)? = nil
@@ -360,12 +363,38 @@ final class MetalTerminalNSView: NSView {
     }
 
     override func mouseMoved(with event: NSEvent) {
+        let cell = gridCell(for: event)
+        lastHoverCell = (cell.col, cell.row)
+        updateLinkCursor(col: cell.col, row: cell.row,
+                         flags: event.modifierFlags, inside: cell.inside)
         guard shouldReportMouse else {
             super.mouseMoved(with: event)
             return
         }
         guard grid.term.anyMotionMouse else { return }
         reportMotion(event: event, button: 3)
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        super.flagsChanged(with: event)
+        let c = lastHoverCell
+        guard c.col >= 0 else { return }
+        updateLinkCursor(col: c.col, row: c.row,
+                         flags: event.modifierFlags, inside: true)
+    }
+
+    private func updateLinkCursor(col: Int, row: Int,
+                                  flags: NSEvent.ModifierFlags, inside: Bool)
+    {
+        guard inside, flags.contains(.command), !shouldReportMouse else {
+            NSCursor.iBeam.set()
+            return
+        }
+        if grid.term.cellUrl(col: UInt16(col), row: UInt16(row)) != nil {
+            NSCursor.pointingHand.set()
+        } else {
+            NSCursor.iBeam.set()
+        }
     }
 
     override func scrollWheel(with event: NSEvent) {
