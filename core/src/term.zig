@@ -161,6 +161,21 @@ export fn ct_term_bracketed_paste_mode(t: ?*Term) c_int {
     return 0;
 }
 
+/// Retrieve the OSC 8 URL for the cell at (col, row), if any.
+/// Writes up to `cap` bytes (NOT NUL-terminated) into `out`.
+/// Returns the URL length, or 0 if the cell has no URL or coords are out of bounds.
+export fn ct_term_cell_url(t: ?*Term, col: u16, row: u16, out: [*]u8, cap: usize) usize {
+    const term = t orelse return 0;
+    if (col >= term.grid.cols or row >= term.grid.rows) return 0;
+    const idx = @as(usize, row) * @as(usize, term.grid.cols) + @as(usize, col);
+    const url_id = term.grid.cells[idx].url_id;
+    if (url_id == 0) return 0;
+    const url = term.grid.url_pool[url_id] orelse return 0;
+    const n = @min(url.len, cap);
+    if (n > 0) @memcpy(out[0..n], url[0..n]);
+    return url.len;
+}
+
 test "C ABI exposes terminal scrollback rows" {
     const testing = std.testing;
     var term = try Term.init(testing.allocator, 4, 2);
