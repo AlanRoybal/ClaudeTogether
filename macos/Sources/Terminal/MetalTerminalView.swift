@@ -266,6 +266,15 @@ final class MetalTerminalNSView: NSView {
             reportClick(event: event, button: SGRButton.left, pressed: true)
             return
         }
+        // OSC 8: cmd+click opens the hyperlink under the cursor.
+        if event.modifierFlags.contains(.command) {
+            let loc = convert(event.locationInWindow, from: nil)
+            let cell = cellAt(point: loc)
+            if let url = grid.term.cellUrl(col: UInt16(cell.col), row: UInt16(cell.row)) {
+                NSWorkspace.shared.open(url)
+                return
+            }
+        }
         if reportSharedInputMouse(event: event) {
             clearSelection()
             return
