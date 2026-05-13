@@ -341,8 +341,9 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                     bgInstances.append(bi)
 
                     // LINK UNDERLINE: thin strip at the cell baseline for OSC 8
-                    // hyperlink cells, drawn in the cell's fg color.
-                    if c.url_id != 0 {
+                    // hyperlink cells. Only visible while cmd is held, matching
+                    // Ghostty's toggle-on-cmd behavior.
+                    if c.url_id != 0 && NSEvent.modifierFlags.contains(.command) {
                         let cellHPx = Float(atlas.cellHeightPx)
                         let ulH = max(1.0, cellHPx * 0.07)
                         var li = CursorInstance()
