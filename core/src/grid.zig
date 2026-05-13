@@ -37,7 +37,7 @@ pub const Cell = extern struct {
     bg: u32 = DEFAULT_BG,
     attrs: u16 = 0,
     width: u8 = 1,
-    _pad: u8 = 0,
+    url_id: u8 = 0, // 0 = no hyperlink; non-zero indexes Grid.url_pool
 };
 
 pub const DEFAULT_FG: u32 = 0xCCCCCC;
@@ -137,6 +137,11 @@ pub const Grid = struct {
 
     bracketed_paste_mode: bool = true,
 
+    // OSC 8 hyperlink state
+    url_pool: [256]?[]const u8 = [_]?[]const u8{null} ** 256,
+    url_next_id: u8 = 1,   // cycles 1–255; 0 reserved for "no link"
+    active_url_id: u8 = 0,
+
     pub fn init(alloc: std.mem.Allocator, cols: u16, rows: u16) !Grid {
         const sz: usize = @as(usize, cols) * @as(usize, rows);
         const primary = try alloc.alloc(Cell, sz);
@@ -162,6 +167,9 @@ pub const Grid = struct {
         self.alloc.free(self.primary);
         self.alloc.free(self.alt);
         self.scrollback.deinit();
+        for (self.url_pool) |maybe_url| {
+            if (maybe_url) |url| self.alloc.free(url);
+        }
     }
 
     pub fn resize(self: *Grid, cols: u16, rows: u16) !void {
@@ -240,7 +248,7 @@ pub const Grid = struct {
             .print => |b| self.putCodepoint(b),
             .execute => |b| self.execute(b),
             .csi => |c| self.csi(c),
-            .osc => |_| {},
+            .osc => |payload| self.applyOsc(payload),
             .esc => |b| self.escFinal(b),
         }
     }
@@ -266,6 +274,7 @@ pub const Grid = struct {
             .bg = bg,
             .attrs = self.sgr_attrs,
             .width = w,
+            .url_id = self.active_url_id,
         };
         if (w == 2) {
             // Trailing half: renderer should treat width=0 as "skip; the
@@ -276,10 +285,31 @@ pub const Grid = struct {
                 .bg = bg,
                 .attrs = self.sgr_attrs,
                 .width = 0,
+                .url_id = self.active_url_id,
             };
         }
         self.cursor_x += w;
         self.epoch +%= 1;
+    }
+
+    fn internUrl(self: *Grid, url: []const u8) !u8 {
+        const id = self.url_next_id;
+        if (self.url_pool[id]) |old| self.alloc.free(old);
+        self.url_pool[id] = try self.alloc.dupe(u8, url);
+        self.url_next_id = if (id == 255) 1 else id + 1;
+        return id;
+    }
+
+    fn applyOsc(self: *Grid, payload: []const u8) void {
+        if (!std.mem.startsWith(u8, payload, "8;")) return;
+        const after8 = payload[2..];
+        const semi = std.mem.indexOfScalar(u8, after8, ';') orelse return;
+        const url = after8[semi + 1 ..];
+        if (url.len == 0) {
+            self.active_url_id = 0;
+        } else {
+            self.active_url_id = self.internUrl(url) catch 0;
+        }
     }
 
     fn execute(self: *Grid, b: u8) void {

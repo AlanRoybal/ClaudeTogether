@@ -151,4 +151,19 @@ final class TermCore {
 
     /// DECSET 1003 — press/release + every motion, no button required.
     var anyMotionMouse: Bool { mouseModeBits & MouseMode.move != 0 }
+
+    /// Returns the OSC 8 URL for the cell at (col, row), or nil if the cell
+    /// carries no hyperlink or the URL is not a valid URL.
+    func cellUrl(col: UInt16, row: UInt16) -> URL? {
+        guard let h = handle else { return nil }
+        var buf = [UInt8](repeating: 0, count: 2048)
+        let len = buf.withUnsafeMutableBufferPointer { p in
+            ct_term_cell_url(h, col, row, p.baseAddress, p.count)
+        }
+        guard len > 0,
+              let str = String(bytes: buf[..<len], encoding: .utf8),
+              let url = URL(string: str)
+        else { return nil }
+        return url
+    }
 }

@@ -51,7 +51,7 @@ typedef struct {
     uint32_t bg;       /* 0xRRGGBB */
     uint16_t attrs;    /* bit 0 bold, 1 italic, 2 underline, 3 reverse, 4 dim */
     uint8_t  width;    /* 1 or 2 (CJK) */
-    uint8_t  _pad;
+    uint8_t  url_id;   /* 0 = no hyperlink; non-zero = index into URL table */
 } ct_cell;
 
 ct_term *ct_term_new(uint16_t cols, uint16_t rows);
@@ -88,6 +88,12 @@ uint32_t ct_term_dirty_epoch(ct_term *t);
 #define CT_MOUSE_URXVT (1u << 4) /* DECSET 1015  — urxvt encoding (rarely)   */
 uint32_t ct_term_mouse_mode(ct_term *t);
 int      ct_term_bracketed_paste_mode(ct_term *t);
+
+/* Retrieve the OSC 8 URL for the cell at (col, row), if any.
+ * Writes up to `cap` bytes (NOT NUL-terminated) into `out`.
+ * Returns the URL length, or 0 if the cell has no URL. */
+size_t   ct_term_cell_url(ct_term *t, uint16_t col, uint16_t row,
+                          uint8_t *out, size_t cap);
 
 /* ---- Session (Phase 3) ----------------------------------------------- */
 
