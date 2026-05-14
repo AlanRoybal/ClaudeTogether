@@ -200,25 +200,37 @@ struct PreferencesView: View {
             VStack(alignment: .leading, spacing: 12) {
                 Text("Terminal Theme")
                     .font(.headline)
-                Picker("Theme", selection: Binding(
-                    get: { model.terminalTheme.name },
-                    set: { name in
-                        if name == "Custom" {
-                            model.terminalTheme = TerminalTheme.custom(
-                                background: model.customThemeBg,
-                                foreground: model.customThemeFg)
-                        } else {
-                            model.terminalTheme = model.allThemes.first { $0.name == name } ?? .defaultDark
-                        }
+
+                ThemeSwatchPickerView(
+                    themes: model.allThemes,
+                    selected: model.terminalTheme.name,
+                    onSelect: { name in
+                        model.terminalTheme = model.allThemes.first { $0.name == name } ?? .defaultDark
                     }
-                )) {
-                    ForEach(model.allThemes, id: \.name) { t in
-                        Text(t.name).tag(t.name)
-                    }
-                    Divider()
-                    Text("Custom").tag("Custom")
+                )
+
+                // Custom entry below the grid
+                HStack(spacing: 8) {
+                    RoundedRectangle(cornerRadius: 4)
+                        .fill(model.terminalTheme.name == "Custom"
+                              ? Color.accentColor : Color.primary.opacity(0.08))
+                        .frame(width: 16, height: 16)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(
+                                    model.terminalTheme.name == "Custom"
+                                        ? Color.accentColor : Color.primary.opacity(0.25),
+                                    lineWidth: 1)
+                        )
+                    Text("Custom")
+                        .font(.subheadline)
                 }
-                .pickerStyle(.radioGroup)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    model.terminalTheme = TerminalTheme.custom(
+                        background: model.customThemeBg,
+                        foreground: model.customThemeFg)
+                }
 
                 if model.terminalTheme.name == "Custom" {
                     Divider()
@@ -273,7 +285,64 @@ struct PreferencesView: View {
             .padding(20)
             .tabItem { Label("Appearance", systemImage: "paintbrush") }
         }
-        .frame(width: 480, height: 420)
+        .frame(width: 520, height: 600)
+    }
+}
+
+// MARK: - Theme swatch picker
+
+private struct ThemeSwatchPickerView: View {
+    let themes: [TerminalTheme]
+    let selected: String
+    let onSelect: (String) -> Void
+
+    private let columns = [GridItem(.adaptive(minimum: 220, maximum: 260), spacing: 10)]
+
+    var body: some View {
+        ScrollView {
+            LazyVGrid(columns: columns, spacing: 10) {
+                ForEach(themes, id: \.name) { theme in
+                    ThemeSwatchCell(theme: theme, isSelected: selected == theme.name)
+                        .onTapGesture { onSelect(theme.name) }
+                }
+            }
+            .padding(2)
+        }
+        .frame(maxHeight: 280)
+    }
+}
+
+private struct ThemeSwatchCell: View {
+    let theme: TerminalTheme
+    let isSelected: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(theme.name)
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundColor(Color(packedRGB: theme.foreground))
+                .lineLimit(1)
+                .truncationMode(.tail)
+
+            HStack(spacing: 3) {
+                ForEach(0..<8, id: \.self) { i in
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color(packedRGB: theme.palette[i]))
+                        .frame(width: 14, height: 10)
+                }
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(packedRGB: theme.background))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(
+                    isSelected ? Color.accentColor : Color.primary.opacity(0.15),
+                    lineWidth: isSelected ? 2 : 1)
+        )
     }
 }
 
