@@ -61,7 +61,8 @@ struct SplitPaneView: View {
             SharedInputCompletionHintsOverlay(
                 grid: tab.grid,
                 autocomplete: model.inputAutocomplete,
-                terminalFont: model.terminalFont)
+                terminalFont: model.terminalFont,
+                theme: model.terminalTheme)
             if tab.splitPane != nil {
                 paneFocusIndicator(active: tab.activePaneIndex == 0)
             }
