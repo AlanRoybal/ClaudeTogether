@@ -71,6 +71,7 @@ struct SharedInputCompletionHintsOverlay: View {
     @ObservedObject var grid: GridModel
     @ObservedObject var autocomplete: AutocompleteState
     var terminalFont: Font = .system(size: 12, design: .monospaced)
+    var theme: TerminalTheme = .defaultDark
 
     var body: some View {
         GeometryReader { geo in
@@ -112,7 +113,7 @@ struct SharedInputCompletionHintsOverlay: View {
                     ForEach(Array(rowItems.enumerated()), id: \.offset) { _, item in
                         Text(item)
                             .font(font)
-                            .foregroundColor(.primary)
+                            .foregroundColor(Color(packedRGB: theme.foreground))
                             .frame(width: CGFloat(itemCols) * cellW, alignment: .leading)
                     }
                 }
@@ -121,7 +122,7 @@ struct SharedInputCompletionHintsOverlay: View {
             if overflow {
                 Text("… \(autocomplete.items.count - 50) more")
                     .font(font)
-                    .foregroundColor(.primary.opacity(0.6))
+                    .foregroundColor(Color(packedRGB: theme.foreground).opacity(0.6))
                     .frame(height: cellH)
             }
         }
