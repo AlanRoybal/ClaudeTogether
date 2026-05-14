@@ -126,11 +126,11 @@ struct CoTTYApp: App {
                                 background: model.customThemeBg,
                                 foreground: model.customThemeFg)
                         } else {
-                            model.terminalTheme = TerminalTheme.named(name)
+                            model.terminalTheme = model.allThemes.first { $0.name == name } ?? .defaultDark
                         }
                     }
                 )) {
-                    ForEach(TerminalTheme.allBuiltin, id: \.name) { t in
+                    ForEach(model.allThemes, id: \.name) { t in
                         Text(t.name).tag(t.name)
                     }
                     Divider()
@@ -208,11 +208,11 @@ struct PreferencesView: View {
                                 background: model.customThemeBg,
                                 foreground: model.customThemeFg)
                         } else {
-                            model.terminalTheme = TerminalTheme.named(name)
+                            model.terminalTheme = model.allThemes.first { $0.name == name } ?? .defaultDark
                         }
                     }
                 )) {
-                    ForEach(TerminalTheme.allBuiltin, id: \.name) { t in
+                    ForEach(model.allThemes, id: \.name) { t in
                         Text(t.name).tag(t.name)
                     }
                     Divider()
@@ -227,6 +227,22 @@ struct PreferencesView: View {
                         .foregroundStyle(.secondary)
                     HexColorField(label: "Background", color: $model.customThemeBg)
                     HexColorField(label: "Foreground", color: $model.customThemeFg)
+                }
+
+                HStack {
+                    Button("Import Theme File…") {
+                        let panel = NSOpenPanel()
+                        panel.allowedContentTypes = []
+                        panel.allowsOtherFileTypes = true
+                        panel.message = "Choose a .claudetheme or .itermcolors file"
+                        panel.prompt = "Import"
+                        if panel.runModal() == .OK, let url = panel.url {
+                            try? model.themeLibrary.importFile(from: url)
+                        }
+                    }
+                    Text("Supports .claudetheme and .itermcolors")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Divider()

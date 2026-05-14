@@ -292,6 +292,12 @@ final class TerminalModel: ObservableObject {
     /// the named font is not installed.
     static let defaultFontName = "FiraCode-Regular"
 
+    /// User-installed themes loaded from ~/.config/claudetogether/themes/.
+    let themeLibrary = ThemeLibrary()
+
+    /// All available themes: built-ins first, then user-installed.
+    var allThemes: [TerminalTheme] { TerminalTheme.allBuiltin + themeLibrary.themes }
+
     @Published var terminalTheme: TerminalTheme = .defaultDark {
         didSet {
             guard terminalTheme != oldValue else { return }
@@ -444,11 +450,14 @@ final class TerminalModel: ObservableObject {
         if let rawFg = defaults.object(forKey: TerminalModel.customThemeFgKey) as? UInt32 {
             customThemeFg = rawFg
         }
+        // Load user-installed themes before resolving saved theme name so
+        // imported presets survive restarts.
+        themeLibrary.load()
         if let name = defaults.string(forKey: TerminalModel.themeDefaultsKey) {
             if name == "Custom" {
                 terminalTheme = TerminalTheme.custom(background: customThemeBg, foreground: customThemeFg)
             } else {
-                terminalTheme = TerminalTheme.named(name)
+                terminalTheme = allThemes.first { $0.name == name } ?? .defaultDark
             }
         }
         if let savedFont = defaults.string(forKey: TerminalModel.fontNameKey) {
