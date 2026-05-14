@@ -52,6 +52,8 @@ extension TerminalTheme {
     static let allBuiltin: [TerminalTheme] = [
         .defaultDark, .dracula, .nord, .solarizedDark,
         .light, .solarizedLight, .cream,
+        .catppuccinMocha, .catppuccinLatte, .tokyoNight, .oneDarkPro,
+        .gruvboxDark, .gruvboxLight, .kanagawa, .rosePine, .ayuDark, .everforest,
     ]
 
     static func named(_ name: String) -> TerminalTheme {
@@ -154,6 +156,128 @@ extension TerminalTheme {
             0x1976D2, 0xAB47BC, 0x00838F, 0x2C2218,
         ],
         selectionBg: 0xEDD5A3, cursorColor: 0x7C5C00
+    )
+
+    // MARK: Community presets
+
+    static let catppuccinMocha = TerminalTheme(
+        name: "Catppuccin Mocha",
+        background: 0x1E1E2E, foreground: 0xCDD6F4,
+        palette: [
+            0x45475A, 0xF38BA8, 0xA6E3A1, 0xF9E2AF,
+            0x89B4FA, 0xCBA6F7, 0x89DCEB, 0xBAC2DE,
+            0x585B70, 0xF38BA8, 0xA6E3A1, 0xF9E2AF,
+            0x89B4FA, 0xCBA6F7, 0x89DCEB, 0xA6ADC8,
+        ],
+        selectionBg: 0x313244, cursorColor: 0xF5E0DC
+    )
+
+    static let catppuccinLatte = TerminalTheme(
+        name: "Catppuccin Latte",
+        background: 0xEFF1F5, foreground: 0x4C4F69,
+        palette: [
+            0x5C5F77, 0xD20F39, 0x40A02B, 0xDF8E1D,
+            0x1E66F5, 0xEA76CB, 0x179299, 0xACB0BE,
+            0x6C6F85, 0xD20F39, 0x40A02B, 0xDF8E1D,
+            0x1E66F5, 0xEA76CB, 0x179299, 0xBCC0CC,
+        ],
+        selectionBg: 0xCCD0DA, cursorColor: 0xDC8A78
+    )
+
+    static let tokyoNight = TerminalTheme(
+        name: "Tokyo Night",
+        background: 0x1A1B26, foreground: 0xA9B1D6,
+        palette: [
+            0x32344A, 0xF7768E, 0x9ECE6A, 0xE0AF68,
+            0x7AA2F7, 0xAD8EE6, 0x449DAB, 0x787C99,
+            0x444B6A, 0xFF7A93, 0xB9F27C, 0xFF9E64,
+            0x7DA6FF, 0xBB9AF7, 0x0DB9D7, 0xACB0D0,
+        ],
+        selectionBg: 0x283457, cursorColor: 0xC0CAF5
+    )
+
+    static let oneDarkPro = TerminalTheme(
+        name: "One Dark Pro",
+        background: 0x282C34, foreground: 0xABB2BF,
+        palette: [
+            0x282C34, 0xE06C75, 0x98C379, 0xE5C07B,
+            0x61AFEF, 0xC678DD, 0x56B6C2, 0xABB2BF,
+            0x5C6370, 0xE06C75, 0x98C379, 0xE5C07B,
+            0x61AFEF, 0xC678DD, 0x56B6C2, 0xFFFFFF,
+        ],
+        selectionBg: 0x3E4451, cursorColor: 0x528BFF
+    )
+
+    static let gruvboxDark = TerminalTheme(
+        name: "Gruvbox Dark",
+        background: 0x282828, foreground: 0xEBDBB2,
+        palette: [
+            0x282828, 0xCC241D, 0x98971A, 0xD79921,
+            0x458588, 0xB16286, 0x689D6A, 0xA89984,
+            0x928374, 0xFB4934, 0xB8BB26, 0xFABD2F,
+            0x83A598, 0xD3869B, 0x8EC07C, 0xEBDBB2,
+        ],
+        selectionBg: 0x504945, cursorColor: 0xFBF1C7
+    )
+
+    static let gruvboxLight = TerminalTheme(
+        name: "Gruvbox Light",
+        background: 0xFBF1C7, foreground: 0x3C3836,
+        palette: [
+            0xFBF1C7, 0xCC241D, 0x98971A, 0xD79921,
+            0x458588, 0xB16286, 0x689D6A, 0x7C6F64,
+            0x928374, 0x9D0006, 0x79740E, 0xB57614,
+            0x076678, 0x8F3F71, 0x427B58, 0x3C3836,
+        ],
+        selectionBg: 0xEBDBB2, cursorColor: 0x282828
+    )
+
+    static let kanagawa = TerminalTheme(
+        name: "Kanagawa",
+        background: 0x1F1F28, foreground: 0xDCD7BA,
+        palette: [
+            0x090618, 0xC34043, 0x76946A, 0xC0A36E,
+            0x7E9CD8, 0x957FB8, 0x6A9589, 0xC8C093,
+            0x727169, 0xE82424, 0x98BB6C, 0xE6C384,
+            0x7FB4CA, 0x938AA9, 0x7AA89F, 0xDCD7BA,
+        ],
+        selectionBg: 0x2D4F67, cursorColor: 0xC8C093
+    )
+
+    static let rosePine = TerminalTheme(
+        name: "Rosé Pine",
+        background: 0x191724, foreground: 0xE0DEF4,
+        palette: [
+            0x26233A, 0xEB6F92, 0x31748F, 0xF6C177,
+            0x9CCFD8, 0xC4A7E7, 0xEBBCBA, 0xE0DEF4,
+            0x6E6A86, 0xEB6F92, 0x31748F, 0xF6C177,
+            0x9CCFD8, 0xC4A7E7, 0xEBBCBA, 0xE0DEF4,
+        ],
+        selectionBg: 0x403D52, cursorColor: 0x524F67
+    )
+
+    static let ayuDark = TerminalTheme(
+        name: "Ayu Dark",
+        background: 0x0D1017, foreground: 0xBFBDB6,
+        palette: [
+            0x131721, 0xEA6C73, 0x91B362, 0xF9AF4F,
+            0x53BDFA, 0xFAE994, 0x90E1C6, 0xC7C7C7,
+            0x686868, 0xF07178, 0xC2D94C, 0xFFB454,
+            0x59C2FF, 0xFFEE99, 0x95E6CB, 0xFFFFFF,
+        ],
+        selectionBg: 0x273747, cursorColor: 0xE6B450
+    )
+
+    static let everforest = TerminalTheme(
+        name: "Everforest",
+        background: 0x2D353B, foreground: 0xD3C6AA,
+        palette: [
+            0x475258, 0xE67E80, 0xA7C080, 0xDBBC7F,
+            0x7FBBB3, 0xD699B6, 0x83C092, 0xD3C6AA,
+            0x5C6A72, 0xE67E80, 0xA7C080, 0xDBBC7F,
+            0x7FBBB3, 0xD699B6, 0x83C092, 0xD3C6AA,
+        ],
+        selectionBg: 0x415058, cursorColor: 0xD3C6AA
     )
 }
 
