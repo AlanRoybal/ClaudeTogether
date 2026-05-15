@@ -17,8 +17,6 @@ core/zig-out/
 core/zig-cache/
 .zig-cache/
 
-# Build artifacts copied from core
-macos/Vendor/
 
 # Local secrets (never commit)
 macos/Secrets.xcconfig
