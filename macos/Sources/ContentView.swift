@@ -40,7 +40,7 @@ struct ContentView: View {
                 VStack(spacing: 0) {
                     TabStripView(model: model)
                     if let tab = model.activeTabForView {
-                        SplitPaneView(tab: tab, model: model)
+                        SplitPaneView(tab: tab, model: model, searchState: model.searchState)
                             .frame(minWidth: 500, minHeight: 300)
                     }
                 }
@@ -94,6 +94,18 @@ struct ContentView: View {
         .ignoresSafeArea(edges: .top)
         .frame(minWidth: 800, minHeight: 550)
         .background(WindowThemeSetter(theme: model.terminalTheme, titleBarInset: $titleBarInset))
+        .onChange(of: model.searchState.query) { _ in
+            if let grid = model.activeGrid { model.searchState.scan(grid: grid) }
+        }
+        .onChange(of: model.searchState.isVisible) { visible in
+            if visible, let grid = model.activeGrid { model.searchState.scan(grid: grid) }
+            if !visible { model.searchState.close() }
+        }
+        .onChange(of: model.activeTabId) { _ in
+            if model.searchState.isVisible, let grid = model.activeGrid {
+                model.searchState.scan(grid: grid)
+            }
+        }
     }
 }
 
@@ -262,6 +274,10 @@ final class TerminalModel: ObservableObject {
     /// shared input mutates; consumed by ContentView's overlay.
     let inputAutocomplete = AutocompleteState()
 
+    /// Find-bar state shared across the window. Searched against the
+    /// active pane's grid; highlights rendered by the Metal BG pass.
+    let searchState = SearchState()
+
     /// CWD used for the currently-visible filesystem completion hints.
     /// Non-nil iff filesystem hints are showing; nil otherwise.
     private var filesystemCompletionCwd: String?
@@ -369,6 +385,11 @@ final class TerminalModel: ObservableObject {
     /// call sites that read `model.grid` (renderer, sidebar, snapshot helpers)
     /// continue to work after the multi-tab refactor.
     var grid: GridModel? { tabs.first(where: { $0.id == activeTabId })?.grid }
+    /// Returns the grid for the currently focused pane (primary or split).
+    var activeGrid: GridModel? {
+        guard let tab = tabs.first(where: { $0.id == activeTabId }) else { return nil }
+        return tab.activePaneIndex == 1 ? tab.splitPane?.grid : tab.grid
+    }
     /// Compatibility shim: returns the active tab's PTY (nil for peer tabs).
     var pty: PTYSession? { tabs.first(where: { $0.id == activeTabId })?.pty }
 
@@ -1396,50 +1417,6 @@ final class TerminalModel: ObservableObject {
         pb.setString(text, forType: .string)
     }
 
-    /// ⌘F — prompt for a query and search the visible terminal grid for
-    /// the first occurrence (case-sensitive). Beeps on no match; otherwise
-    /// shows an informational alert with the line number.
-    func presentFindPrompt() {
-        guard let grid = grid else {
-            NSSound.beep()
-            return
-        }
-
-        let alert = NSAlert()
-        alert.messageText = "Find"
-        alert.informativeText = "Search the visible terminal."
-        alert.alertStyle = .informational
-        let input = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        input.placeholderString = "query"
-        alert.accessoryView = input
-        alert.window.initialFirstResponder = input
-        alert.addButton(withTitle: "Find")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-
-        let query = input.stringValue
-        guard !query.isEmpty else { return }
-
-        let lines = visibleTerminalLines(grid: grid)
-        for (idx, line) in lines.enumerated() {
-            if line.range(of: query) != nil {
-                let result = NSAlert()
-                result.messageText = "Found"
-                result.informativeText = "Match on line \(idx + 1)."
-                result.alertStyle = .informational
-                result.addButton(withTitle: "OK")
-                result.runModal()
-                return
-            }
-        }
-        NSSound.beep()
-        let miss = NSAlert()
-        miss.messageText = "Not found"
-        miss.informativeText = "\u{201C}\(query)\u{201D} is not on screen."
-        miss.alertStyle = .warning
-        miss.addButton(withTitle: "OK")
-        miss.runModal()
-    }
 
     /// Decode visible cells row-by-row into Swift strings. Trailing blanks
     /// per row are trimmed. Wide cells (`width == 0` continuations) are
