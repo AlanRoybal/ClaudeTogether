@@ -6,6 +6,7 @@ import SwiftUI
 struct SplitPaneView: View {
     let tab: TabState
     @ObservedObject var model: TerminalModel
+    @ObservedObject var searchState: SearchState
 
     var body: some View {
         if let pane = tab.splitPane {
@@ -57,12 +58,23 @@ struct SplitPaneView: View {
                 mouseModeEnabled: model.mouseMode,
                 theme: model.terminalTheme,
                 fontName: model.fontName,
-                ligaturesEnabled: model.ligaturesEnabled)
+                ligaturesEnabled: model.ligaturesEnabled,
+                searchMatches: searchState.matches,
+                currentMatchIndex: searchState.currentMatchIndex)
             SharedInputCompletionHintsOverlay(
                 grid: tab.grid,
                 autocomplete: model.inputAutocomplete,
                 terminalFont: model.terminalFont,
                 theme: model.terminalTheme)
+            if searchState.isVisible {
+                VStack {
+                    FindBarView(state: searchState)
+                        .padding(.horizontal, 12)
+                        .padding(.top, 8)
+                    Spacer()
+                }
+                .allowsHitTesting(true)
+            }
             if tab.splitPane != nil {
                 paneFocusIndicator(active: tab.activePaneIndex == 0)
             }
@@ -103,7 +115,9 @@ struct SplitPaneView: View {
                 fontSize: model.fontSize,
                 mouseModeEnabled: model.mouseMode,
                 theme: model.terminalTheme,
-                ligaturesEnabled: model.ligaturesEnabled)
+                ligaturesEnabled: model.ligaturesEnabled,
+                searchMatches: [],
+                currentMatchIndex: nil)
             paneFocusIndicator(active: tab.activePaneIndex == 1)
         }
         .frame(minWidth: 200, minHeight: 100)
