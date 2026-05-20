@@ -295,6 +295,9 @@ final class TerminalModel: ObservableObject {
     /// User-installed themes loaded from ~/.config/claudetogether/themes/.
     let themeLibrary = ThemeLibrary()
 
+    /// Config file reader/watcher for ~/.config/CoTTY/config.toml.
+    let configFile = ConfigFile()
+
     /// All available themes: built-ins first, then user-installed.
     var allThemes: [TerminalTheme] { TerminalTheme.allBuiltin + themeLibrary.themes }
 
@@ -468,6 +471,10 @@ final class TerminalModel: ObservableObject {
         if defaults.object(forKey: TerminalModel.ligaturesEnabledKey) != nil {
             ligaturesEnabled = defaults.bool(forKey: TerminalModel.ligaturesEnabledKey)
         }
+        // Apply config file overrides after the UserDefaults baseline is set.
+        // themeLibrary.load() has already run above, so allThemes is populated.
+        configFile.load()
+        applyConfig(configFile.current)
         // Re-publish child ObservableObject changes.
         sessionManager.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
@@ -500,6 +507,10 @@ final class TerminalModel: ObservableObject {
             .sink { [weak self] url in
                 self?.showShareSheet(for: url)
             }.store(in: &cancellables)
+        configFile.$current
+            .dropFirst()
+            .sink { [weak self] newValues in self?.applyConfig(newValues) }
+            .store(in: &cancellables)
 
         // Route inbound frames.
         sessionManager.onFrame = { [weak self] frame, peerID in
@@ -596,6 +607,28 @@ final class TerminalModel: ObservableObject {
             return (path: bore, server: SessionManager.defaultBoreServer)
         }
         return nil
+    }
+
+    // MARK: - Config file
+
+    private func applyConfig(_ c: ConfigValues) {
+        if let v = c.fontSize { fontSize = Self.clampFontSize(CGFloat(v)) }
+        if let v = c.fontName { fontName = v }
+        if let v = c.ligaturesEnabled { ligaturesEnabled = v }
+        // Apply custom colors before resolving the theme name so that
+        // TerminalTheme.custom(…) picks them up when theme = "Custom".
+        if let v = c.customBg { customThemeBg = v }
+        if let v = c.customFg { customThemeFg = v }
+        if let name = c.theme {
+            if name == "Custom" {
+                terminalTheme = TerminalTheme.custom(background: customThemeBg,
+                                                     foreground: customThemeFg)
+            } else {
+                terminalTheme = allThemes.first { $0.name == name } ?? terminalTheme
+            }
+        }
+        if let v = c.displayName { sessionManager.localName = v }
+        if let v = c.boreServer { sessionManager.boreServer = v }
     }
 
     // MARK: derived UI state
