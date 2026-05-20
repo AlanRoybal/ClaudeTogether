@@ -94,9 +94,15 @@ struct CoTTYApp: App {
                 Button("Paste") { model.menuPaste() }
                     .keyboardShortcut("v", modifiers: .command)
                 Divider()
-                Button("Find...") { model.presentFindPrompt() }
+                Button("Find") { model.searchState.isVisible.toggle() }
                     .keyboardShortcut("f", modifiers: .command)
-                    .disabled(model.grid == nil)
+                    .disabled(model.activeGrid == nil)
+                Button("Find Next") { model.searchState.selectNext() }
+                    .keyboardShortcut("g", modifiers: .command)
+                    .disabled(!model.searchState.isVisible || model.searchState.matches.isEmpty)
+                Button("Find Previous") { model.searchState.selectPrev() }
+                    .keyboardShortcut("g", modifiers: [.command, .shift])
+                    .disabled(!model.searchState.isVisible || model.searchState.matches.isEmpty)
             }
 
             CommandMenu("Format") {

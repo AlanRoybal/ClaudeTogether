@@ -121,6 +121,11 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     /// inclusive and `start` is always <= `end` (row-major order).
     var selection: (start: (col: Int, row: Int), end: (col: Int, row: Int))? = nil
 
+    /// Current find-bar matches in viewport coordinates. Set by MetalTerminalView.
+    var searchMatches: [SearchMatch] = []
+    /// Index into `searchMatches` for the currently focused match, or nil.
+    var currentMatchIndex: Int? = nil
+
     init?(view: MTKView, fontName: String = "", pointSize: CGFloat = 13) {
         guard let device = view.device ?? MTLCreateSystemDefaultDevice() else {
             return nil
@@ -319,6 +324,24 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         let selectionSnapshot = selection   // snapshot so rendering is consistent
         let selectionColor = unpack(theme.selectionBg)
 
+        // Build flat-index sets for search match cells before the draw loop.
+        let searchMatchColor   = unpack(theme.searchMatchBg)
+        let searchCurrentColor = unpack(theme.searchCurrentMatchBg)
+        var currentMatchCells  = Set<Int>()
+        var otherMatchCells    = Set<Int>()
+        if !searchMatches.isEmpty {
+            for (i, m) in searchMatches.enumerated() {
+                for offset in 0..<m.length {
+                    let idx = m.row * cols + m.colStart + offset
+                    if i == currentMatchIndex {
+                        currentMatchCells.insert(idx)
+                    } else {
+                        otherMatchCells.insert(idx)
+                    }
+                }
+            }
+        }
+
         if snap.count >= cellCount {
             let atlasW = Float(atlas.atlasWidthPx)
             let atlasH = Float(atlas.atlasHeightPx)
@@ -335,9 +358,18 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
 
                     // BG: render the terminal's actual background. Colored
                     // collaborator blocks are composited in the cursor pass.
+                    // Priority: selection > current search match > other search matches.
                     var bi = BgInstance()
                     bi.gridPos = SIMD2<UInt16>(UInt16(x), UInt16(y))
-                    bi.color = selectionSnapshot.map { isCellSelected(col: x, row: y, sel: $0) ? selectionColor : bg } ?? bg
+                    let cellIdx = y * cols + x
+                    var cellBg = bg
+                    if !otherMatchCells.isEmpty, otherMatchCells.contains(cellIdx) {
+                        cellBg = searchMatchColor
+                    }
+                    if !currentMatchCells.isEmpty, currentMatchCells.contains(cellIdx) {
+                        cellBg = searchCurrentColor
+                    }
+                    bi.color = selectionSnapshot.map { isCellSelected(col: x, row: y, sel: $0) ? selectionColor : cellBg } ?? cellBg
                     bgInstances.append(bi)
 
                     // LINK UNDERLINE: thin strip at the cell baseline for OSC 8

@@ -827,6 +827,8 @@ struct MetalTerminalView: NSViewRepresentable {
     let theme: TerminalTheme
     let fontName: String
     let ligaturesEnabled: Bool
+    let searchMatches: [SearchMatch]
+    let currentMatchIndex: Int?
 
     init(grid: GridModel,
          onKey: @escaping ([UInt8]) -> Void,
@@ -840,7 +842,9 @@ struct MetalTerminalView: NSViewRepresentable {
          mouseModeEnabled: Bool = false,
          theme: TerminalTheme = .defaultDark,
          fontName: String = "",
-         ligaturesEnabled: Bool = true)
+         ligaturesEnabled: Bool = true,
+         searchMatches: [SearchMatch] = [],
+         currentMatchIndex: Int? = nil)
     {
         self.grid = grid
         self.onKey = onKey
@@ -855,6 +859,8 @@ struct MetalTerminalView: NSViewRepresentable {
         self.theme = theme
         self.fontName = fontName
         self.ligaturesEnabled = ligaturesEnabled
+        self.searchMatches = searchMatches
+        self.currentMatchIndex = currentMatchIndex
     }
 
     func makeNSView(context: Context) -> MetalTerminalNSView {
@@ -900,6 +906,8 @@ struct MetalTerminalView: NSViewRepresentable {
         nsView.mouseModeEnabled = mouseModeEnabled
         nsView.refreshTrackingArea()
         nsView.theme = theme
+        nsView.renderer.searchMatches = searchMatches
+        nsView.renderer.currentMatchIndex = currentMatchIndex
     }
 
     static func dismantleNSView(_ nsView: MetalTerminalNSView, coordinator: ()) {
