@@ -297,6 +297,21 @@ extension TerminalTheme {
         let b = Double( background        & 0xFF) / 255
         return 0.299 * r + 0.587 * g + 0.114 * b < 0.5
     }
+
+    /// Background color for non-current search match cells.
+    /// Blends an amber hue into the theme background so it reads well on any theme.
+    var searchMatchBg: UInt32 {
+        isDark
+            ? blendColor(background, 0xFBBF24, t: 0.45)
+            : blendColor(background, 0xB45309, t: 0.40)
+    }
+
+    /// Background color for the currently selected search match cell.
+    var searchCurrentMatchBg: UInt32 {
+        isDark
+            ? blendColor(background, 0xF97316, t: 0.70)
+            : blendColor(background, 0x9A3412, t: 0.50)
+    }
 }
 
 extension Color {
