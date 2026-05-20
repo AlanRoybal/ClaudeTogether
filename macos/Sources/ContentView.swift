@@ -94,18 +94,6 @@ struct ContentView: View {
         .ignoresSafeArea(edges: .top)
         .frame(minWidth: 800, minHeight: 550)
         .background(WindowThemeSetter(theme: model.terminalTheme, titleBarInset: $titleBarInset))
-        .onChange(of: model.searchState.query) { _ in
-            if let grid = model.activeGrid { model.searchState.scan(grid: grid) }
-        }
-        .onChange(of: model.searchState.isVisible) { visible in
-            if visible, let grid = model.activeGrid { model.searchState.scan(grid: grid) }
-            if !visible { model.searchState.close() }
-        }
-        .onChange(of: model.activeTabId) { _ in
-            if model.searchState.isVisible, let grid = model.activeGrid {
-                model.searchState.scan(grid: grid)
-            }
-        }
     }
 }
 

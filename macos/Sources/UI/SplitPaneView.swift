@@ -80,6 +80,12 @@ struct SplitPaneView: View {
             }
         }
         .frame(minWidth: 200, minHeight: 100)
+        .onChange(of: searchState.query) { _ in
+            searchState.scan(grid: tab.grid)
+        }
+        .onChange(of: searchState.isVisible) { visible in
+            if visible { searchState.scan(grid: tab.grid) }
+        }
     }
 
     // MARK: - Secondary (split) pane
