@@ -2166,6 +2166,12 @@ final class TerminalModel: ObservableObject {
                 sessionManager.relayPaneCursor(from: identity, paneId: paneId, col: col, row: row)
             }
 
+        case .kick(let id):
+            guard sessionManager.role == .peer,
+                  id == sessionManager.localIdentity else { return }
+            showSessionNotification("You were removed from this session.")
+            endSession()
+
         default:
             break
         }

@@ -716,11 +716,7 @@ final class SessionManager: ObservableObject {
         case .heartbeat:
             break
         case .kick(let id):
-            if role == .peer && id == localIdentity {
-                lastError = "You were removed from this session."
-                stop()
-                state = .disconnected  // overrides stop()'s .idle assignment
-            }
+            _ = id  // ContentView.handleInbound handles teardown and notification
         default:
             break
         }
