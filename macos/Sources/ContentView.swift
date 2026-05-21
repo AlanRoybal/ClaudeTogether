@@ -2762,6 +2762,17 @@ final class TerminalModel: ObservableObject {
         else {
             return
         }
+        // Only send scrollback on the initial join handshake (peerID is set).
+        // Broadcast refreshes on tab-focus must not flood all peers with history.
+        if let peerID {
+            let history = encodeScrollbackHistory(from: tab.grid)
+            if !history.isEmpty {
+                sessionManager.sendTabPtyOutput(
+                    tabId: tabId,
+                    data: Data(history),
+                    toTransportPeerID: peerID)
+            }
+        }
         let bytes = encodeTerminalSnapshot(from: tab.grid)
         guard !bytes.isEmpty else { return }
         sessionManager.sendTabPtyOutput(
@@ -2794,6 +2805,12 @@ final class TerminalModel: ObservableObject {
                 sessionManager.sendPaneOpen(
                     tabId: tab.id, paneId: pane.id, axis: tab.splitAxis,
                     toTransportPeerID: peerID)
+                let paneHistory = encodeScrollbackHistory(from: pane.grid)
+                if !paneHistory.isEmpty {
+                    sessionManager.sendPanePtyOutput(
+                        paneId: pane.id, data: Data(paneHistory),
+                        toTransportPeerID: peerID)
+                }
                 let snap = encodeTerminalSnapshot(from: pane.grid)
                 if !snap.isEmpty {
                     sessionManager.sendPanePtyOutput(
@@ -2810,7 +2827,10 @@ final class TerminalModel: ObservableObject {
     }
 
     private func encodeTerminalSnapshot(from grid: GridModel) -> [UInt8] {
-        let snapshot = grid.snapshot()
+        // Always encode the live viewport, never the scroll-adjusted overlay.
+        // grid.snapshot() blends scrollback rows in when the host has scrolled
+        // back, which would send the wrong view and misplace the cursor.
+        let snapshot = grid.term.snapshot()
         let cols = Int(grid.cols)
         let rows = Int(grid.rows)
         guard cols > 0, rows > 0, snapshot.count >= cols * rows else {
@@ -2857,6 +2877,67 @@ final class TerminalModel: ObservableObject {
         out += "\u{1B}[0m"
         out += "\u{1B}[\(Int(cursor.y) + 1);\(Int(cursor.x) + 1)H"
         out += "\u{1B}[?25h"
+        return Array(out.utf8)
+    }
+
+    private func encodeScrollbackHistory(from grid: GridModel) -> [UInt8] {
+        let cols = Int(grid.cols)
+        let totalRows = grid.term.scrollbackLength
+        guard cols > 0, totalRows > 0 else { return [] }
+
+        var out = ""
+        out += "\u{1B}[?25l"
+        out += "\u{1B}[0m"
+
+        let batchSize = 500
+        for startRow in stride(from: 0, to: totalRows, by: batchSize) {
+            let rowCount = min(batchSize, totalRows - startRow)
+            var cells = [ct_cell](repeating: ct_cell(), count: rowCount * cols)
+            let copied = grid.term.copyScrollback(
+                startRow: startRow,
+                rowCount: rowCount,
+                into: &cells)
+
+            for r in 0..<copied {
+                var rendered = "\u{1B}[0m"
+                var visibleLine = ""
+                var pendingStyle = SnapshotStyle.default
+
+                for c in 0..<cols {
+                    let cell = cells[r * cols + c]
+                    if cell.width == 0 { continue }
+                    let ch = scalarString(from: cell.codepoint)
+                    let style = SnapshotStyle(cell: cell)
+                    if style != pendingStyle {
+                        rendered += style.sgrTransition(from: pendingStyle)
+                        pendingStyle = style
+                    }
+                    rendered += ch
+                    if ch != " " || style != .default {
+                        visibleLine = rendered
+                    }
+                }
+
+                if visibleLine.isEmpty {
+                    out += "\r\n"
+                } else {
+                    out += visibleLine
+                    out += "\u{1B}[0m\r\n"
+                }
+            }
+        }
+
+        // Flush whatever is still on the visible screen into the peer's
+        // scrollback ring. After sending totalRows lines, the last min(rows,
+        // totalRows) rows are on-screen and have not yet been pushed to
+        // scrollback. Sending grid.rows blank newlines scrolls them off —
+        // they land in the ring — so the subsequent \u{1B}[2J in the viewport
+        // frame cannot erase them.
+        let flushCount = Int(grid.rows)
+        for _ in 0..<flushCount {
+            out += "\r\n"
+        }
+
         return Array(out.utf8)
     }
 
