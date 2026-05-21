@@ -41,6 +41,7 @@ enum FrameTag: UInt8 {
     case panePtyOutput = 0x1D
     case paneInput     = 0x1E
     case paneCursorPos = 0x1F
+    case kick = 0x20
 }
 
 enum SessionRole: UInt8 {
@@ -147,6 +148,7 @@ enum Frame {
     case panePtyOutput(paneId: UInt32, data: Data)
     case paneInput(paneId: UInt32, data: Data)
     case paneCursorPos(UserIdentity, paneId: UInt32, col: UInt16, row: UInt16)
+    case kick(UserIdentity)
 }
 
 /// Which direction a split divides the terminal viewport.
@@ -304,6 +306,9 @@ enum FrameCodec {
             appendU32(&out, paneId)
             appendU16(&out, col)
             appendU16(&out, row)
+        case .kick(let id):
+            out.append(FrameTag.kick.rawValue)
+            out.append(contentsOf: id.bytes)
         }
         return out
     }
@@ -482,6 +487,9 @@ enum FrameCodec {
             let col = try r.readU16()
             let row = try r.readU16()
             return .paneCursorPos(id, paneId: paneId, col: col, row: row)
+        case .kick:
+            let id = try UserIdentity.from(exactly16: Array(try r.readBytes(16)))
+            return .kick(id)
         }
     }
 
