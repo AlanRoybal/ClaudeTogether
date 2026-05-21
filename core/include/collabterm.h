@@ -135,6 +135,11 @@ int ct_session_poll_event(ct_session *s,
                           uint8_t *out_kind,
                           uint32_t *out_peer_id);
 
+/* Host only: forcibly close a peer's TCP connection. The Zig reader thread
+ * detects the close and fires a peer_disconnected event, which the Swift
+ * layer uses to clean up the roster. */
+void ct_session_drop_peer(ct_session *s, uint32_t peer_id);
+
 /* ---- Bore supervisor ------------------------------------------------- */
 
 typedef struct ct_bore ct_bore;

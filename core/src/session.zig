@@ -181,6 +181,19 @@ pub const Session = struct {
         };
     }
 
+    /// Host only: close a peer's TCP connection. The reader thread detects the
+    /// close, calls markDead, and pushes a peer_disconnected event.
+    pub fn dropPeer(self: *Session, peer_id: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.peers.items) |p| {
+            if (p.id == peer_id) {
+                p.conn.close();
+                break;
+            }
+        }
+    }
+
     /// Pop the next inbound frame. Caller must `freeFrame` the payload.
     /// Returns null if none pending.
     pub fn pollFrame(self: *Session) ?InboundFrame {
