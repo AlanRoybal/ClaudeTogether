@@ -438,6 +438,28 @@ final class SessionManager: ObservableObject {
         broadcast(.accessMode(accessMode))
     }
 
+    /// Host only: remove a participant by identity. Sends a kick frame so the
+    /// peer can display a "you were removed" message, then closes their socket.
+    func kickPeer(_ identity: UserIdentity) {
+        guard role == .host,
+              state == .running,
+              identity != localIdentity else { return }
+        guard let peerID = transportToIdentity.first(where: { $0.value == identity })?.key,
+              let h = handle else { return }
+
+        // Notify the peer before the socket drops (TCP ordering guarantees delivery).
+        send(.kick(identity), toTransportPeerID: peerID)
+
+        // Close the TCP connection; reader thread fires peer_disconnected async.
+        ct_session_drop_peer(h, peerID)
+
+        // Eagerly update local state so the UI is immediately responsive.
+        // The async peer_disconnected event will be a no-op (identity already removed).
+        transportToIdentity.removeValue(forKey: peerID)
+        participants.removeAll { $0.identity == identity }
+        broadcastRoster()
+    }
+
     /// Peer only: ship keystroke bytes to the host as an opaque `inputOp`
     /// payload. (Full CRDT merge is a future step; Phase 3 uses this as a
     /// "raw-bytes passthrough" so end-to-end shared typing works.) In
@@ -693,6 +715,12 @@ final class SessionManager: ObservableObject {
             if role == .peer { accessMode = m }
         case .heartbeat:
             break
+        case .kick(let id):
+            if role == .peer && id == localIdentity {
+                lastError = "You were removed from this session."
+                stop()
+                state = .disconnected  // overrides stop()'s .idle assignment
+            }
         default:
             break
         }
