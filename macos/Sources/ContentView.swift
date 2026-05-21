@@ -2860,6 +2860,55 @@ final class TerminalModel: ObservableObject {
         return Array(out.utf8)
     }
 
+    private func encodeScrollbackHistory(from grid: GridModel) -> [UInt8] {
+        let cols = Int(grid.cols)
+        let totalRows = grid.term.scrollbackLength
+        guard cols > 0, totalRows > 0 else { return [] }
+
+        var out = ""
+        out += "\u{1B}[?25l"
+        out += "\u{1B}[0m"
+
+        let batchSize = 500
+        for startRow in stride(from: 0, to: totalRows, by: batchSize) {
+            let rowCount = min(batchSize, totalRows - startRow)
+            var cells = [ct_cell](repeating: ct_cell(), count: rowCount * cols)
+            let copied = grid.term.copyScrollback(
+                startRow: startRow,
+                rowCount: rowCount,
+                into: &cells)
+
+            for r in 0..<copied {
+                var rendered = "\u{1B}[0m"
+                var visibleLine = ""
+                var pendingStyle = SnapshotStyle.default
+
+                for c in 0..<cols {
+                    let cell = cells[r * cols + c]
+                    if cell.width == 0 { continue }
+                    let ch = scalarString(from: cell.codepoint)
+                    let style = SnapshotStyle(cell: cell)
+                    if style != pendingStyle {
+                        rendered += style.sgrTransition(from: pendingStyle)
+                        pendingStyle = style
+                    }
+                    rendered += ch
+                    if ch != " " || style != .default {
+                        visibleLine = rendered
+                    }
+                }
+
+                if visibleLine.isEmpty {
+                    out += "\r\n"
+                } else {
+                    out += visibleLine
+                    out += "\u{1B}[0m\r\n"
+                }
+            }
+        }
+        return Array(out.utf8)
+    }
+
     private func scalarString(from codepoint: UInt32) -> String {
         guard codepoint != 0,
               let scalar = UnicodeScalar(codepoint)
