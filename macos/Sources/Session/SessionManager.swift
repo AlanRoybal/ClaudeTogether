@@ -607,8 +607,8 @@ final class SessionManager: ObservableObject {
     }
 
     private func pump() {
-        drainEvents()
         drainFrames()
+        drainEvents()
     }
 
     private func drainEvents() {
