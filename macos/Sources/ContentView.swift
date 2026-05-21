@@ -2762,12 +2762,16 @@ final class TerminalModel: ObservableObject {
         else {
             return
         }
-        let history = encodeScrollbackHistory(from: tab.grid)
-        if !history.isEmpty {
-            sessionManager.sendTabPtyOutput(
-                tabId: tabId,
-                data: Data(history),
-                toTransportPeerID: peerID)
+        // Only send scrollback on the initial join handshake (peerID is set).
+        // Broadcast refreshes on tab-focus must not flood all peers with history.
+        if let peerID {
+            let history = encodeScrollbackHistory(from: tab.grid)
+            if !history.isEmpty {
+                sessionManager.sendTabPtyOutput(
+                    tabId: tabId,
+                    data: Data(history),
+                    toTransportPeerID: peerID)
+            }
         }
         let bytes = encodeTerminalSnapshot(from: tab.grid)
         guard !bytes.isEmpty else { return }
@@ -2823,7 +2827,10 @@ final class TerminalModel: ObservableObject {
     }
 
     private func encodeTerminalSnapshot(from grid: GridModel) -> [UInt8] {
-        let snapshot = grid.snapshot()
+        // Always encode the live viewport, never the scroll-adjusted overlay.
+        // grid.snapshot() blends scrollback rows in when the host has scrolled
+        // back, which would send the wrong view and misplace the cursor.
+        let snapshot = grid.term.snapshot()
         let cols = Int(grid.cols)
         let rows = Int(grid.rows)
         guard cols > 0, rows > 0, snapshot.count >= cols * rows else {
@@ -2919,6 +2926,18 @@ final class TerminalModel: ObservableObject {
                 }
             }
         }
+
+        // Flush whatever is still on the visible screen into the peer's
+        // scrollback ring. After sending totalRows lines, the last min(rows,
+        // totalRows) rows are on-screen and have not yet been pushed to
+        // scrollback. Sending grid.rows blank newlines scrolls them off —
+        // they land in the ring — so the subsequent \u{1B}[2J in the viewport
+        // frame cannot erase them.
+        let flushCount = Int(grid.rows)
+        for _ in 0..<flushCount {
+            out += "\r\n"
+        }
+
         return Array(out.utf8)
     }
 
