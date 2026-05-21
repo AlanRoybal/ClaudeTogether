@@ -2762,6 +2762,13 @@ final class TerminalModel: ObservableObject {
         else {
             return
         }
+        let history = encodeScrollbackHistory(from: tab.grid)
+        if !history.isEmpty {
+            sessionManager.sendTabPtyOutput(
+                tabId: tabId,
+                data: Data(history),
+                toTransportPeerID: peerID)
+        }
         let bytes = encodeTerminalSnapshot(from: tab.grid)
         guard !bytes.isEmpty else { return }
         sessionManager.sendTabPtyOutput(
@@ -2794,6 +2801,12 @@ final class TerminalModel: ObservableObject {
                 sessionManager.sendPaneOpen(
                     tabId: tab.id, paneId: pane.id, axis: tab.splitAxis,
                     toTransportPeerID: peerID)
+                let paneHistory = encodeScrollbackHistory(from: pane.grid)
+                if !paneHistory.isEmpty {
+                    sessionManager.sendPanePtyOutput(
+                        paneId: pane.id, data: Data(paneHistory),
+                        toTransportPeerID: peerID)
+                }
                 let snap = encodeTerminalSnapshot(from: pane.grid)
                 if !snap.isEmpty {
                     sessionManager.sendPanePtyOutput(
