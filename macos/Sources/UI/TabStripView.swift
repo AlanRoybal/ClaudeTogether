@@ -3,156 +3,288 @@ import SwiftUI
 struct TabStripView: View {
     @ObservedObject var model: TerminalModel
 
+    // Absolute X of the tab's slot when drag began; stays fixed throughout the drag.
+    @State private var dragStartSlotX: CGFloat = 0
+    // Absolute X of the tab's current slot after any live swaps; updated on each swap.
+    @State private var dragCurrentSlotX: CGFloat = 0
+    @State private var currentTranslation: CGFloat = 0
+    @State private var previousTranslation: CGFloat = 0
+    @State private var draggingTabId: UInt32? = nil
+    @State private var tabFrames: [UInt32: CGRect] = [:]
+    @State private var previewOrder: [UInt32]? = nil
+
     private var theme: TerminalTheme { model.terminalTheme }
+
+    // Visual offset for the dragged tab: keeps the tab pinned under the cursor
+    // regardless of how many slot-swaps have occurred.
+    private func dragOffset(for tabId: UInt32) -> CGFloat {
+        guard tabId == draggingTabId else { return 0 }
+        return dragStartSlotX + currentTranslation - dragCurrentSlotX
+    }
+
+    private var displayedTabs: [TabState] {
+        guard let order = previewOrder else { return model.tabs }
+        return order.compactMap { id in model.tabs.first(where: { $0.id == id }) }
+    }
 
     var body: some View {
         HStack(spacing: 4) {
-            ForEach(model.tabs) { tab in
-                TabStripButton(
-                    title: tab.title,
-                    isActive: tab.id == model.activeTabId,
-                    canClose: model.sessionManager.role == .host,
-                    theme: theme,
-                    onSelect: { model.focusTab(id: tab.id) },
-                    onClose: { model.closeTab(id: tab.id) })
-            }
-
-            if model.sessionManager.role == .host {
-                Button(action: { model.openNewTab() }) {
-                    Image(systemName: "plus")
-                        .font(.system(size: 11, weight: .semibold))
-                        .frame(width: 18, height: 18)
-                        .foregroundColor(theme.swiftUIForeground.opacity(0.7))
+            // Tabs expand to fill all available space equally.
+            HStack(spacing: 4) {
+                ForEach(Array(displayedTabs.enumerated()), id: \.element.id) { idx, tab in
+                    TabStripButton(
+                        title: tab.title,
+                        index: idx,
+                        isActive: tab.id == model.activeTabId,
+                        canClose: model.sessionManager.role == .host,
+                        isDragging: draggingTabId == tab.id,
+                        theme: theme,
+                        onSelect: { model.focusTab(id: tab.id) },
+                        onClose: { model.closeTab(id: tab.id) })
+                    .frame(maxWidth: .infinity)
+                    .background(frameCapture(for: tab.id))
+                    .offset(x: dragOffset(for: tab.id))
+                    .zIndex(draggingTabId == tab.id ? 1 : 0)
+                    .simultaneousGesture(dragGesture(for: tab))
                 }
-                .buttonStyle(.plain)
-                .help("New tab (⌘T)")
-                .accessibilityLabel("New tab")
             }
+            .frame(maxWidth: .infinity)
 
-            Spacer(minLength: 0)
-
-            if let tab = model.activeTabForView {
-                if tab.splitPane == nil {
-                    if model.sessionManager.role == .host {
-                        Button(action: {
-                            NotificationCenter.default.post(name: .ctPaneSplitH, object: nil)
-                        }) {
-                            Image(systemName: "rectangle.split.2x1")
-                                .font(.system(size: 11, weight: .semibold))
-                                .frame(width: 18, height: 18)
-                                .foregroundColor(theme.swiftUIForeground.opacity(0.7))
-                        }
-                        .buttonStyle(.plain)
-                        .help("Split pane horizontally (⌘D)")
-                        .accessibilityLabel("Split pane horizontally")
-
-                        Button(action: {
-                            NotificationCenter.default.post(name: .ctPaneSplitV, object: nil)
-                        }) {
-                            Image(systemName: "rectangle.split.1x2")
-                                .font(.system(size: 11, weight: .semibold))
-                                .frame(width: 18, height: 18)
-                                .foregroundColor(theme.swiftUIForeground.opacity(0.7))
-                        }
-                        .buttonStyle(.plain)
-                        .help("Split pane vertically (⌘⇧D)")
-                        .accessibilityLabel("Split pane vertically")
-                    }
-                } else {
-                    Button(action: {
-                        NotificationCenter.default.post(name: .ctPaneNext, object: nil)
-                    }) {
-                        Image(systemName: "arrow.triangle.2.circlepath")
+            // Fixed-width trailing controls.
+            HStack(spacing: 4) {
+                if model.sessionManager.role == .host {
+                    Button(action: { model.openNewTab() }) {
+                        Image(systemName: "plus")
                             .font(.system(size: 11, weight: .semibold))
                             .frame(width: 18, height: 18)
                             .foregroundColor(theme.swiftUIForeground.opacity(0.7))
                     }
                     .buttonStyle(.plain)
-                    .help("Focus next pane (⌘⌥⇥)")
-                    .accessibilityLabel("Focus next pane")
+                    .help("New tab (⌘T)")
+                    .accessibilityLabel("New tab")
+                }
 
-                    if model.sessionManager.role == .host {
+                if let tab = model.activeTabForView {
+                    if tab.splitPane == nil {
+                        if model.sessionManager.role == .host {
+                            Button(action: {
+                                NotificationCenter.default.post(name: .ctPaneSplitH, object: nil)
+                            }) {
+                                Image(systemName: "rectangle.split.2x1")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .frame(width: 18, height: 18)
+                                    .foregroundColor(theme.swiftUIForeground.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                            .help("Split pane horizontally (⌘D)")
+                            .accessibilityLabel("Split pane horizontally")
+
+                            Button(action: {
+                                NotificationCenter.default.post(name: .ctPaneSplitV, object: nil)
+                            }) {
+                                Image(systemName: "rectangle.split.1x2")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .frame(width: 18, height: 18)
+                                    .foregroundColor(theme.swiftUIForeground.opacity(0.7))
+                            }
+                            .buttonStyle(.plain)
+                            .help("Split pane vertically (⌘⇧D)")
+                            .accessibilityLabel("Split pane vertically")
+                        }
+                    } else {
                         Button(action: {
-                            NotificationCenter.default.post(name: .ctPaneClose, object: nil)
+                            NotificationCenter.default.post(name: .ctPaneNext, object: nil)
                         }) {
-                            Image(systemName: "rectangle.grid.1x2")
+                            Image(systemName: "arrow.triangle.2.circlepath")
                                 .font(.system(size: 11, weight: .semibold))
                                 .frame(width: 18, height: 18)
-                                .foregroundColor(theme.swiftUIForeground.opacity(0.45))
+                                .foregroundColor(theme.swiftUIForeground.opacity(0.7))
                         }
                         .buttonStyle(.plain)
-                        .help("Close split pane (⌘⇧P)")
-                        .accessibilityLabel("Close split pane")
+                        .help("Focus next pane (⌘⌥⇥)")
+                        .accessibilityLabel("Focus next pane")
+
+                        if model.sessionManager.role == .host {
+                            Button(action: {
+                                NotificationCenter.default.post(name: .ctPaneClose, object: nil)
+                            }) {
+                                Image(systemName: "rectangle.grid.1x2")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .frame(width: 18, height: 18)
+                                    .foregroundColor(theme.swiftUIForeground.opacity(0.45))
+                            }
+                            .buttonStyle(.plain)
+                            .help("Close split pane (⌘⇧P)")
+                            .accessibilityLabel("Close split pane")
+                        }
                     }
                 }
             }
+            .fixedSize()
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+        .padding(.vertical, 2)
         .background(theme.swiftUIBackground)
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(theme.swiftUIForeground.opacity(0.12))
                 .frame(height: 1)
         }
+        .coordinateSpace(name: "tabStrip")
+        .onPreferenceChange(TabFrameKey.self) { tabFrames = $0 }
+    }
+
+    private func frameCapture(for id: UInt32) -> some View {
+        GeometryReader { geo in
+            Color.clear.preference(
+                key: TabFrameKey.self,
+                value: [id: geo.frame(in: .named("tabStrip"))]
+            )
+        }
+    }
+
+    private func dragGesture(for tab: TabState) -> some Gesture {
+        DragGesture(minimumDistance: 4, coordinateSpace: .named("tabStrip"))
+            .onChanged { value in
+                guard model.sessionManager.role == .host else { return }
+
+                if draggingTabId == nil {
+                    guard let frame = tabFrames[tab.id] else { return }
+                    draggingTabId = tab.id
+                    previewOrder = model.tabs.map(\.id)
+                    dragStartSlotX = frame.minX
+                    dragCurrentSlotX = frame.minX
+                }
+                guard draggingTabId == tab.id else { return }
+
+                let translation = value.translation.width
+                let delta = translation - previousTranslation
+                previousTranslation = translation
+                currentTranslation = translation
+
+                guard delta != 0 else { return }
+
+                let tabWidth = tabFrames[tab.id]?.width ?? 100
+                let visualLeftEdge = dragStartSlotX + currentTranslation
+                let visualRightEdge = visualLeftEdge + tabWidth
+
+                if delta > 0 {
+                    // Moving right: only check right neighbor to avoid stale-frame false triggers.
+                    if let fromIdx = previewOrder?.firstIndex(of: tab.id),
+                       let order = previewOrder,
+                       fromIdx + 1 < order.count {
+                        let rightId = order[fromIdx + 1]
+                        if let rightFrame = tabFrames[rightId], visualRightEdge > rightFrame.midX {
+                            var newOrder = order
+                            newOrder.move(fromOffsets: IndexSet(integer: fromIdx), toOffset: fromIdx + 2)
+                            dragCurrentSlotX = rightFrame.minX
+                            withAnimation(.easeInOut(duration: 0.18)) { previewOrder = newOrder }
+                        }
+                    }
+                } else {
+                    // Moving left: only check left neighbor.
+                    if let fromIdx = previewOrder?.firstIndex(of: tab.id),
+                       let order = previewOrder,
+                       fromIdx > 0 {
+                        let leftId = order[fromIdx - 1]
+                        if let leftFrame = tabFrames[leftId], visualLeftEdge < leftFrame.midX {
+                            var newOrder = order
+                            newOrder.move(fromOffsets: IndexSet(integer: fromIdx), toOffset: fromIdx - 1)
+                            dragCurrentSlotX = leftFrame.minX
+                            withAnimation(.easeInOut(duration: 0.18)) { previewOrder = newOrder }
+                        }
+                    }
+                }
+            }
+            .onEnded { _ in
+                guard model.sessionManager.role == .host else { return }
+                if let order = previewOrder,
+                   let finalIdx = order.firstIndex(of: tab.id),
+                   let originalIdx = model.tabs.firstIndex(where: { $0.id == tab.id }) {
+                    model.moveTab(fromIndex: originalIdx, toIndex: finalIdx)
+                }
+                draggingTabId = nil
+                dragStartSlotX = 0
+                dragCurrentSlotX = 0
+                currentTranslation = 0
+                previousTranslation = 0
+                previewOrder = nil
+            }
+    }
+}
+
+private struct TabFrameKey: PreferenceKey {
+    static var defaultValue: [UInt32: CGRect] = [:]
+    static func reduce(value: inout [UInt32: CGRect], nextValue: () -> [UInt32: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { $1 })
     }
 }
 
 private struct TabStripButton: View {
     let title: String
+    let index: Int
     let isActive: Bool
     let canClose: Bool
+    let isDragging: Bool
     let theme: TerminalTheme
     let onSelect: () -> Void
     let onClose: () -> Void
 
+    @State private var isHovered = false
+    @State private var isXHovered = false
+
     var body: some View {
-        HStack(spacing: 2) {
+        HStack(spacing: 0) {
+            // Close button — always reserves space to prevent layout shifts.
+            if canClose {
+                Button(action: onClose) {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundColor(theme.swiftUIForeground.opacity(isXHovered ? 0.85 : 0.3))
+                        .frame(width: 14, height: 14)
+                        .background(
+                            RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                .fill(theme.swiftUIForeground.opacity(isXHovered ? 0.15 : 0))
+                        )
+                }
+                .buttonStyle(.plain)
+                .onHover { isXHovered = $0 }
+                .accessibilityLabel("Close tab \(title)")
+                .help("Close \(title)")
+                .padding(.leading, 6)
+            }
+
+            // Title — fills remaining space, tap selects the tab.
             Button(action: onSelect) {
                 Text(title)
-                    .font(.system(size: 11,
-                                  weight: isActive ? .semibold : .regular,
-                                  design: .rounded))
+                    .font(.system(size: 11, weight: isActive ? .medium : .regular))
                     .lineLimit(1)
-                    .truncationMode(.tail)
+                    .truncationMode(.middle)
                     .foregroundColor(isActive
                                      ? theme.swiftUIForeground
-                                     : theme.swiftUIForeground.opacity(0.5))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .frame(minWidth: 70, maxWidth: 180, alignment: .leading)
-                    .background(tabBackground)
+                                     : theme.swiftUIForeground.opacity(0.38))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 5)
+                    .padding(.horizontal, 6)
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Select tab \(title)")
 
-            if canClose {
-                Button(action: onClose) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 9, weight: .semibold))
-                        .frame(width: 20, height: 20)
-                        .foregroundColor(isActive
-                                         ? theme.swiftUIForeground.opacity(0.8)
-                                         : theme.swiftUIForeground.opacity(0.35))
-                        .background(closeBackground)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("Close tab \(title)")
-                .help("Close \(title)")
+            // ⌘N shortcut hint.
+            if index < 9 {
+                Text("⌘\(index + 1)")
+                    .font(.system(size: 9, weight: .regular))
+                    .foregroundColor(theme.swiftUIForeground.opacity(isActive ? 0.3 : 0.18))
+                    .padding(.trailing, 7)
             }
         }
-    }
-
-    private var tabBackground: some View {
-        RoundedRectangle(cornerRadius: 5, style: .continuous)
-            .fill(theme.swiftUIForeground.opacity(isActive ? 0.18 : 0.06))
-    }
-
-    private var closeBackground: some View {
-        RoundedRectangle(cornerRadius: 5, style: .continuous)
-            .fill(theme.swiftUIForeground.opacity(isActive ? 0.12 : 0.04))
-            .overlay(
-                RoundedRectangle(cornerRadius: 5, style: .continuous)
-                    .strokeBorder(theme.swiftUIForeground.opacity(0.06), lineWidth: 1))
+        .background(
+            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                .fill(theme.swiftUIForeground.opacity(isActive ? 0.13 : 0.04))
+        )
+        .onHover { isHovered = $0 }
+        .opacity(isDragging ? 0.7 : 1.0)
+        .shadow(color: isDragging ? .black.opacity(0.2) : .clear, radius: 5, x: 0, y: 2)
+        .animation(.easeInOut(duration: 0.12), value: isDragging)
     }
 }

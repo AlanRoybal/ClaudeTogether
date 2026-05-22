@@ -52,6 +52,13 @@ struct CoTTYApp: App {
                 Button("Show Previous Tab") { model.previousTab() }
                 .keyboardShortcut("[", modifiers: [.command, .shift])
 
+                ForEach(Array(model.tabs.enumerated()), id: \.element.id) { idx, tab in
+                    if idx < 9 {
+                        Button("Select Tab \(idx + 1)") { model.focusTab(id: tab.id) }
+                            .keyboardShortcut(KeyEquivalent(Character(String(idx + 1))), modifiers: .command)
+                    }
+                }
+
                 Divider()
 
                 Button("Split Pane Horizontally") {
