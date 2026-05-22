@@ -176,6 +176,14 @@ export fn ct_session_send_to(
     return 0;
 }
 
+/// Host only: forcibly close a peer's TCP connection by transport peer id.
+/// The Zig reader thread detects the close and fires a peer_disconnected
+/// event, which the Swift layer uses to clean up the roster.
+export fn ct_session_drop_peer(handle: ?*anyopaque, peer_id: u32) void {
+    const s: *session_mod.Session = @ptrCast(@alignCast(handle orelse return));
+    s.dropPeer(peer_id);
+}
+
 /// Pop the next inbound frame. If one is available, copies up to `cap`
 /// bytes into `out`, writes the sending peer id into `*out_peer_id`, and
 /// returns the frame length (may exceed `cap` — caller should treat

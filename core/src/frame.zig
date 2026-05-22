@@ -52,6 +52,8 @@ pub const Tag = enum(u8) {
     tab_focus = 0x19,
     /// Host fans a chunk of PTY output for a specific tab to peers.
     tab_pty_output = 0x1A,
+    /// Host sends to a specific peer before closing their connection.
+    kick = 0x20,
 };
 
 pub const Role = enum(u8) {

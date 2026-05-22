@@ -391,7 +391,16 @@ private func sessionMenuItems(model: TerminalModel) -> some View {
             Divider()
             ForEach(model.sessionManager.participants) { p in
                 let suffix = p.identity == model.sessionManager.localIdentity ? " (you)" : ""
-                Button(p.name + suffix) {}.disabled(true)
+                if model.sessionManager.role == .host
+                    && p.identity != model.sessionManager.localIdentity {
+                    Menu(p.name) {
+                        Button("Remove from Session") {
+                            model.sessionManager.kickPeer(p.identity)
+                        }
+                    }
+                } else {
+                    Button(p.name + suffix) {}.disabled(true)
+                }
             }
         }
 
