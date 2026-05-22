@@ -852,6 +852,15 @@ final class TerminalModel: ObservableObject {
         closeTab(id: id)
     }
 
+    func moveTab(fromIndex: Int, toIndex: Int) {
+        guard sessionManager.role == .host else { return }
+        guard fromIndex != toIndex,
+              tabs.indices.contains(fromIndex),
+              tabs.indices.contains(toIndex) else { return }
+        tabs.move(fromOffsets: IndexSet(integer: fromIndex),
+                  toOffset: toIndex < fromIndex ? toIndex : toIndex + 1)
+    }
+
     /// Update which tab this local user is focused on. Focus is local to
     /// each participant; peers are not forced to follow the host.
     func focusTab(id: UInt32) {
