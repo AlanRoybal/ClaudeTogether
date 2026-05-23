@@ -38,6 +38,7 @@ struct TabStripView: View {
                         isActive: tab.id == model.activeTabId,
                         canClose: model.sessionManager.role == .host,
                         isDragging: draggingTabId == tab.id,
+                        hasUnreadOutput: tab.hasUnreadOutput,
                         theme: theme,
                         onSelect: { model.focusTab(id: tab.id) },
                         onClose: { model.closeTab(id: tab.id) })
@@ -264,12 +265,15 @@ private struct TabStripButton: View {
     let isActive: Bool
     let canClose: Bool
     let isDragging: Bool
+    let hasUnreadOutput: Bool
     let theme: TerminalTheme
     let onSelect: () -> Void
     let onClose: () -> Void
 
     @State private var isHovered = false
     @State private var isXHovered = false
+
+    private var showsActivityIndicator: Bool { hasUnreadOutput && !isActive }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -294,19 +298,27 @@ private struct TabStripButton: View {
 
             // Title — fills remaining space, tap selects the tab.
             Button(action: onSelect) {
-                Text(title)
-                    .font(.system(size: 11, weight: isActive ? .medium : .regular))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .foregroundColor(isActive
-                                     ? theme.swiftUIForeground
-                                     : theme.swiftUIForeground.opacity(0.38))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 5)
-                    .padding(.horizontal, 6)
+                HStack(spacing: 4) {
+                    Text(title)
+                        .font(.system(size: 11, weight: isActive ? .medium : .regular))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .foregroundColor(isActive
+                                         ? theme.swiftUIForeground
+                                         : theme.swiftUIForeground.opacity(0.38))
+                        .layoutPriority(1)
+                    if showsActivityIndicator {
+                        AnimatedEllipsisView(color: theme.swiftUIForeground.opacity(0.55))
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 5)
+                .padding(.horizontal, 6)
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Select tab \(title)")
+            .accessibilityLabel(showsActivityIndicator
+                                ? "Select tab \(title), new activity"
+                                : "Select tab \(title)")
 
             // ⌘N shortcut hint.
             if index < 9 {
