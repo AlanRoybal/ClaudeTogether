@@ -2433,6 +2433,9 @@ final class TerminalModel: ObservableObject {
             sharedInputs[tabId] = state
             syncGridSharedInputOverlay(tabId: tabId)
             refreshInputAutocomplete()
+            if tabId != activeTabId {
+                markTabUnread(id: tabId)
+            }
         }
     }
 
@@ -2456,6 +2459,9 @@ final class TerminalModel: ObservableObject {
         broadcastSharedInputSnapshot(tabId: tabId)
         handleSharedInputEffect(tabId: tabId, effect)
         refreshInputAutocomplete()
+        if tabId != activeTabId {
+            markTabUnread(id: tabId)
+        }
     }
 
     private func applyOptimisticSharedInputRequest(tabId: UInt32,
