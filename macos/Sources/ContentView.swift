@@ -222,6 +222,9 @@ struct TabState: Identifiable {
     var splitAxis: SplitAxis = .horizontal
     /// 0 = primary pane, 1 = split pane. Determines where keystrokes go.
     var activePaneIndex: Int = 0
+    /// True when output has arrived on this tab while it was in the
+    /// background for this participant. Cleared on focus.
+    var hasUnreadOutput: Bool = false
 }
 
 extension Notification.Name {
@@ -863,10 +866,24 @@ final class TerminalModel: ObservableObject {
 
     /// Update which tab this local user is focused on. Focus is local to
     /// each participant; peers are not forced to follow the host.
+    /// Mark a background tab as having unread output, so the tab strip can
+    /// surface an activity indicator. No-op if the tab is already marked.
+    func markTabUnread(id: UInt32) {
+        guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
+        if !tabs[idx].hasUnreadOutput {
+            tabs[idx].hasUnreadOutput = true
+        }
+    }
+
     func focusTab(id: UInt32) {
         guard tabs.contains(where: { $0.id == id }) else { return }
         let previousId = activeTabId
         activeTabId = id
+        if let idx = tabs.firstIndex(where: { $0.id == id }),
+           tabs[idx].hasUnreadOutput
+        {
+            tabs[idx].hasUnreadOutput = false
+        }
         recordLocalTabFocus(id, broadcast: sessionManager.state == .running)
         if sessionManager.role == .host, sessionManager.state == .running {
             sendTabSnapshot(tabId: id)
@@ -1061,6 +1078,8 @@ final class TerminalModel: ObservableObject {
             // output landed on the active tab.
             if id == self.activeTabId {
                 self.probeLocalMode()
+            } else {
+                self.markTabUnread(id: id)
             }
             if shouldShare {
                 self.handleHostPtyOutput(tabId: id)
@@ -1985,6 +2004,9 @@ final class TerminalModel: ObservableObject {
                     for frame in pendingFrames {
                         tabs.first(where: { $0.id == tabId })?.grid.feed(Array(frame))
                     }
+                    if !pendingFrames.isEmpty, tabId != activeTabId {
+                        markTabUnread(id: tabId)
+                    }
                 }
                 if pendingPeerFocusedTabId == tabId {
                     pendingPeerFocusedTabId = nil
@@ -2032,6 +2054,9 @@ final class TerminalModel: ObservableObject {
             guard sessionManager.role == .peer else { return }
             if let tab = tabs.first(where: { $0.id == tabId }) {
                 tab.grid.feed(Array(data))
+                if tabId != activeTabId {
+                    markTabUnread(id: tabId)
+                }
             } else {
                 pendingPeerTabOutput[tabId, default: []].append(data)
             }
