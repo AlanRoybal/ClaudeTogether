@@ -1066,6 +1066,16 @@ final class TerminalModel: ObservableObject {
                 {
                     self.sendTabSnapshot(tabId: id)
                     self.pendingHostTabInitialSnapshots.remove(id)
+                    // The shared-input anchor was first computed in
+                    // openNewTab before the PTY had a chance to render its
+                    // prompt, so it pointed at column 0 and let peers move
+                    // the cursor through the prompt characters. Now that
+                    // the first bytes have rendered, recompute the anchor
+                    // at the real cursor position and re-broadcast.
+                    if !self.lastLocalCreatorOnlyMode {
+                        self.activateSharedInputAtCurrentCursor(
+                            tabId: id, broadcast: true)
+                    }
                 }
                 // Backward compat for single-tab peers only. In multi-tab
                 // sessions, bare PtyOutput is session-wide and can repaint
