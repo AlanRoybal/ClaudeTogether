@@ -220,6 +220,44 @@ private struct TabFrameKey: PreferenceKey {
     }
 }
 
+/// Three dots that fade in sequence to signal background activity on a tab.
+/// The view occupies a fixed width so toggling visibility on the parent does
+/// not shift the tab title's layout.
+private struct AnimatedEllipsisView: View {
+    let color: Color
+
+    private let dotSize: CGFloat = 2.5
+    private let spacing: CGFloat = 2
+    private let cycle: TimeInterval = 1.2
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+                .truncatingRemainder(dividingBy: cycle) / cycle
+            HStack(spacing: spacing) {
+                ForEach(0..<3) { i in
+                    Circle()
+                        .fill(color)
+                        .frame(width: dotSize, height: dotSize)
+                        .opacity(opacity(at: t, index: i))
+                }
+            }
+        }
+        .frame(width: dotSize * 3 + spacing * 2, alignment: .leading)
+        .accessibilityHidden(true)
+    }
+
+    /// Each dot peaks 1/3 of a cycle apart, easeInOut between 0.2 and 1.0.
+    private func opacity(at t: Double, index: Int) -> Double {
+        let phase = (t - Double(index) / 3.0).truncatingRemainder(dividingBy: 1.0)
+        let wrapped = phase < 0 ? phase + 1.0 : phase
+        // Triangle wave 0..1..0, then ease.
+        let tri = wrapped < 0.5 ? wrapped * 2.0 : (1.0 - wrapped) * 2.0
+        let eased = tri * tri * (3.0 - 2.0 * tri)
+        return 0.2 + 0.8 * eased
+    }
+}
+
 private struct TabStripButton: View {
     let title: String
     let index: Int
