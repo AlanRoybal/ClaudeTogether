@@ -1078,8 +1078,6 @@ final class TerminalModel: ObservableObject {
             // output landed on the active tab.
             if id == self.activeTabId {
                 self.probeLocalMode()
-            } else {
-                self.markTabUnread(id: id)
             }
             if shouldShare {
                 self.handleHostPtyOutput(tabId: id)
@@ -2004,9 +2002,6 @@ final class TerminalModel: ObservableObject {
                     for frame in pendingFrames {
                         tabs.first(where: { $0.id == tabId })?.grid.feed(Array(frame))
                     }
-                    if !pendingFrames.isEmpty, tabId != activeTabId {
-                        markTabUnread(id: tabId)
-                    }
                 }
                 if pendingPeerFocusedTabId == tabId {
                     pendingPeerFocusedTabId = nil
@@ -2054,9 +2049,6 @@ final class TerminalModel: ObservableObject {
             guard sessionManager.role == .peer else { return }
             if let tab = tabs.first(where: { $0.id == tabId }) {
                 tab.grid.feed(Array(data))
-                if tabId != activeTabId {
-                    markTabUnread(id: tabId)
-                }
             } else {
                 pendingPeerTabOutput[tabId, default: []].append(data)
             }
@@ -2073,6 +2065,9 @@ final class TerminalModel: ObservableObject {
                   let pty = tab.pty
             else { return }
             pty.send(Array(data))
+            if tabId != activeTabId {
+                markTabUnread(id: tabId)
+            }
         case .cursorPos(let identity, let col, let row):
             // Update the peer's cursor in the active tab's primary pane grid.
             guard identity != sessionManager.localIdentity,
