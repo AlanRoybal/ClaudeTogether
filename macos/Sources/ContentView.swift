@@ -2397,6 +2397,7 @@ final class TerminalModel: ObservableObject {
             var state = sharedInputs[tabId] ?? SharedInputState()
             let wasActive = state.isActive
             let preservedAnchor = (state.anchorCol, state.anchorRow)
+            let preservedText = state.text
             let localAnchor = tabs.first(where: { $0.id == tabId })?.grid.term.cursor()
 
             // If the text is unchanged this snapshot was triggered by a pure
@@ -2428,7 +2429,14 @@ final class TerminalModel: ObservableObject {
             sharedInputs[tabId] = state
             syncGridSharedInputOverlay(tabId: tabId)
             refreshInputAutocomplete()
-            if tabId != activeTabId {
+            // Only treat snapshots that change the text as typing activity.
+            // Snapshots also fire on tab open, peer join (host floods all
+            // tabs), focus changes, and cursor-only moves — none of which
+            // should trip the indicator.
+            let isTypingActivity = wasActive
+                && snapshot.isActive
+                && snapshot.text != preservedText
+            if isTypingActivity, tabId != activeTabId {
                 markTabUnread(id: tabId)
             }
         }
@@ -2442,6 +2450,14 @@ final class TerminalModel: ObservableObject {
         // extraction (e.g. for history recall via ↑).
         freshlyRespawnedTabs.remove(tabId)
         syncSharedInputParticipants(tabId: tabId, broadcast: false)
+        // Mark the tab unread for the local participant whenever a typing
+        // request arrives for a tab they aren't currently viewing — even if
+        // the host's shared-input state for that tab isn't active yet (e.g.
+        // host has never visited the tab). This is the only signal the host
+        // has that a guest is typing on a background tab.
+        if request.actor != sessionManager.localIdentity, tabId != activeTabId {
+            markTabUnread(id: tabId)
+        }
         var state = sharedInputs[tabId] ?? SharedInputState()
         if !state.isActive {
             sharedInputs[tabId] = state
@@ -2454,9 +2470,6 @@ final class TerminalModel: ObservableObject {
         broadcastSharedInputSnapshot(tabId: tabId)
         handleSharedInputEffect(tabId: tabId, effect)
         refreshInputAutocomplete()
-        if tabId != activeTabId {
-            markTabUnread(id: tabId)
-        }
     }
 
     private func applyOptimisticSharedInputRequest(tabId: UInt32,
