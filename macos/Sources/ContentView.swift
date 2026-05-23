@@ -417,6 +417,10 @@ final class TerminalModel: ObservableObject {
     /// prepends Ctrl+U to clear the shell's readline buffer before sending
     /// the committed line, since the shell already holds that text.
     private var sharedInputNeedsLineClear = Set<UInt32>()
+    /// Per-tab idle timer that clears the activity indicator after a short
+    /// period without typing. Rescheduled on each typing event.
+    private var unreadIdleTimers: [UInt32: Timer] = [:]
+    private let unreadIdleInterval: TimeInterval = 1.5
     private var participantFocusedTab: [UserIdentity: UInt32] = [:]
     private var editorSavedRevisions: [UInt64: UInt32] = [:]
     private var fileSyncWatcher: FSSyncWatcher?
@@ -840,6 +844,7 @@ final class TerminalModel: ObservableObject {
         sharedInputs.removeValue(forKey: id)
         sharedInputPromptTimers.removeValue(forKey: id)?.invalidate()
         sharedInputTransientOutputTimers.removeValue(forKey: id)?.invalidate()
+        unreadIdleTimers.removeValue(forKey: id)?.invalidate()
         participantFocusedTab = participantFocusedTab.filter { $0.value != id }
         pendingHostTabInitialSnapshots.remove(id)
         pendingHostTabStartCwds.removeValue(forKey: id)
@@ -875,11 +880,29 @@ final class TerminalModel: ObservableObject {
     /// Update which tab this local user is focused on. Focus is local to
     /// each participant; peers are not forced to follow the host.
     /// Mark a background tab as having unread output, so the tab strip can
-    /// surface an activity indicator. No-op if the tab is already marked.
+    /// surface an activity indicator. Each call also (re)schedules an idle
+    /// timer that clears the indicator after a short pause in typing.
     func markTabUnread(id: UInt32) {
         guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
         if !tabs[idx].hasUnreadOutput {
             tabs[idx].hasUnreadOutput = true
+        }
+        unreadIdleTimers.removeValue(forKey: id)?.invalidate()
+        unreadIdleTimers[id] = Timer.scheduledTimer(
+            withTimeInterval: unreadIdleInterval,
+            repeats: false
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.clearTabUnread(id: id)
+            }
+        }
+    }
+
+    private func clearTabUnread(id: UInt32) {
+        unreadIdleTimers.removeValue(forKey: id)?.invalidate()
+        guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
+        if tabs[idx].hasUnreadOutput {
+            tabs[idx].hasUnreadOutput = false
         }
     }
 
@@ -887,11 +910,7 @@ final class TerminalModel: ObservableObject {
         guard tabs.contains(where: { $0.id == id }) else { return }
         let previousId = activeTabId
         activeTabId = id
-        if let idx = tabs.firstIndex(where: { $0.id == id }),
-           tabs[idx].hasUnreadOutput
-        {
-            tabs[idx].hasUnreadOutput = false
-        }
+        clearTabUnread(id: id)
         recordLocalTabFocus(id, broadcast: sessionManager.state == .running)
         if sessionManager.role == .host, sessionManager.state == .running {
             sendTabSnapshot(tabId: id)
