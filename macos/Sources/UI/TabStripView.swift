@@ -310,10 +310,12 @@ private struct TabStripButton: View {
                     if showsActivityIndicator {
                         AnimatedEllipsisView(color: theme.swiftUIForeground.opacity(0.55))
                     }
+                    Spacer(minLength: 0)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.vertical, 5)
                 .padding(.horizontal, 6)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel(showsActivityIndicator
