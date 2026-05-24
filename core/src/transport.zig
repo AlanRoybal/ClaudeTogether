@@ -92,6 +92,7 @@ pub const Listener = struct {
 
     pub fn accept(self: *Listener) !Connection {
         const conn = try self.server.accept();
+        setNoDelay(conn.stream);
         return .{ .stream = conn.stream };
     }
 
@@ -104,7 +105,23 @@ pub const Listener = struct {
 /// or DNS name (resolved synchronously).
 pub fn connect(allocator: std.mem.Allocator, host: []const u8, port: u16) !Connection {
     const stream = try net.tcpConnectToHost(allocator, host, port);
+    setNoDelay(stream);
     return .{ .stream = stream };
+}
+
+/// Disable Nagle's algorithm so single-keystroke frames and other small
+/// interactive messages leave the socket immediately. Best-effort: a failure
+/// here just means slightly higher latency, not a broken session.
+fn setNoDelay(stream: net.Stream) void {
+    const one: c_int = 1;
+    // IPPROTO_TCP = 6, TCP_NODELAY = 1 on both macOS and Linux. Hard-coded
+    // because std.posix in Zig 0.13 does not re-export `TCP` constants.
+    std.posix.setsockopt(
+        stream.handle,
+        6,
+        1,
+        std.mem.asBytes(&one),
+    ) catch {};
 }
 
 // --- tests ----------------------------------------------------------------
@@ -186,6 +203,41 @@ test "peer close surfaces as PeerClosed" {
 
     var buf: [64]u8 = undefined;
     try testing.expectError(error.PeerClosed, server_conn.recvFrame(&buf));
+}
+
+test "loopback sockets have TCP_NODELAY enabled" {
+    var listener = try Listener.listen(0);
+    defer listener.close();
+    const port = listener.boundPort();
+
+    const Runner = struct {
+        fn clientThread(p: u16, out_fd: *std.posix.socket_t) void {
+            var conn = connect(testing.allocator, "127.0.0.1", p) catch return;
+            out_fd.* = conn.stream.handle;
+            // Keep socket alive until parent has read it back.
+            std.time.sleep(50 * std.time.ns_per_ms);
+            conn.close();
+        }
+    };
+
+    var client_fd: std.posix.socket_t = undefined;
+    const t = try std.Thread.spawn(.{}, Runner.clientThread, .{ port, &client_fd });
+    defer t.join();
+
+    var server_conn = try listener.accept();
+    defer server_conn.close();
+
+    var val: c_int = 0;
+    var len: std.posix.socklen_t = @sizeOf(c_int);
+    const rc = std.c.getsockopt(
+        server_conn.stream.handle,
+        6,
+        1,
+        @ptrCast(&val),
+        &len,
+    );
+    try testing.expect(rc == 0);
+    try testing.expect(val != 0);
 }
 
 test "frame too large rejected on send" {
