@@ -55,7 +55,7 @@ struct ContentView: View {
             }
 
             if model.activeEditor == nil, model.showRawBanner {
-                Text("Creator is running a full-screen app. Use /edit for shared file editing; terminal input is disabled here.")
+                Text("TUI mode — your keystrokes forward to the host. Use /edit for shared file editing.")
                     .font(.callout)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
@@ -672,10 +672,13 @@ final class TerminalModel: ObservableObject {
         sessionManager.accessMode == .viewOnly
     }
 
-    /// False when the terminal view should drop keystrokes:
-    /// either the host is in creator-only mode (raw) or the host has
-    /// flipped access to view-only.
-    var inputEnabled: Bool { !showRawBanner && !isViewOnlyPeer }
+    /// False when the terminal view should drop keystrokes. View-only
+    /// peers are always blocked. In raw (TUI) mode peers stay enabled
+    /// so their keystrokes ride the existing inputOp→pty.send passthrough
+    /// fallback into the host's PTY — see the host-side handler in
+    /// `handleFrame(.inputOp)` where a payload that isn't a SharedInputCodec
+    /// packet is forwarded to the active tab's PTY.
+    var inputEnabled: Bool { !isViewOnlyPeer }
 
     // MARK: host session
 
