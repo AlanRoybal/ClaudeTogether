@@ -1,0 +1,5 @@
+module CollabTermC {
+    header "collabterm.h"
+    link "collabterm"
+    export *
+}

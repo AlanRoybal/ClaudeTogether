@@ -225,6 +225,14 @@ struct TabState: Identifiable {
     /// True when output has arrived on this tab while it was in the
     /// background for this participant. Cleared on focus.
     var hasUnreadOutput: Bool = false
+
+    /// True if the underlying tool has put the PTY in raw mode — either via
+    /// the alt-screen DECSET (vim, htop) or via termios ICANON-off (claude,
+    /// codex). Peer-side tabs have no PTY and report based on alt-screen only.
+    var isRawMode: Bool {
+        if grid.isUsingAlternateScreen { return true }
+        return pty?.isRaw ?? false
+    }
 }
 
 extension Notification.Name {
