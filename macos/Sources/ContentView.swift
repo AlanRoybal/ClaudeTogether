@@ -54,16 +54,6 @@ struct ContentView: View {
                     .onAppear { model.openInitialTab() }
             }
 
-            if model.activeEditor == nil, model.showRawBanner {
-                Text("TUI mode — your keystrokes forward to the host. Use /edit for shared file editing.")
-                    .font(.callout)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(.orange.opacity(0.85), in: Capsule())
-                    .foregroundStyle(.white)
-                    .padding(.top, titleBarInset + 8)
-            }
-
             if model.isViewOnlyPeer {
                 HStack {
                     Spacer()
@@ -76,18 +66,6 @@ struct ContentView: View {
                         .padding(.trailing, 12)
                 }
                 .padding(.top, titleBarInset + 8)
-            }
-
-            if let msg = model.sessionNotificationMessage {
-                Text(msg)
-                    .font(.callout)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(.indigo.opacity(0.85), in: Capsule())
-                    .foregroundStyle(.white)
-                    .padding(.top, titleBarInset + 8)
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                    .allowsHitTesting(false)
             }
 
         }
