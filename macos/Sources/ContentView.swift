@@ -2245,7 +2245,11 @@ final class TerminalModel: ObservableObject {
 
     private func startModeProbe() {
         modeTimer?.invalidate()
-        modeTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+        // Faster cadence in line mode so we catch claude/codex flipping
+        // termios before they (sometimes) toggle alt-screen; once raw we
+        // back off to 200ms.
+        let interval = lastLocalCreatorOnlyMode ? 0.2 : 0.06
+        modeTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.probeLocalMode() }
         }
     }
@@ -2257,9 +2261,12 @@ final class TerminalModel: ObservableObject {
     }
 
     private func probeLocalMode(force: Bool = false) {
-        let creatorOnlyMode = grid?.isUsingAlternateScreen ?? false
+        let creatorOnlyMode = activeTab?.isRawMode ?? (grid?.isUsingAlternateScreen ?? false)
         guard force || creatorOnlyMode != lastLocalCreatorOnlyMode else { return }
         lastLocalCreatorOnlyMode = creatorOnlyMode
+        // Re-arm at the cadence that matches the new mode (60ms in line,
+        // 200ms in raw). Cheap: just a Timer.replace.
+        if modeTimer != nil { startModeProbe() }
         // Only propagate if we're currently hosting a shared session.
         if sessionManager.role == .host, sessionManager.state == .running {
             sessionManager.sendMode(creatorOnlyMode ? .raw : .line)
@@ -2313,7 +2320,7 @@ final class TerminalModel: ObservableObject {
         else {
             return false
         }
-        return !tab.grid.isUsingAlternateScreen
+        return !tab.isRawMode
     }
 
     private func isPeerSharedLineSession(tabId: UInt32) -> Bool {
@@ -2564,7 +2571,7 @@ final class TerminalModel: ObservableObject {
         guard sessionManager.role == .host,
               sessionManager.state == .running,
               let tab = tabs.first(where: { $0.id == tabId }),
-              !tab.grid.isUsingAlternateScreen
+              !tab.isRawMode
         else {
             return
         }
@@ -2596,9 +2603,10 @@ final class TerminalModel: ObservableObject {
     {
         guard sessionManager.role == .host,
               sessionManager.state == .running,
-              let grid = tabs.first(where: { $0.id == tabId })?.grid,
-              !grid.isUsingAlternateScreen
+              let tab = tabs.first(where: { $0.id == tabId }),
+              !tab.isRawMode
         else { return }
+        let grid = tab.grid
 
         syncSharedInputParticipants(tabId: tabId, broadcast: false)
         let cursor = grid.term.cursor()
