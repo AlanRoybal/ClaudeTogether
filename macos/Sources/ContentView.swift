@@ -3585,6 +3585,10 @@ final class TerminalModel: ObservableObject {
         else {
             return
         }
+        // No remote peers → no one to deliver deltas to. Skip the directory
+        // walk in `incrementalSync()`; a fresh `restartFileSyncWatcher` (with
+        // a `fullSync`) runs when a peer actually joins.
+        guard sessionManager.participants.count > 1 else { return }
         if fileSyncWatcher == nil {
             restartFileSyncWatcher()
         }
