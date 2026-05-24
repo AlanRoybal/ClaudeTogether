@@ -2272,6 +2272,11 @@ final class TerminalModel: ObservableObject {
             sessionManager.sendMode(creatorOnlyMode ? .raw : .line)
             if creatorOnlyMode {
                 if let activeTabId {
+                    // Cancel any pending re-activation so a late timer
+                    // doesn't bring the shared-input overlay back on top of
+                    // a TUI that's about to paint the same screen region.
+                    sharedInputPromptTimers.removeValue(forKey: activeTabId)?.invalidate()
+                    sharedInputTransientOutputTimers.removeValue(forKey: activeTabId)?.invalidate()
                     deactivateSharedInput(tabId: activeTabId, bumpRevision: true)
                     syncGridSharedInputOverlay(tabId: activeTabId)
                     broadcastSharedInputSnapshot(tabId: activeTabId)
