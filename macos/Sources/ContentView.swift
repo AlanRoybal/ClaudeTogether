@@ -498,6 +498,9 @@ final class TerminalModel: ObservableObject {
                 self.showSessionNotification("\(p.name) left")
             }
             self.previousParticipants = newParticipants
+            // Mode probe is gated on hosting + having a remote peer; the
+            // first peer's Hello starts it, the last peer's leave stops it.
+            self.startModeProbe()
         }.store(in: &cancellables)
         sessionManager.$accessMode.sink { [weak self] _ in
             self?.syncEditorReadOnlyState()
@@ -2226,6 +2229,16 @@ final class TerminalModel: ObservableObject {
 
     private func startModeProbe() {
         modeTimer?.invalidate()
+        modeTimer = nil
+        // probeLocalMode is a no-op unless we are hosting a running session
+        // with at least one remote peer — skip the timer entirely otherwise
+        // to keep the main thread idle when the app is local-only.
+        guard sessionManager.role == .host,
+              sessionManager.state == .running,
+              sessionManager.participants.count > 1
+        else {
+            return
+        }
         // Faster cadence in line mode so we catch claude/codex flipping
         // termios before they (sometimes) toggle alt-screen; once raw we
         // back off to 200ms.
@@ -3585,6 +3598,10 @@ final class TerminalModel: ObservableObject {
         else {
             return
         }
+        // No remote peers → no one to deliver deltas to. Skip the directory
+        // walk in `incrementalSync()`; a fresh `restartFileSyncWatcher` (with
+        // a `fullSync`) runs when a peer actually joins.
+        guard sessionManager.participants.count > 1 else { return }
         if fileSyncWatcher == nil {
             restartFileSyncWatcher()
         }

@@ -79,7 +79,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
 
     /// When true the draw loop attempts ligature substitution for known
     /// programming sequences before falling back to individual-glyph rendering.
-    var ligaturesEnabled: Bool = true
+    var ligaturesEnabled: Bool = true { didSet { rendererMutationSeq &+= 1 } }
 
     private static let ligatureSequences: [String] = [
         // longest first so greedy matching picks the longest match
@@ -114,17 +114,28 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
 
     var onResize: ((UInt16, UInt16) -> Void)?
 
-    var cursorVisible = true
+    var cursorVisible = true { didSet { rendererMutationSeq &+= 1 } }
     private var blinkStart = CACurrentMediaTime()
 
     /// Normalized selection range set by the view layer. Both endpoints are
     /// inclusive and `start` is always <= `end` (row-major order).
-    var selection: (start: (col: Int, row: Int), end: (col: Int, row: Int))? = nil
+    var selection: (start: (col: Int, row: Int), end: (col: Int, row: Int))? = nil {
+        didSet { rendererMutationSeq &+= 1 }
+    }
 
     /// Current find-bar matches in viewport coordinates. Set by MetalTerminalView.
-    var searchMatches: [SearchMatch] = []
+    var searchMatches: [SearchMatch] = [] { didSet { rendererMutationSeq &+= 1 } }
     /// Index into `searchMatches` for the currently focused match, or nil.
-    var currentMatchIndex: Int? = nil
+    var currentMatchIndex: Int? = nil { didSet { rendererMutationSeq &+= 1 } }
+
+    /// Bumped by any renderer-state setter that affects `draw(in:)` output but
+    /// is not reflected in `GridModel.epoch` (selection, search, theme, font,
+    /// cursor visibility, ligatures). Combined with `grid.epoch` and the
+    /// quantised blink phase to gate redraws — see `draw(in:)`.
+    private var rendererMutationSeq: UInt64 = 0
+    private var lastDrawnGridEpoch: UInt32?
+    private var lastDrawnMutationSeq: UInt64?
+    private var lastDrawnBlinkPhase: Int?
 
     init?(view: MTKView, fontName: String = "", pointSize: CGFloat = 13) {
         guard let device = view.device ?? MTLCreateSystemDefaultDevice() else {
@@ -230,6 +241,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             green: Double((bg >>  8) & 0xFF) / 255,
             blue:  Double( bg        & 0xFF) / 255,
             alpha: 1)
+        rendererMutationSeq &+= 1
     }
 
     // MARK: MTKViewDelegate
@@ -258,6 +270,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     func setPointSize(_ newPointSize: CGFloat) {
         guard newPointSize > 0, newPointSize != pointSize else { return }
         pointSize = newPointSize
+        rendererMutationSeq &+= 1
         let scale = view?.window?.backingScaleFactor
             ?? atlas.scale
         if let newAtlas = GlyphAtlas(device: device,
@@ -276,6 +289,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     func setFontName(_ newName: String) {
         guard newName != fontName else { return }
         fontName = newName
+        rendererMutationSeq &+= 1
         let scale = view?.window?.backingScaleFactor ?? atlas.scale
         if let newAtlas = GlyphAtlas(device: device,
                                      fontName: newName.isEmpty ? nil : newName,
@@ -291,14 +305,34 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     }
 
     func draw(in view: MTKView) {
-        guard let grid = grid,
-              let drawable = view.currentDrawable,
+        guard let grid = grid else { return }
+
+        // Battery saver: when neither the grid, renderer state, nor the
+        // (quantised) blink phase has changed, skip the GPU encode entirely.
+        // The previously presented drawable stays on screen — MTKView does
+        // not require a present every vsync. Blink phase is quantised to the
+        // 500 ms half-period so we wake exactly at on/off transitions.
+        let now = CACurrentMediaTime()
+        let blinkPhase = Int((now - blinkStart) / (CursorOverlay.blinkPeriod * 0.5))
+        let gridEpoch = grid.epoch
+        let mutationSeq = rendererMutationSeq
+        if lastDrawnGridEpoch == gridEpoch,
+           lastDrawnMutationSeq == mutationSeq,
+           lastDrawnBlinkPhase == blinkPhase
+        {
+            return
+        }
+
+        guard let drawable = view.currentDrawable,
               let rpd = view.currentRenderPassDescriptor,
               let cmd = commandQueue.makeCommandBuffer()
         else { return }
 
+        lastDrawnGridEpoch = gridEpoch
+        lastDrawnMutationSeq = mutationSeq
+        lastDrawnBlinkPhase = blinkPhase
+
         let snap = grid.snapshot()
-        let now = CACurrentMediaTime()
         let overlay = CursorOverlay.build(
             cursors: grid.cursors,
             time: now,

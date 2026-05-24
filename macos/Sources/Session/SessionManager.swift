@@ -97,7 +97,10 @@ final class SessionManager: ObservableObject {
 
     private var handle: OpaquePointer?
     private var boreHandle: OpaquePointer?
-    private var pollTimer: Timer?
+    private var pollTimer: DispatchSourceTimer?
+    /// Last interval picked by `schedulePump`. Persists across ticks so the
+    /// adaptive backoff can step up/down rather than snapping each cycle.
+    private var pollIntervalMs: Int = 16
     private var borePumpTimer: Timer?
     private var keepAliveTimer: Timer?
 
@@ -119,7 +122,7 @@ final class SessionManager: ObservableObject {
     }
 
     deinit {
-        pollTimer?.invalidate()
+        pollTimer?.cancel()
         borePumpTimer?.invalidate()
         keepAliveTimer?.invalidate()
         if let h = handle { ct_session_free(h) }
@@ -176,7 +179,7 @@ final class SessionManager: ObservableObject {
     }
 
     func stop() {
-        pollTimer?.invalidate(); pollTimer = nil
+        pollTimer?.cancel(); pollTimer = nil
         borePumpTimer?.invalidate(); borePumpTimer = nil
         keepAliveTimer?.invalidate(); keepAliveTimer = nil
         if let h = handle {
@@ -539,9 +542,43 @@ final class SessionManager: ObservableObject {
     // MARK: polling
 
     private func startPolling() {
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.016, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.pump() }
+        pollTimer?.cancel()
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        pollTimer = t
+        pollIntervalMs = 16
+        t.setEventHandler { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self = self else { return }
+                let drained = self.pump()
+                self.schedulePump(drained: drained)
+            }
         }
+        t.schedule(deadline: .now() + .milliseconds(pollIntervalMs))
+        t.resume()
+    }
+
+    /// Pick the next pump interval based on activity. Backoff schedule:
+    /// 16 ms (active) → 33 ms → 66 ms (steady idle, peer connected),
+    /// or 200 ms when no remote peer is connected. Any drain > 0 snaps
+    /// back to 16 ms so interactive latency stays unaffected. Cheap: just
+    /// re-arms the existing DispatchSourceTimer.
+    private func schedulePump(drained: Int) {
+        guard let t = pollTimer else { return }
+        let next: Int
+        if drained > 0 {
+            next = 16
+        } else if participants.count <= 1 {
+            // No remote peers — `ct_session_poll` can't produce frames.
+            next = 200
+        } else {
+            switch pollIntervalMs {
+            case ..<33: next = 33
+            case 33..<66: next = 66
+            default: next = 66
+            }
+        }
+        pollIntervalMs = next
+        t.schedule(deadline: .now() + .milliseconds(next))
     }
 
     private func startKeepAlive() {
@@ -606,41 +643,48 @@ final class SessionManager: ObservableObject {
         }
     }
 
-    private func pump() {
-        drainFrames()
-        drainEvents()
+    @discardableResult
+    private func pump() -> Int {
+        return drainFrames() + drainEvents()
     }
 
-    private func drainEvents() {
+    @discardableResult
+    private func drainEvents() -> Int {
+        var count = 0
         for _ in 0..<32 {
             // Re-check every iteration: an event handler may have called
             // stop() (e.g. peer-side on host disconnect), freeing the handle.
-            guard let h = handle else { return }
+            guard let h = handle else { return count }
             var kind: UInt8 = 0
             var peerID: UInt32 = 0
             let r = ct_session_poll_event(h, &kind, &peerID)
-            if r == 0 { return }
+            if r == 0 { return count }
+            count += 1
             switch kind {
             case 0: handleConnected(peerID)
             case 1: handleDisconnected(peerID)
             default: break
             }
         }
+        return count
     }
 
-    private func drainFrames() {
+    @discardableResult
+    private func drainFrames() -> Int {
         var buf = [UInt8](repeating: 0, count: 64 * 1024)
+        var count = 0
         for _ in 0..<64 {
-            guard let h = handle else { return }
+            guard let h = handle else { return count }
             var peerID: UInt32 = 0
             let n = buf.withUnsafeMutableBufferPointer { p -> Int in
                 Int(ct_session_poll(h, p.baseAddress, p.count, &peerID))
             }
-            if n == 0 { return }
+            if n == 0 { return count }
             if n > buf.count {
                 buf = [UInt8](repeating: 0, count: n)
                 continue
             }
+            count += 1
             let wire = Data(buf.prefix(n))
             do {
                 let plain: Data
@@ -655,6 +699,7 @@ final class SessionManager: ObservableObject {
                 lastError = "decode: \(error)"
             }
         }
+        return count
     }
 
     // MARK: event / frame handlers
