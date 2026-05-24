@@ -67,6 +67,7 @@ final class GridModel: ObservableObject {
     var isUsingAlternateScreen: Bool { term.isUsingAlternateScreen }
 
     func feed(_ bytes: [UInt8]) {
+        guard !bytes.isEmpty else { return }
         term.feed(bytes)
         // Always follow new output: snap back to the live view so the terminal
         // auto-scrolls. Users who want to read history can scroll up manually;
@@ -77,6 +78,9 @@ final class GridModel: ObservableObject {
         } else {
             syncOverlayCursors()
         }
+        // Cell contents may have changed without the cursor moving; bump so
+        // the renderer treats the grid as dirty regardless of cursor sync.
+        epoch &+= 1
     }
 
     func resize(cols: UInt16, rows: UInt16, preserveTop: Bool = false) {
@@ -87,6 +91,7 @@ final class GridModel: ObservableObject {
         } else {
             syncOverlayCursors()
         }
+        epoch &+= 1
     }
 
     @discardableResult
@@ -194,6 +199,9 @@ final class GridModel: ObservableObject {
             textScalars: Array(text.unicodeScalars),
             cursors: cursors)
         syncOverlayCursors()
+        // Overlay text edits may not move any cursor (e.g. cursor stays at
+        // end while a peer types) — bump explicitly so renderer redraws.
+        epoch &+= 1
     }
 
     func clearInputOverlay() {
