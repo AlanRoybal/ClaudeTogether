@@ -222,6 +222,9 @@ struct TabState: Identifiable {
     var splitAxis: SplitAxis = .horizontal
     /// 0 = primary pane, 1 = split pane. Determines where keystrokes go.
     var activePaneIndex: Int = 0
+    /// True when output has arrived on this tab while it was in the
+    /// background for this participant. Cleared on focus.
+    var hasUnreadOutput: Bool = false
 }
 
 extension Notification.Name {
@@ -414,6 +417,10 @@ final class TerminalModel: ObservableObject {
     /// prepends Ctrl+U to clear the shell's readline buffer before sending
     /// the committed line, since the shell already holds that text.
     private var sharedInputNeedsLineClear = Set<UInt32>()
+    /// Per-tab idle timer that clears the activity indicator after a short
+    /// period without typing. Rescheduled on each typing event.
+    private var unreadIdleTimers: [UInt32: Timer] = [:]
+    private let unreadIdleInterval: TimeInterval = 1.5
     private var participantFocusedTab: [UserIdentity: UInt32] = [:]
     private var editorSavedRevisions: [UInt64: UInt32] = [:]
     private var fileSyncWatcher: FSSyncWatcher?
@@ -795,6 +802,14 @@ final class TerminalModel: ObservableObject {
             return
         }
         tabs.append(tab)
+        // Mark the tab as a freshly spawned shell so the shared-input anchor
+        // recomputation skips the "reuse prior anchor on the same row" path
+        // (which, without this flag, would lock the anchor at col 0 — the
+        // cursor position at the moment of tab creation, before the prompt
+        // had rendered — and let participants edit the prompt characters
+        // themselves). Cleared on first user input by
+        // applyAuthoritativeSharedInputRequest.
+        freshlyRespawnedTabs.insert(tabId)
         if shouldDeferSpawn {
             pendingHostTabStartCwds[tabId] = folder
         }
@@ -829,6 +844,7 @@ final class TerminalModel: ObservableObject {
         sharedInputs.removeValue(forKey: id)
         sharedInputPromptTimers.removeValue(forKey: id)?.invalidate()
         sharedInputTransientOutputTimers.removeValue(forKey: id)?.invalidate()
+        unreadIdleTimers.removeValue(forKey: id)?.invalidate()
         participantFocusedTab = participantFocusedTab.filter { $0.value != id }
         pendingHostTabInitialSnapshots.remove(id)
         pendingHostTabStartCwds.removeValue(forKey: id)
@@ -863,10 +879,38 @@ final class TerminalModel: ObservableObject {
 
     /// Update which tab this local user is focused on. Focus is local to
     /// each participant; peers are not forced to follow the host.
+    /// Mark a background tab as having unread output, so the tab strip can
+    /// surface an activity indicator. Each call also (re)schedules an idle
+    /// timer that clears the indicator after a short pause in typing.
+    func markTabUnread(id: UInt32) {
+        guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
+        if !tabs[idx].hasUnreadOutput {
+            tabs[idx].hasUnreadOutput = true
+        }
+        unreadIdleTimers.removeValue(forKey: id)?.invalidate()
+        unreadIdleTimers[id] = Timer.scheduledTimer(
+            withTimeInterval: unreadIdleInterval,
+            repeats: false
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.clearTabUnread(id: id)
+            }
+        }
+    }
+
+    private func clearTabUnread(id: UInt32) {
+        unreadIdleTimers.removeValue(forKey: id)?.invalidate()
+        guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
+        if tabs[idx].hasUnreadOutput {
+            tabs[idx].hasUnreadOutput = false
+        }
+    }
+
     func focusTab(id: UInt32) {
         guard tabs.contains(where: { $0.id == id }) else { return }
         let previousId = activeTabId
         activeTabId = id
+        clearTabUnread(id: id)
         recordLocalTabFocus(id, broadcast: sessionManager.state == .running)
         if sessionManager.role == .host, sessionManager.state == .running {
             sendTabSnapshot(tabId: id)
@@ -2048,6 +2092,9 @@ final class TerminalModel: ObservableObject {
                   let pty = tab.pty
             else { return }
             pty.send(Array(data))
+            if tabId != activeTabId {
+                markTabUnread(id: tabId)
+            }
         case .cursorPos(let identity, let col, let row):
             // Update the peer's cursor in the active tab's primary pane grid.
             guard identity != sessionManager.localIdentity,
@@ -2377,6 +2424,7 @@ final class TerminalModel: ObservableObject {
             var state = sharedInputs[tabId] ?? SharedInputState()
             let wasActive = state.isActive
             let preservedAnchor = (state.anchorCol, state.anchorRow)
+            let preservedText = state.text
             let localAnchor = tabs.first(where: { $0.id == tabId })?.grid.term.cursor()
 
             // If the text is unchanged this snapshot was triggered by a pure
@@ -2408,6 +2456,16 @@ final class TerminalModel: ObservableObject {
             sharedInputs[tabId] = state
             syncGridSharedInputOverlay(tabId: tabId)
             refreshInputAutocomplete()
+            // Only treat snapshots that change the text as typing activity.
+            // Snapshots also fire on tab open, peer join (host floods all
+            // tabs), focus changes, and cursor-only moves — none of which
+            // should trip the indicator.
+            let isTypingActivity = wasActive
+                && snapshot.isActive
+                && snapshot.text != preservedText
+            if isTypingActivity, tabId != activeTabId {
+                markTabUnread(id: tabId)
+            }
         }
     }
 
@@ -2419,6 +2477,14 @@ final class TerminalModel: ObservableObject {
         // extraction (e.g. for history recall via ↑).
         freshlyRespawnedTabs.remove(tabId)
         syncSharedInputParticipants(tabId: tabId, broadcast: false)
+        // Mark the tab unread for the local participant whenever a typing
+        // request arrives for a tab they aren't currently viewing — even if
+        // the host's shared-input state for that tab isn't active yet (e.g.
+        // host has never visited the tab). This is the only signal the host
+        // has that a guest is typing on a background tab.
+        if request.actor != sessionManager.localIdentity, tabId != activeTabId {
+            markTabUnread(id: tabId)
+        }
         var state = sharedInputs[tabId] ?? SharedInputState()
         if !state.isActive {
             sharedInputs[tabId] = state

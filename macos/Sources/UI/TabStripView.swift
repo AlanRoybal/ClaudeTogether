@@ -38,6 +38,7 @@ struct TabStripView: View {
                         isActive: tab.id == model.activeTabId,
                         canClose: model.sessionManager.role == .host,
                         isDragging: draggingTabId == tab.id,
+                        hasUnreadOutput: tab.hasUnreadOutput,
                         theme: theme,
                         onSelect: { model.focusTab(id: tab.id) },
                         onClose: { model.closeTab(id: tab.id) })
@@ -220,18 +221,59 @@ private struct TabFrameKey: PreferenceKey {
     }
 }
 
+/// Three dots that fade in sequence to signal background activity on a tab.
+/// The view occupies a fixed width so toggling visibility on the parent does
+/// not shift the tab title's layout.
+private struct AnimatedEllipsisView: View {
+    let color: Color
+
+    private let dotSize: CGFloat = 2.5
+    private let spacing: CGFloat = 2
+    private let cycle: TimeInterval = 1.2
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+                .truncatingRemainder(dividingBy: cycle) / cycle
+            HStack(spacing: spacing) {
+                ForEach(0..<3) { i in
+                    Circle()
+                        .fill(color)
+                        .frame(width: dotSize, height: dotSize)
+                        .opacity(opacity(at: t, index: i))
+                }
+            }
+        }
+        .frame(width: dotSize * 3 + spacing * 2, alignment: .leading)
+        .accessibilityHidden(true)
+    }
+
+    /// Each dot peaks 1/3 of a cycle apart, easeInOut between 0.2 and 1.0.
+    private func opacity(at t: Double, index: Int) -> Double {
+        let phase = (t - Double(index) / 3.0).truncatingRemainder(dividingBy: 1.0)
+        let wrapped = phase < 0 ? phase + 1.0 : phase
+        // Triangle wave 0..1..0, then ease.
+        let tri = wrapped < 0.5 ? wrapped * 2.0 : (1.0 - wrapped) * 2.0
+        let eased = tri * tri * (3.0 - 2.0 * tri)
+        return 0.2 + 0.8 * eased
+    }
+}
+
 private struct TabStripButton: View {
     let title: String
     let index: Int
     let isActive: Bool
     let canClose: Bool
     let isDragging: Bool
+    let hasUnreadOutput: Bool
     let theme: TerminalTheme
     let onSelect: () -> Void
     let onClose: () -> Void
 
     @State private var isHovered = false
     @State private var isXHovered = false
+
+    private var showsActivityIndicator: Bool { hasUnreadOutput && !isActive }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -256,19 +298,29 @@ private struct TabStripButton: View {
 
             // Title — fills remaining space, tap selects the tab.
             Button(action: onSelect) {
-                Text(title)
-                    .font(.system(size: 11, weight: isActive ? .medium : .regular))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .foregroundColor(isActive
-                                     ? theme.swiftUIForeground
-                                     : theme.swiftUIForeground.opacity(0.38))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 5)
-                    .padding(.horizontal, 6)
+                HStack(spacing: 4) {
+                    Text(title)
+                        .font(.system(size: 11, weight: isActive ? .medium : .regular))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .foregroundColor(isActive
+                                         ? theme.swiftUIForeground
+                                         : theme.swiftUIForeground.opacity(0.38))
+                        .layoutPriority(1)
+                    if showsActivityIndicator {
+                        AnimatedEllipsisView(color: theme.swiftUIForeground.opacity(0.55))
+                    }
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.vertical, 5)
+                .padding(.horizontal, 6)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Select tab \(title)")
+            .accessibilityLabel(showsActivityIndicator
+                                ? "Select tab \(title), new activity"
+                                : "Select tab \(title)")
 
             // ⌘N shortcut hint.
             if index < 9 {
