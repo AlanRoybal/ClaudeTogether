@@ -5,8 +5,21 @@
 //! Lifecycle: callers spawn via `start`, poll `publicUrl()` until non-null
 //! (or some timeout), and call `stop` on shutdown. Restart on crash is the
 //! caller's responsibility — keep policy out of this module.
+//!
+//! Implemented on raw libc fork/exec/pipe (like `pty.zig`). Zig 0.16's
+//! `std.process.Child` now requires threading a `std.Io` through spawn/wait/
+//! kill and reading pipes via the new streaming `Io.File`; doing it directly
+//! against libc keeps the same non-blocking polling semantics with no `Io`.
 
 const std = @import("std");
+
+const c = @cImport({
+    @cInclude("unistd.h");
+    @cInclude("signal.h");
+    @cInclude("poll.h");
+    @cInclude("sys/wait.h");
+    @cInclude("sys/stat.h");
+});
 
 pub const Error = error{
     SpawnFailed,
@@ -17,84 +30,117 @@ pub const Error = error{
 
 pub const Supervisor = struct {
     allocator: std.mem.Allocator,
-    child: ?std.process.Child = null,
+    pid: ?c.pid_t = null,
+    /// Read ends of the child's stdout/stderr pipes (parent side).
+    stdout_fd: ?c_int = null,
+    stderr_fd: ?c_int = null,
     /// Parsed "bore.pub:NNNNN" once the child announces it. Owned by
     /// this supervisor (freed on stop()).
     public_url: ?[]u8 = null,
     /// Scratch buffer for incremental stdout/stderr reads while waiting for
     /// the "listening at ..." announcement.
-    output_buf: std.ArrayList(u8),
+    output_buf: std.ArrayList(u8) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) Supervisor {
-        return .{
-            .allocator = allocator,
-            .output_buf = std.ArrayList(u8).init(allocator),
-        };
+        return .{ .allocator = allocator };
     }
 
     pub fn deinit(self: *Supervisor) void {
         self.stop();
-        self.output_buf.deinit();
+        self.output_buf.deinit(self.allocator);
     }
 
     /// Spawn a tunnel process from `tool_path`.
     /// If `server` is non-empty: bore mode → `bore local <port> --to <server> [--secret <secret>]`
     /// If `server` is empty:    ngrok mode → `ngrok tcp <port>`
     pub fn start(self: *Supervisor, tool_path: []const u8, server: []const u8, local_port: u16, secret: []const u8) !void {
-        if (self.child != null) return; // already running
+        if (self.pid != null) return; // already running
 
         const port_str = try std.fmt.allocPrint(self.allocator, "{d}", .{local_port});
         defer self.allocator.free(port_str);
 
-        var argv_buf: [8][]const u8 = undefined;
+        // Assemble argv as borrowed slices, then NUL-terminate each for execvp.
+        var args_buf: [8][]const u8 = undefined;
         var argc: usize = 0;
-        argv_buf[argc] = tool_path; argc += 1;
+        args_buf[argc] = tool_path; argc += 1;
         if (server.len == 0) {
-            // ngrok tcp <port>
-            argv_buf[argc] = "tcp"; argc += 1;
-            argv_buf[argc] = port_str; argc += 1;
+            args_buf[argc] = "tcp"; argc += 1;
+            args_buf[argc] = port_str; argc += 1;
         } else {
-            // bore local <port> --to <server> [--secret <secret>]
-            argv_buf[argc] = "local"; argc += 1;
-            argv_buf[argc] = port_str; argc += 1;
-            argv_buf[argc] = "--to"; argc += 1;
-            argv_buf[argc] = server; argc += 1;
+            args_buf[argc] = "local"; argc += 1;
+            args_buf[argc] = port_str; argc += 1;
+            args_buf[argc] = "--to"; argc += 1;
+            args_buf[argc] = server; argc += 1;
             if (secret.len > 0) {
-                argv_buf[argc] = "--secret"; argc += 1;
-                argv_buf[argc] = secret; argc += 1;
+                args_buf[argc] = "--secret"; argc += 1;
+                args_buf[argc] = secret; argc += 1;
             }
         }
 
-        var child = std.process.Child.init(argv_buf[0..argc], self.allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Pipe;
-        child.stdin_behavior = .Ignore;
+        // NUL-terminated argv (execvp wants a null-terminated pointer array).
+        var argv: [9][*c]u8 = undefined;
+        var made: usize = 0;
+        errdefer for (0..made) |i| self.allocator.free(std.mem.span(@as([*:0]u8, @ptrCast(argv[i]))));
+        for (0..argc) |i| {
+            const z = try self.allocator.dupeZ(u8, args_buf[i]);
+            argv[i] = @ptrCast(z.ptr);
+            made += 1;
+        }
+        argv[argc] = null;
+        defer for (0..argc) |i| self.allocator.free(std.mem.span(@as([*:0]u8, @ptrCast(argv[i]))));
 
-        child.spawn() catch return error.SpawnFailed;
-        errdefer _ = child.kill() catch {};
+        var out_fds: [2]c_int = undefined;
+        var err_fds: [2]c_int = undefined;
+        if (c.pipe(&out_fds) != 0) return error.SpawnFailed;
+        errdefer {
+            _ = c.close(out_fds[0]);
+            _ = c.close(out_fds[1]);
+        }
+        if (c.pipe(&err_fds) != 0) return error.SpawnFailed;
+        errdefer {
+            _ = c.close(err_fds[0]);
+            _ = c.close(err_fds[1]);
+        }
 
-        try setPipeNonBlocking(child.stdout orelse return error.SpawnFailed);
-        try setPipeNonBlocking(child.stderr orelse return error.SpawnFailed);
-        self.child = child;
+        const pid = c.fork();
+        if (pid < 0) return error.SpawnFailed;
+
+        if (pid == 0) {
+            // child: wire pipe write ends to stdout/stderr, then exec.
+            _ = c.dup2(out_fds[1], c.STDOUT_FILENO);
+            _ = c.dup2(err_fds[1], c.STDERR_FILENO);
+            _ = c.close(out_fds[0]);
+            _ = c.close(out_fds[1]);
+            _ = c.close(err_fds[0]);
+            _ = c.close(err_fds[1]);
+            _ = c.execvp(argv[0], &argv);
+            c._exit(127); // execvp returned → failed
+        }
+
+        // parent: keep read ends, close write ends.
+        _ = c.close(out_fds[1]);
+        _ = c.close(err_fds[1]);
+        self.pid = pid;
+        self.stdout_fd = out_fds[0];
+        self.stderr_fd = err_fds[0];
     }
 
     /// Pump bore's stdout/stderr once, looking for the
     /// "listening at bore.pub:PORT" line. Returns the parsed URL if found
-    /// this call. Non-blocking style: reads whatever is available, parses
-    /// when the line is complete. Caller should poll this until it returns
-    /// non-null.
+    /// this call. Non-blocking: reads whatever is available, parses when the
+    /// line is complete. Caller should poll this until it returns non-null.
     pub fn pump(self: *Supervisor) !?[]const u8 {
         if (self.public_url) |u| return u;
-        const child = &(self.child orelse return error.NotStarted);
-        const stdout_state = try self.pumpPipe(child.stdout);
-        const stderr_state = try self.pumpPipe(child.stderr);
+        if (self.pid == null) return error.NotStarted;
+        const stdout_state = try self.pumpPipe(self.stdout_fd);
+        const stderr_state = try self.pumpPipe(self.stderr_fd);
 
         if (parsePublicUrl(self.output_buf.items)) |url| {
             self.public_url = try self.allocator.dupe(u8, url);
             return self.public_url;
         }
         if (stdout_state == .eof and stderr_state == .eof) {
-            _ = child.wait() catch {};
+            self.reap();
             return error.ProcessExited;
         }
         return null;
@@ -110,15 +156,21 @@ pub const Supervisor = struct {
     }
 
     pub fn isRunning(self: *Supervisor) bool {
-        const c = &(self.child orelse return false);
-        _ = c;
-        return true;
+        return self.pid != null;
     }
 
     pub fn stop(self: *Supervisor) void {
-        if (self.child) |*c| {
-            _ = c.kill() catch {};
-            self.child = null;
+        if (self.pid) |pid| {
+            _ = c.kill(pid, c.SIGTERM);
+            self.reap();
+        }
+        if (self.stdout_fd) |fd| {
+            _ = c.close(fd);
+            self.stdout_fd = null;
+        }
+        if (self.stderr_fd) |fd| {
+            _ = c.close(fd);
+            self.stderr_fd = null;
         }
         if (self.public_url) |u| {
             self.allocator.free(u);
@@ -127,38 +179,43 @@ pub const Supervisor = struct {
         self.output_buf.clearRetainingCapacity();
     }
 
+    fn reap(self: *Supervisor) void {
+        if (self.pid) |pid| {
+            _ = c.waitpid(pid, null, 0);
+            self.pid = null;
+        }
+    }
+
     const PipeState = enum {
         ready,
         would_block,
         eof,
     };
 
-    fn pumpPipe(self: *Supervisor, pipe: ?std.fs.File) !PipeState {
-        const file = pipe orelse return .eof;
+    fn pumpPipe(self: *Supervisor, pipe_fd: ?c_int) !PipeState {
+        const fd = pipe_fd orelse return .eof;
         var tmp: [1024]u8 = undefined;
         var saw_data = false;
 
         while (true) {
-            const n = file.read(&tmp) catch |err| switch (err) {
-                error.WouldBlock => return if (saw_data) .ready else .would_block,
-                else => return error.ReadFailed,
+            var pfd = c.struct_pollfd{
+                .fd = fd,
+                .events = c.POLLIN,
+                .revents = 0,
             };
+            const pr = c.poll(&pfd, 1, 0);
+            if (pr <= 0) return if (saw_data) .ready else .would_block;
+            if ((pfd.revents & (c.POLLIN | c.POLLHUP)) == 0)
+                return if (saw_data) .ready else .would_block;
+
+            const n = c.read(fd, &tmp, tmp.len);
+            if (n < 0) return error.ReadFailed;
             if (n == 0) return if (saw_data) .ready else .eof;
             saw_data = true;
-            try self.output_buf.appendSlice(tmp[0..n]);
+            try self.output_buf.appendSlice(self.allocator, tmp[0..@intCast(n)]);
         }
     }
 };
-
-fn setPipeNonBlocking(file: std.fs.File) !void {
-    var flags = std.posix.fcntl(file.handle, std.posix.F.GETFL, 0) catch {
-        return error.ReadFailed;
-    };
-    flags |= 1 << @bitOffsetOf(std.posix.O, "NONBLOCK");
-    _ = std.posix.fcntl(file.handle, std.posix.F.SETFL, flags) catch {
-        return error.ReadFailed;
-    };
-}
 
 /// Scans `output` (accumulated tunnel stdout/stderr) for a public address.
 ///
@@ -202,6 +259,7 @@ pub fn parsePublicUrl(output: []const u8) ?[]const u8 {
 // --- tests ----------------------------------------------------------------
 
 const testing = std.testing;
+const runtime = @import("runtime.zig");
 
 test "parsePublicUrl finds the announcement line" {
     const sample =
@@ -259,14 +317,13 @@ test "Supervisor parses public URL from stderr" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(testing.io, .{
         .sub_path = "fake-bore.sh",
         .data =
         \\#!/bin/sh
         \\printf '2024-01-01T00:00:00Z INFO bore_cli::client: listening at bore.pub:12345\n' >&2
         \\sleep 1
         ,
-        .flags = .{ .mode = 0o755 },
     });
 
     const script_path = try std.fs.path.join(testing.allocator, &.{
@@ -276,6 +333,12 @@ test "Supervisor parses public URL from stderr" {
         "fake-bore.sh",
     });
     defer testing.allocator.free(script_path);
+
+    // CreateFileOptions no longer carries a mode; make the script executable
+    // so execvp can run it.
+    const script_z = try testing.allocator.dupeZ(u8, script_path);
+    defer testing.allocator.free(script_z);
+    _ = c.chmod(script_z.ptr, 0o755);
 
     var sup = Supervisor.init(testing.allocator);
     defer sup.deinit();
@@ -286,7 +349,7 @@ test "Supervisor parses public URL from stderr" {
             try testing.expectEqualStrings("bore.pub:12345", url);
             return;
         }
-        std.time.sleep(10 * std.time.ns_per_ms);
+        runtime.sleep(10 * runtime.ns_per_ms);
     }
 
     return error.TestUnexpectedResult;
@@ -296,14 +359,13 @@ test "Supervisor reports process exit after stderr-only failure" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{
+    try tmp.dir.writeFile(testing.io, .{
         .sub_path = "fake-bore.sh",
         .data =
         \\#!/bin/sh
         \\printf 'Error: bore failed to connect\n' >&2
         \\exit 1
         ,
-        .flags = .{ .mode = 0o755 },
     });
 
     const script_path = try std.fs.path.join(testing.allocator, &.{
@@ -313,6 +375,12 @@ test "Supervisor reports process exit after stderr-only failure" {
         "fake-bore.sh",
     });
     defer testing.allocator.free(script_path);
+
+    // CreateFileOptions no longer carries a mode; make the script executable
+    // so execvp can run it.
+    const script_z = try testing.allocator.dupeZ(u8, script_path);
+    defer testing.allocator.free(script_z);
+    _ = c.chmod(script_z.ptr, 0o755);
 
     var sup = Supervisor.init(testing.allocator);
     defer sup.deinit();
@@ -325,7 +393,7 @@ test "Supervisor reports process exit after stderr-only failure" {
             return;
         };
         try testing.expect(url == null);
-        std.time.sleep(10 * std.time.ns_per_ms);
+        runtime.sleep(10 * runtime.ns_per_ms);
     }
 
     return error.TestUnexpectedResult;

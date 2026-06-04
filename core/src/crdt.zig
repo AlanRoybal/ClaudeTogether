@@ -74,12 +74,12 @@ pub const Sequence = struct {
         return .{
             .allocator = allocator,
             .client = client,
-            .items = std.ArrayList(Item).init(allocator),
+            .items = .empty,
         };
     }
 
     pub fn deinit(self: *Sequence) void {
-        self.items.deinit();
+        self.items.deinit(self.allocator);
     }
 
     /// Number of live (non-tombstone) codepoints.
@@ -93,8 +93,8 @@ pub const Sequence = struct {
 
     /// Materialize into a UTF-8 string. Caller owns returned slice.
     pub fn toUtf8(self: *const Sequence, allocator: std.mem.Allocator) ![]u8 {
-        var out = std.ArrayList(u8).init(allocator);
-        errdefer out.deinit();
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
         var tmp: [4]u8 = undefined;
         for (self.items.items) |it| {
             if (it.deleted) continue;
@@ -102,9 +102,9 @@ pub const Sequence = struct {
                 @intCast(it.codepoint),
                 &tmp,
             );
-            try out.appendSlice(tmp[0..n]);
+            try out.appendSlice(allocator, tmp[0..n]);
         }
-        return out.toOwnedSlice();
+        return out.toOwnedSlice(allocator);
     }
 
     /// Insert `codepoint` before the visible item at `visible_pos` (0 = head,
@@ -228,9 +228,9 @@ pub const Sequence = struct {
             @as(usize, count) * encoded_snapshot_item_len;
         if (bytes.len != required) return error.Truncated;
 
-        var next = std.ArrayList(Item).init(self.allocator);
-        errdefer next.deinit();
-        try next.ensureTotalCapacity(@intCast(count));
+        var next: std.ArrayList(Item) = .empty;
+        errdefer next.deinit(self.allocator);
+        try next.ensureTotalCapacity(self.allocator, @intCast(count));
 
         var max_clock: u32 = 0;
         var i: u32 = 0;
@@ -274,7 +274,7 @@ pub const Sequence = struct {
             });
         }
 
-        self.items.deinit();
+        self.items.deinit(self.allocator);
         self.items = next;
         self.clock = max_clock;
     }
@@ -365,7 +365,7 @@ pub const Sequence = struct {
                 idx += 1;
             } else break;
         }
-        try self.items.insert(idx, .{
+        try self.items.insert(self.allocator, idx, .{
             .id = id,
             .after = after,
             .codepoint = cp,
@@ -477,7 +477,7 @@ pub fn encodeOp(op: Op, out: []u8) !usize {
 
 pub fn decodeOp(bytes: []const u8) !Op {
     if (bytes.len < 1) return error.Truncated;
-    const kind = std.meta.intToEnum(OpKind, bytes[0]) catch return error.InvalidEnum;
+    const kind = std.enums.fromInt(OpKind, bytes[0]) orelse return error.InvalidEnum;
     var pos: usize = 1;
     switch (kind) {
         .insert => {

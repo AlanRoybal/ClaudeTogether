@@ -144,6 +144,10 @@ private final class WindowThemeNSView: NSView {
     private func applyToWindow() {
         guard let window else { return }
         let color = theme.nsBackground
+        // Disable macOS native window tabbing — the app has its own tab strip
+        // (TabStripView), so the system tab bar (window title + "+") at the top
+        // is redundant.
+        window.tabbingMode = .disallowed
         window.titlebarAppearsTransparent = true
         window.backgroundColor = color
         window.appearance = NSAppearance(named: theme.isDark ? .darkAqua : .aqua)
@@ -204,12 +208,18 @@ struct TabState: Identifiable {
     /// background for this participant. Cleared on focus.
     var hasUnreadOutput: Bool = false
 
-    /// True if the underlying tool has put the PTY in raw mode — either via
-    /// the alt-screen DECSET (vim, htop) or via termios ICANON-off (claude,
-    /// codex). Peer-side tabs have no PTY and report based on alt-screen only.
+    /// True if the underlying tool is a full-screen TUI — detected via the
+    /// alt-screen DECSET (vim, htop, less). Such tabs fall back to
+    /// creator-only input.
+    ///
+    /// NOTE: deliberately alt-screen ONLY. We do not consult `ct_pty_is_raw`
+    /// (termios ICANON-off), because shell line editors (zsh ZLE, bash
+    /// readline) hold the tty in raw mode *at the prompt* — so a termios check
+    /// wrongly classifies an ordinary shell prompt as a raw TUI and disables
+    /// collaborative shared input there. The trade-off is that raw line-REPLs
+    /// (claude, codex) keep shared input active rather than going creator-only.
     var isRawMode: Bool {
-        if grid.isUsingAlternateScreen { return true }
-        return pty?.isRaw ?? false
+        grid.isUsingAlternateScreen
     }
 }
 
@@ -298,6 +308,11 @@ final class TerminalModel: ObservableObject {
         didSet {
             guard terminalTheme != oldValue else { return }
             UserDefaults.standard.set(terminalTheme.name, forKey: TerminalModel.themeDefaultsKey)
+            // Participant cursor colors are derived from the active theme;
+            // re-resolve them and refresh the overlays so carets + legend
+            // follow the new theme.
+            applyThemeParticipantColors()
+            syncAllGridSharedInputOverlays()
         }
     }
 
@@ -483,6 +498,12 @@ final class TerminalModel: ObservableObject {
         }.store(in: &cancellables)
         sessionManager.$participants.sink { [weak self] newParticipants in
             guard let self = self else { return }
+            // Avoid re-entering when applyThemeParticipantColors() mutates the
+            // participants' colors below.
+            if self.refreshingParticipantColors { return }
+            self.refreshingParticipantColors = true
+            self.applyThemeParticipantColors()
+            self.refreshingParticipantColors = false
             self.syncSharedInputParticipants(
                 broadcast: self.sessionManager.role == .host)
             self.syncAllGridSharedInputOverlays()
@@ -3636,9 +3657,60 @@ final class TerminalModel: ObservableObject {
 
     private func color(for identity: UserIdentity) -> UInt32 {
         sessionManager.participants.first(where: { $0.identity == identity })?.color
-            ?? (identity == sessionManager.localIdentity
-                ? sessionManager.localColor
-                : 0x5AC8FA)
+            ?? themeCursorColor(for: identity,
+                                among: sessionManager.participants)
+    }
+
+    /// Vivid, theme-derived palette for participant cursors. Each viewer maps
+    /// participants to ITS OWN active theme's 16-color ANSI palette, so cursor
+    /// colors always harmonize with the theme that viewer is looking at. We
+    /// pick the saturated chromatic hues (bright first) and skip
+    /// black/white/grays so carets stay legible on the theme background.
+    private var themeCursorPalette: [UInt32] {
+        let p = terminalTheme.palette
+        guard p.count >= 16 else { return SessionManager.participantPalette }
+        // zigPalette16 order: 9..14 = bright red/green/yellow/blue/magenta/cyan,
+        // 1..6 = their normal variants.
+        return [p[9], p[10], p[11], p[12], p[13], p[14],
+                p[1], p[2], p[3], p[4], p[5], p[6]]
+    }
+
+    /// Deterministic, collision-avoiding slot for `identity` over the current
+    /// participant set. Stable for a given set, so each participant keeps a
+    /// distinct color; computed purely from the shared roster identities.
+    private func themeCursorColor(for identity: UserIdentity,
+                                  among participants: [SessionManager.Participant]) -> UInt32 {
+        let palette = themeCursorPalette
+        let n = palette.count
+        guard n > 0 else { return 0x5AC8FA }
+        let ordered = participants.map(\.identity).sorted {
+            $0.bytes.lexicographicallyPrecedes($1.bytes)
+        }
+        var taken = Set<Int>()
+        var slotFor: Int? = nil
+        for id in ordered {
+            let pref = Int(SessionManager.colorHash(for: id) % UInt32(n))
+            var slot = pref, off = 0
+            while taken.contains(slot) && off < n { off += 1; slot = (pref + off) % n }
+            taken.insert(slot)
+            if id == identity { slotFor = slot }
+        }
+        let slot = slotFor ?? Int(SessionManager.colorHash(for: identity) % UInt32(n))
+        return palette[slot % n]
+    }
+
+    private var refreshingParticipantColors = false
+
+    /// Rewrite every participant's stored color from the active theme. Keeps
+    /// the cursor overlay, the peer terminal cursors, and the color legend all
+    /// consistent. Idempotent (only assigns on change) and guarded so the
+    /// resulting `$participants` mutation doesn't recurse.
+    func applyThemeParticipantColors() {
+        let snapshot = sessionManager.participants
+        for participant in snapshot {
+            let c = themeCursorColor(for: participant.identity, among: snapshot)
+            sessionManager.setParticipantColor(participant.identity, to: c)
+        }
     }
 }
 

@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 @main
 struct CoTTYApp: App {
@@ -6,6 +7,14 @@ struct CoTTYApp: App {
     /// `.commands { ... }` on the scene) can drive the same TerminalModel
     /// instance that ContentView renders.
     @StateObject private var model = TerminalModel()
+
+    init() {
+        // Kill macOS native window tabbing entirely (the system "CoTTY + tab
+        // bar" at the top). The app has its own tab strip; the native one is
+        // redundant. Class-level toggle, read when windows are created, so it
+        // must be set before the first window appears.
+        NSWindow.allowsAutomaticWindowTabbing = false
+    }
 
     var body: some Scene {
         WindowGroup("CoTTY") {

@@ -3,17 +3,18 @@ const pty = @import("pty.zig");
 const session_mod = @import("session.zig");
 const bore_mod = @import("bore.zig");
 const crdt = @import("crdt.zig");
+const runtime = @import("runtime.zig");
 
-// Process-wide allocator for C-ABI objects. Using the general-purpose
-// allocator so leaks show up in Debug builds.
-var gpa_instance: std.heap.GeneralPurposeAllocator(.{}) = .{};
+// Process-wide allocator for C-ABI objects. Using the debug allocator
+// so leaks show up in Debug builds.
+var gpa_instance: std.heap.DebugAllocator(.{}) = .init;
 fn gpa() std.mem.Allocator {
     return gpa_instance.allocator();
 }
 
 // Last-error slot so callers can read a human-readable reason after a
 // NULL / -1 return from the C ABI. Thread-safe via a single mutex.
-var last_error_mutex: std.Thread.Mutex = .{};
+var last_error_mutex: runtime.Mutex = .{};
 var last_error_buf: [256]u8 = undefined;
 var last_error_len: usize = 0;
 
