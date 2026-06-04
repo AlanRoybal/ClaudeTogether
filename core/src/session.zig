@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const transport = @import("transport.zig");
+const runtime = @import("runtime.zig");
 
 const InboundFrame = struct {
     /// Monotonic peer id assigned when the connection was accepted/opened.
@@ -41,7 +42,7 @@ const Peer = struct {
     dead: bool = false,
     /// Protects concurrent writes from the session thread and any
     /// broadcast() callers.
-    write_mutex: std.Thread.Mutex = .{},
+    write_mutex: runtime.Mutex = .{},
     thread: ?std.Thread = null,
 };
 
@@ -53,11 +54,10 @@ pub const Session = struct {
     accept_thread: ?std.Thread = null,
     bound_port: u16 = 0,
 
-    mutex: std.Thread.Mutex = .{},
-    queue_cond: std.Thread.Condition = .{},
-    peers: std.ArrayList(*Peer),
-    inbound: std.ArrayList(InboundFrame),
-    events: std.ArrayList(Event),
+    mutex: runtime.Mutex = .{},
+    peers: std.ArrayList(*Peer) = .empty,
+    inbound: std.ArrayList(InboundFrame) = .empty,
+    events: std.ArrayList(Event) = .empty,
     next_peer_id: u32 = 1,
     shutting_down: bool = false,
 
@@ -67,9 +67,6 @@ pub const Session = struct {
         self.* = .{
             .allocator = allocator,
             .role = .host,
-            .peers = std.ArrayList(*Peer).init(allocator),
-            .inbound = std.ArrayList(InboundFrame).init(allocator),
-            .events = std.ArrayList(Event).init(allocator),
         };
 
         self.listener = try transport.Listener.listen(port);
@@ -89,9 +86,6 @@ pub const Session = struct {
         self.* = .{
             .allocator = allocator,
             .role = .peer,
-            .peers = std.ArrayList(*Peer).init(allocator),
-            .inbound = std.ArrayList(InboundFrame).init(allocator),
-            .events = std.ArrayList(Event).init(allocator),
         };
 
         const conn = try transport.connect(allocator, host, port);
@@ -120,11 +114,11 @@ pub const Session = struct {
 
         // Drain leftover inbound buffers.
         for (self.inbound.items) |f| self.allocator.free(f.payload);
-        self.inbound.deinit();
-        self.events.deinit();
+        self.inbound.deinit(self.allocator);
+        self.events.deinit(self.allocator);
 
         for (self.peers.items) |p| self.allocator.destroy(p);
-        self.peers.deinit();
+        self.peers.deinit(self.allocator);
 
         self.allocator.destroy(self);
     }
@@ -226,9 +220,9 @@ pub const Session = struct {
             .conn = conn,
         };
         self.next_peer_id += 1;
-        try self.peers.append(p);
+        try self.peers.append(self.allocator, p);
         const peer_id = p.id;
-        self.events.append(.{
+        self.events.append(self.allocator, .{
             .kind = .peer_connected,
             .peer_id = peer_id,
         }) catch {};
@@ -247,10 +241,10 @@ pub const Session = struct {
             // accept() is blocking; the listener.close() on deinit unblocks
             // it with an error which we treat as shutdown.
             if (self.listener == null) return;
-            const conn = self.listener.?.server.accept() catch return;
-            const wrapped = transport.Connection{ .stream = conn.stream };
-            self.addPeer(wrapped) catch {
-                wrapped.stream.close();
+            const conn = self.listener.?.accept() catch return;
+            self.addPeer(conn) catch {
+                var dead = conn;
+                dead.close();
                 continue;
             };
         }
@@ -296,7 +290,7 @@ pub const Session = struct {
         _ = self;
         var pos: usize = 0;
         while (pos < buf.len) {
-            const n = p.conn.stream.read(buf[pos..]) catch
+            const n = p.conn.read(buf[pos..]) catch
                 return error.ReadFailed;
             if (n == 0) {
                 if (pos == 0 and allow_eof) return error.PeerClosed;
@@ -313,11 +307,10 @@ pub const Session = struct {
             self.allocator.free(buf);
             return;
         }
-        self.inbound.append(.{ .peer_id = peer_id, .payload = buf }) catch {
+        self.inbound.append(self.allocator, .{ .peer_id = peer_id, .payload = buf }) catch {
             self.allocator.free(buf);
             return;
         };
-        self.queue_cond.signal();
     }
 
     fn markDead(self: *Session, p: *Peer, err: anyerror) void {
@@ -328,7 +321,7 @@ pub const Session = struct {
         if (p.dead) return;
         p.dead = true;
         if (!self.shutting_down) {
-            self.events.append(.{
+            self.events.append(self.allocator, .{
                 .kind = .peer_disconnected,
                 .peer_id = p.id,
             }) catch {};
@@ -351,7 +344,7 @@ test "host + peer exchange frames" {
     // Wait for host to register the new peer.
     var waited: usize = 0;
     while (host.peerCount() == 0 and waited < 200) : (waited += 1) {
-        std.time.sleep(5 * std.time.ns_per_ms);
+        runtime.sleep(5 * runtime.ns_per_ms);
     }
     try testing.expect(host.peerCount() >= 1);
 
@@ -365,7 +358,7 @@ test "host + peer exchange frames" {
             try testing.expectEqualStrings("hello from host", f.payload);
             break;
         }
-        std.time.sleep(5 * std.time.ns_per_ms);
+        runtime.sleep(5 * runtime.ns_per_ms);
     } else return error.TestUnexpectedResult;
 
     // peer -> host
@@ -377,7 +370,7 @@ test "host + peer exchange frames" {
             try testing.expectEqualStrings("hello from peer", f.payload);
             break;
         }
-        std.time.sleep(5 * std.time.ns_per_ms);
+        runtime.sleep(5 * runtime.ns_per_ms);
     } else return error.TestUnexpectedResult;
 }
 
@@ -393,7 +386,7 @@ test "host can send to one peer without broadcasting to another" {
 
     var waited: usize = 0;
     while (host.peerCount() < 2 and waited < 400) : (waited += 1) {
-        std.time.sleep(5 * std.time.ns_per_ms);
+        runtime.sleep(5 * runtime.ns_per_ms);
     }
     try testing.expectEqual(@as(usize, 2), host.peerCount());
 
@@ -411,7 +404,7 @@ test "host can send to one peer without broadcasting to another" {
             }
             continue;
         }
-        std.time.sleep(5 * std.time.ns_per_ms);
+        runtime.sleep(5 * runtime.ns_per_ms);
     }
 
     const target_id = first_id orelse return error.TestUnexpectedResult;
@@ -435,7 +428,7 @@ test "host can send to one peer without broadcasting to another" {
             }
         }
         if (saw_private_count > 0) break;
-        std.time.sleep(5 * std.time.ns_per_ms);
+        runtime.sleep(5 * runtime.ns_per_ms);
     }
 
     try testing.expectEqual(@as(usize, 1), saw_private_count);

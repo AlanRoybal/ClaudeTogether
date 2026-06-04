@@ -48,7 +48,7 @@ pub const Term = struct {
 };
 
 // Global allocator for the Term lifecycle. Swift owns the handle pointer.
-var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
+var gpa_state: std.heap.DebugAllocator(.{}) = .init;
 
 fn allocator() std.mem.Allocator {
     return gpa_state.allocator();

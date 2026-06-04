@@ -222,6 +222,9 @@ pub const Frame = union(Tag) {
     tab_close: TabClose,
     tab_focus: TabFocus,
     tab_pty_output: TabPtyOutput,
+    /// Host->peer pre-disconnect notice. Encoded/decoded on the Swift side
+    /// (FrameCodec); zig treats it as a payloadless control tag.
+    kick: void,
 };
 
 pub const DecodeError = error{
@@ -293,7 +296,7 @@ const Reader = struct {
 pub fn decode(bytes: []const u8) DecodeError!Frame {
     var r = Reader{ .buf = bytes };
     const tag_byte = try r.readU8();
-    const tag = std.meta.intToEnum(Tag, tag_byte) catch return error.UnknownTag;
+    const tag = std.enums.fromInt(Tag, tag_byte) orelse return error.UnknownTag;
 
     return switch (tag) {
         .pty_output => blk: {
@@ -329,7 +332,7 @@ pub fn decode(bytes: []const u8) DecodeError!Frame {
             var id: UserId = undefined;
             @memcpy(&id, id_bytes);
             const role_b = try r.readU8();
-            const role = std.meta.intToEnum(Role, role_b) catch
+            const role = std.enums.fromInt(Role, role_b) orelse
                 return error.InvalidEnum;
             const color = try r.readU32();
             const name_len = try r.readU16();
@@ -343,14 +346,14 @@ pub fn decode(bytes: []const u8) DecodeError!Frame {
         },
         .mode_change => blk: {
             const m_b = try r.readU8();
-            const mode = std.meta.intToEnum(Mode, m_b) catch
+            const mode = std.enums.fromInt(Mode, m_b) orelse
                 return error.InvalidEnum;
             break :blk Frame{ .mode_change = .{ .mode = mode } };
         },
         .heartbeat => Frame{ .heartbeat = {} },
         .access_mode => blk: {
             const a_b = try r.readU8();
-            const access = std.meta.intToEnum(Access, a_b) catch
+            const access = std.enums.fromInt(Access, a_b) orelse
                 return error.InvalidEnum;
             break :blk Frame{ .access_mode = .{ .mode = access } };
         },
@@ -444,6 +447,7 @@ pub fn decode(bytes: []const u8) DecodeError!Frame {
             break :blk Frame{ .fs_snapshot = .{ .payload = payload } };
         },
         .roster => error.NotImplemented,
+        .kick => Frame{ .kick = {} },
     };
 }
 
@@ -571,6 +575,7 @@ pub fn encode(frame: Frame, out: []u8) EncodeError!usize {
         .fs_delta => |p| try w.writeBytes(p.payload),
         .fs_snapshot => |p| try w.writeBytes(p.payload),
         .roster => return error.BufferTooSmall, // NYI
+        .kick => {},
     }
     return w.pos;
 }
@@ -601,6 +606,7 @@ pub fn encodedLen(frame: Frame) usize {
         .fs_delta => |p| 1 + p.payload.len,
         .fs_snapshot => |p| 1 + p.payload.len,
         .roster => 1,
+        .kick => 1,
     };
 }
 
