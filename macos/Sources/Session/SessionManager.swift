@@ -789,6 +789,15 @@ final class SessionManager: ObservableObject {
         }
     }
 
+    /// Override a participant's rendered cursor color. Used by the UI layer to
+    /// apply theme-derived (per-viewer) colors; no-op if unchanged.
+    func setParticipantColor(_ identity: UserIdentity, to color: UInt32) {
+        if let i = participants.firstIndex(where: { $0.identity == identity }),
+           participants[i].color != color {
+            participants[i].color = color
+        }
+    }
+
     private func resolvedParticipantColor(for identity: UserIdentity,
                                           preferredColor: UInt32) -> UInt32
     {
@@ -912,7 +921,7 @@ final class SessionManager: ObservableObject {
         return nil
     }
 
-    nonisolated private static func colorHash(for identity: UserIdentity) -> UInt32 {
+    nonisolated static func colorHash(for identity: UserIdentity) -> UInt32 {
         var hash: UInt32 = 2166136261
         for byte in identity.bytes {
             hash ^= UInt32(byte)
