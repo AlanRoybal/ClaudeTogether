@@ -144,6 +144,10 @@ private final class WindowThemeNSView: NSView {
     private func applyToWindow() {
         guard let window else { return }
         let color = theme.nsBackground
+        // Disable macOS native window tabbing — the app has its own tab strip
+        // (TabStripView), so the system tab bar (window title + "+") at the top
+        // is redundant.
+        window.tabbingMode = .disallowed
         window.titlebarAppearsTransparent = true
         window.backgroundColor = color
         window.appearance = NSAppearance(named: theme.isDark ? .darkAqua : .aqua)
