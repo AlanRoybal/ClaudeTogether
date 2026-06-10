@@ -446,6 +446,11 @@ private func sessionMenuItems(model: TerminalModel) -> some View {
             }
         }
 
+    case .reconnecting(let attempt):
+        Button("Reconnecting… (attempt \(attempt) of \(SessionManager.maxReconnectAttempts))") {}
+            .disabled(true)
+        Button("Leave Session") { model.endSession() }
+
     case .disconnected:
         Button("Host Disconnected") {}.disabled(true)
         Button("Dismiss") { model.endSession() }

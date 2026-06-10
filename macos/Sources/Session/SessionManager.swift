@@ -22,6 +22,7 @@ final class SessionManager: ObservableObject {
         case idle
         case starting
         case running
+        case reconnecting(attempt: Int)  // peer-only: connection dropped, auto-retrying
         case disconnected  // peer-only: host went away
         case failed(String)
     }
@@ -109,8 +110,30 @@ final class SessionManager: ObservableObject {
 
     private static let keepAliveInterval: TimeInterval = 15
 
+    /// Peer-only auto-reconnect (#61): the host:port of the last successful
+    /// join, kept so a dropped connection can be retried without the user
+    /// re-entering the share URL. Cleared by `stop()`.
+    private var lastJoinHost: String?
+    private var lastJoinPort: UInt16 = 0
+    private var reconnectTimer: Timer?
+    private var reconnectAttempt = 0
+    /// Bumped by `stop()` so an in-flight background connect from a
+    /// cancelled reconnect can't resurrect a session the user left.
+    private var reconnectGeneration = 0
+    static let maxReconnectAttempts = 8
+
     /// Decoded inbound frame + the transport peer id that sent it.
     var onFrame: ((Frame, UInt32) -> Void)?
+
+    /// Peer-only: fired when the host connection drops and auto-reconnect
+    /// starts. UI shows a "reconnecting" notice.
+    var onReconnectBegan: (() -> Void)?
+
+    /// Peer-only: fired after the transport is re-established, before Hello
+    /// is re-sent. The UI layer must reset join-time state here so the
+    /// host's re-join snapshot lands in fresh grids instead of appending to
+    /// stale ones.
+    var onReconnected: (() -> Void)?
 
     init(identity: UserIdentity = .random(),
          name: String? = nil,
@@ -125,6 +148,7 @@ final class SessionManager: ObservableObject {
         pollTimer?.cancel()
         borePumpTimer?.invalidate()
         keepAliveTimer?.invalidate()
+        reconnectTimer?.invalidate()
         if let h = handle { ct_session_free(h) }
         if let b = boreHandle { ct_bore_free(b) }
     }
@@ -169,6 +193,8 @@ final class SessionManager: ObservableObject {
             return
         }
         handle = h
+        lastJoinHost = host
+        lastJoinPort = port
         participants = [Participant(
             identity: localIdentity, role: .peer,
             name: localName, color: localColor)]
@@ -182,6 +208,11 @@ final class SessionManager: ObservableObject {
         pollTimer?.cancel(); pollTimer = nil
         borePumpTimer?.invalidate(); borePumpTimer = nil
         keepAliveTimer?.invalidate(); keepAliveTimer = nil
+        reconnectTimer?.invalidate(); reconnectTimer = nil
+        reconnectAttempt = 0
+        reconnectGeneration += 1
+        lastJoinHost = nil
+        lastJoinPort = 0
         if let h = handle {
             ct_session_free(h)
             handle = nil
@@ -716,15 +747,113 @@ final class SessionManager: ObservableObject {
     private func handleDisconnected(_ peerID: UInt32) {
         if role == .host {
             if let gone = transportToIdentity.removeValue(forKey: peerID) {
-                participants.removeAll { $0.identity == gone }
+                // A reconnecting peer may already be back on a new transport
+                // connection before the old socket's death is noticed — only
+                // drop them from the roster when this was their last one.
+                if !transportToIdentity.values.contains(gone) {
+                    participants.removeAll { $0.identity == gone }
+                }
                 broadcastRoster()
             }
         } else {
-            // Peer-side: the host dropped. Tear down.
-            // (`ct_session_peer_count` would be 0 here too.)
+            // Peer-side: the host connection dropped. Auto-retry the join
+            // with backoff (#61); tear down only if we never had a target.
+            if lastJoinHost != nil {
+                beginReconnect()
+            } else {
+                stop()
+                state = .disconnected
+            }
+        }
+    }
+
+    // MARK: reconnect (peer only)
+
+    /// Backoff before reconnect `attempt` (1-based): 1s, 2s, 4s, …, 30s cap.
+    private static func reconnectDelay(attempt: Int) -> TimeInterval {
+        min(30, pow(2, Double(attempt - 1)))
+    }
+
+    /// Tear down the dead transport but keep identity, session key, role,
+    /// and roster so the session can resume in place.
+    private func beginReconnect() {
+        pollTimer?.cancel(); pollTimer = nil
+        keepAliveTimer?.invalidate(); keepAliveTimer = nil
+        if let h = handle {
+            ct_session_free(h)
+            handle = nil
+        }
+        reconnectAttempt = 0
+        onReconnectBegan?()
+        scheduleReconnect()
+    }
+
+    private func scheduleReconnect() {
+        reconnectAttempt += 1
+        guard reconnectAttempt <= Self.maxReconnectAttempts else {
+            NSLog("[ct] reconnect gave up after %d attempts", Self.maxReconnectAttempts)
             stop()
             state = .disconnected
+            return
         }
+        state = .reconnecting(attempt: reconnectAttempt)
+        let delay = Self.reconnectDelay(attempt: reconnectAttempt)
+        NSLog("[ct] reconnect attempt %d/%d in %.0fs",
+              reconnectAttempt, Self.maxReconnectAttempts, delay)
+        reconnectTimer?.invalidate()
+        reconnectTimer = Timer.scheduledTimer(
+            withTimeInterval: delay,
+            repeats: false
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.attemptReconnect() }
+        }
+    }
+
+    private func attemptReconnect() {
+        guard case .reconnecting = state, let host = lastJoinHost else { return }
+        let port = lastJoinPort
+        let generation = reconnectGeneration
+        // Connect off the main actor — a vanished host can leave the TCP
+        // handshake hanging far longer than any acceptable UI stall. The
+        // handle crosses back as a bit pattern because OpaquePointer is
+        // not Sendable.
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let bits = host.withCString { cstr in
+                Int(bitPattern: ct_session_new_peer(cstr, port))
+            }
+            guard let self else {
+                // Manager died while connecting; don't leak the socket.
+                if let h = OpaquePointer(bitPattern: bits) { ct_session_free(h) }
+                return
+            }
+            await self.finishReconnectAttempt(handleBits: bits, generation: generation)
+        }
+    }
+
+    private func finishReconnectAttempt(handleBits: Int, generation: Int) {
+        let newHandle = OpaquePointer(bitPattern: handleBits)
+        // The user stopped or left the session while the connect was in
+        // flight — discard the orphaned connection.
+        guard generation == reconnectGeneration, case .reconnecting = state else {
+            if let h = newHandle { ct_session_free(h) }
+            return
+        }
+        guard let h = newHandle else {
+            NSLog("[ct] reconnect attempt %d failed: %@",
+                  reconnectAttempt, Self.readLastError() ?? "unknown error")
+            scheduleReconnect()
+            return
+        }
+        NSLog("[ct] reconnected after %d attempt(s)", reconnectAttempt)
+        handle = h
+        reconnectAttempt = 0
+        state = .running
+        startPolling()
+        startKeepAlive()
+        // Let the UI reset join-time state before Hello triggers the host's
+        // re-join snapshot.
+        onReconnected?()
+        sendHello()
     }
 
     private func handleFrame(_ frame: Frame, from peerID: UInt32) {
