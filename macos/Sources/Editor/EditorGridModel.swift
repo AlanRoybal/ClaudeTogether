@@ -20,7 +20,10 @@ struct UserSelection: Equatable {
 /// `EditorController`.
 @MainActor
 final class EditorGridModel: ObservableObject {
-    let controller: EditorController
+    // unowned: the controller owns this model (controller → gridModel), so a
+    // strong back-reference would be a retain cycle leaking the entire editor
+    // stack (CRDT replica, undo stacks, word index) on every document close.
+    unowned let controller: EditorController
 
     // Colors used for blank cells and default text. Updated via setTheme().
     private var themeFg: UInt32 = 0xE8ECF3

@@ -36,7 +36,10 @@ final class GridModel: ObservableObject {
     let term: TermCore
     let localCursorID = UUID()
     private var overlay: InputOverlay?
-    private var overlaySnapshot: [ct_cell] = []
+    // Manually-managed storage so `snapshot()` can hand out a pointer that
+    // stays valid until the next rebuild (escaping a pointer out of an
+    // Array's withUnsafeBufferPointer is undefined behavior).
+    private var overlaySnapshot = UnsafeMutableBufferPointer<ct_cell>(start: nil, count: 0)
     private var peerTerminalCursors: [UUID: (col: UInt16, row: UInt16, color: UInt32)] = [:]
 
     /// Ordered list of cursors currently visible in the viewport.
@@ -60,6 +63,10 @@ final class GridModel: ObservableObject {
         self.cursors[0] = UserCursor(
             id: localCursorID, col: 0, row: 0,
             color: 0xFFFFFF, isLocal: true)
+    }
+
+    deinit {
+        if overlaySnapshot.baseAddress != nil { overlaySnapshot.deallocate() }
     }
 
     var cols: UInt16 { term.cols }
@@ -126,7 +133,9 @@ final class GridModel: ObservableObject {
         guard scrollOffset > 0 || overlay != nil else { return base }
 
         if overlaySnapshot.count != base.count {
-            overlaySnapshot = [ct_cell](repeating: ct_cell(), count: base.count)
+            if overlaySnapshot.baseAddress != nil { overlaySnapshot.deallocate() }
+            overlaySnapshot = .allocate(capacity: base.count)
+            overlaySnapshot.initialize(repeating: ct_cell())
         }
         if scrollOffset > 0 {
             copyScrolledSnapshot(primary: base, offset: scrollOffset)
@@ -137,7 +146,7 @@ final class GridModel: ObservableObject {
         }
 
         guard let overlay else {
-            return overlaySnapshot.withUnsafeBufferPointer { $0 }
+            return UnsafeBufferPointer(overlaySnapshot)
         }
 
         let maxCursorOffset = overlay.cursors.map(\.offset).max() ?? 0
@@ -155,7 +164,7 @@ final class GridModel: ObservableObject {
         }
 
         guard let styleIndex else {
-            return overlaySnapshot.withUnsafeBufferPointer { $0 }
+            return UnsafeBufferPointer(overlaySnapshot)
         }
 
         let styleCell = overlaySnapshot[styleIndex]
@@ -185,7 +194,7 @@ final class GridModel: ObservableObject {
             overlaySnapshot[idx] = cell
         }
 
-        return overlaySnapshot.withUnsafeBufferPointer { $0 }
+        return UnsafeBufferPointer(overlaySnapshot)
     }
 
     func setInputOverlay(anchorCol: UInt16,
@@ -382,10 +391,8 @@ final class GridModel: ObservableObject {
                 rowCount: scrollbackRows,
                 into: &scrollbackCells)
             let cellsToCopy = min(copied * cols, overlaySnapshot.count)
-            if cellsToCopy > 0 {
-                overlaySnapshot.replaceSubrange(
-                    0..<cellsToCopy,
-                    with: scrollbackCells.prefix(cellsToCopy))
+            for i in 0..<cellsToCopy {
+                overlaySnapshot[i] = scrollbackCells[i]
             }
             visibleRow = copied
         }
@@ -396,9 +403,9 @@ final class GridModel: ObservableObject {
             let srcStart = primaryRow * cols
             guard dstStart < overlaySnapshot.count else { break }
             if srcStart + cols <= primary.count {
-                overlaySnapshot.replaceSubrange(
-                    dstStart..<(dstStart + cols),
-                    with: primary[srcStart..<(srcStart + cols)])
+                for i in 0..<cols {
+                    overlaySnapshot[dstStart + i] = primary[srcStart + i]
+                }
             }
             visibleRow += 1
             primaryRow += 1

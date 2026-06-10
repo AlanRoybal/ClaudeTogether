@@ -121,6 +121,7 @@ struct SplitPaneView: View {
                 fontSize: model.fontSize,
                 mouseModeEnabled: model.mouseMode,
                 theme: model.terminalTheme,
+                fontName: model.fontName,
                 ligaturesEnabled: model.ligaturesEnabled,
                 searchMatches: [],
                 currentMatchIndex: nil)
