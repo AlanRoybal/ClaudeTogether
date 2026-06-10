@@ -13,9 +13,19 @@ pub const Decoder = struct {
     codepoint: u32 = 0,
     lower_bound: u8 = 0x80,
     upper_bound: u8 = 0xBF,
+    /// Second result of the last `push`: when a byte terminates an invalid
+    /// sequence, WHATWG reconsumes it as a new lead, which can produce a
+    /// codepoint of its own. Collect it with `takePending` after every push.
+    pending: ?u32 = null,
 
     pub fn init() Decoder {
         return .{};
+    }
+
+    pub fn takePending(self: *Decoder) ?u32 {
+        const p = self.pending;
+        self.pending = null;
+        return p;
     }
 
     fn reset(self: *Decoder) void {
@@ -53,6 +63,11 @@ pub const Decoder = struct {
         }
         if (b < self.lower_bound or b > self.upper_bound) {
             self.reset();
+            // WHATWG: reconsume the offending byte as the start of a new
+            // sequence — otherwise a real character that follows a truncated
+            // sequence is silently swallowed (e.g. 0xC3 'A' must decode to
+            // U+FFFD 'A', not just U+FFFD).
+            self.pending = self.push(b);
             return REPLACEMENT;
         }
         self.lower_bound = 0x80;
@@ -139,6 +154,14 @@ test "overlong E0 80 80 rejected" {
     var d = Decoder.init();
     try std.testing.expectEqual(@as(?u32, null), d.push(0xE0));
     try std.testing.expectEqual(@as(?u32, REPLACEMENT), d.push(0x80));
+}
+
+test "invalid continuation reconsumes the byte" {
+    var d = Decoder.init();
+    try std.testing.expectEqual(@as(?u32, null), d.push(0xC3));
+    try std.testing.expectEqual(@as(?u32, REPLACEMENT), d.push('A'));
+    try std.testing.expectEqual(@as(?u32, 'A'), d.takePending());
+    try std.testing.expectEqual(@as(?u32, null), d.takePending());
 }
 
 test "width" {

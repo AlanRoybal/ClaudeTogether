@@ -32,6 +32,7 @@ pub const Term = struct {
             switch (ev) {
                 .print => |pb| {
                     if (self.decoder.push(pb)) |cp| self.grid.putCodepoint(cp);
+                    if (self.decoder.takePending()) |cp| self.grid.putCodepoint(cp);
                 },
                 else => self.grid.apply(ev),
             }
