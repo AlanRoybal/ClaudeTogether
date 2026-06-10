@@ -247,7 +247,7 @@ final class SessionManager: ObservableObject {
     /// Broadcast to every transport peer (no filtering).
     func broadcast(_ frame: Frame) {
         guard let h = handle else { return }
-        let data = encryptedWireBytes(FrameCodec.encode(frame))
+        guard let data = encryptedWireBytes(FrameCodec.encode(frame)) else { return }
         let rc = data.withUnsafeBytes { raw -> Int32 in
             guard let base = raw.baseAddress else { return -1 }
             return ct_session_broadcast(
@@ -262,7 +262,7 @@ final class SessionManager: ObservableObject {
 
     func send(_ frame: Frame, toTransportPeerID peerID: UInt32) {
         guard let h = handle else { return }
-        let data = encryptedWireBytes(FrameCodec.encode(frame))
+        guard let data = encryptedWireBytes(FrameCodec.encode(frame)) else { return }
         let rc = data.withUnsafeBytes { raw -> Int32 in
             guard let base = raw.baseAddress else { return -1 }
             return ct_session_send_to(
@@ -277,13 +277,15 @@ final class SessionManager: ObservableObject {
         }
     }
 
-    private func encryptedWireBytes(_ plain: Data) -> Data {
+    /// Returns nil when encryption fails — the frame must be DROPPED, never
+    /// silently downgraded to plaintext on an encrypted session.
+    private func encryptedWireBytes(_ plain: Data) -> Data? {
         guard let key = sessionKey else { return plain }
         do {
             return try key.encrypt(plain)
         } catch {
-            NSLog("[ct] encrypt failed: %@", "\(error)")
-            return plain
+            NSLog("[ct] encrypt failed, frame dropped: %@", "\(error)")
+            return nil
         }
     }
 
