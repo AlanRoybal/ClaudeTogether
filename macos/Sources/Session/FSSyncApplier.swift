@@ -33,6 +33,21 @@ enum SessionPathResolver {
         guard resolved.path == root.path || resolved.path.hasPrefix(rootPrefix) else {
             return nil
         }
+
+        // The checks above are purely lexical. If any component already on
+        // disk is a symlink (root/cfg -> /etc), a write to "cfg/evil" would
+        // physically land outside the root — including through a *dangling*
+        // link, which data.write would happily create the target for. FS sync
+        // never legitimately writes through links (the host-side watcher
+        // skips symlinks), so reject the path outright.
+        var probe = root
+        for component in parts {
+            probe = probe.appendingPathComponent(String(component), isDirectory: false)
+            if let values = try? probe.resourceValues(forKeys: [.isSymbolicLinkKey]),
+               values.isSymbolicLink == true {
+                return nil
+            }
+        }
         return resolved
     }
 
