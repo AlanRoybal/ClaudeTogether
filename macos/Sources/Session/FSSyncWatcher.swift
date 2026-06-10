@@ -90,6 +90,13 @@ final class FSSyncWatcher {
                 continue
             }
 
+            if values.isDirectory == true,
+               Self.defaultExcludedDirectoryNames.contains(standardized.lastPathComponent)
+            {
+                enumerator.skipDescendants()
+                continue
+            }
+
             if values.isDirectory == true {
                 entries[relativePath] = FSSyncLocalEntry(
                     kind: .directory,
