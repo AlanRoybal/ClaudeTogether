@@ -12,6 +12,20 @@ private struct FSSyncLocalEntry: Equatable {
 }
 
 final class FSSyncWatcher {
+    /// Directory names never synced to peers, at any depth (#88). The
+    /// `.cottyignore` rules planned in #72 layer on top of these defaults.
+    static let defaultExcludedDirectoryNames: Set<String> = [
+        "node_modules",
+        ".git",
+        ".build",
+        ".swiftpm",
+        "dist",
+        "target",
+        "DerivedData",
+        "__pycache__",
+        ".venv",
+    ]
+
     private let rootURL: URL
     private var lastEntries: [String: FSSyncLocalEntry] = [:]
     private let fileManager = FileManager.default
