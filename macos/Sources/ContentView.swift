@@ -543,6 +543,14 @@ final class TerminalModel: ObservableObject {
             self?.handleInbound(frame, from: peerID)
         }
 
+        // Peer-side auto-reconnect (#61).
+        sessionManager.onReconnectBegan = { [weak self] in
+            self?.showSessionNotification("Connection lost — reconnecting…")
+        }
+        sessionManager.onReconnected = { [weak self] in
+            self?.handlePeerReconnected()
+        }
+
         // DIAG: auto-share on launch when CT_AUTOSHARE=1 so we can test
         // bore/URL without requiring a UI click.
         NotificationCenter.default.addObserver(
@@ -1779,6 +1787,29 @@ final class TerminalModel: ObservableObject {
         DispatchQueue.main.async { [weak self] in
             self?.sessionManager.joinPeer(host: host, port: port)
         }
+    }
+
+    /// Restores peer-side UI state after an automatic reconnect (#61).
+    /// Mirrors the join-time reset in `promptJoin`/`joinFromURL`: the host
+    /// answers our re-sent Hello with TabOpen + snapshots, so stale tabs
+    /// must be replaced with a fresh placeholder, not appended to.
+    private func handlePeerReconnected() {
+        guard sessionManager.role == .peer else { return }
+        guard let placeholder = makePeerTab(
+            id: TerminalModel.placeholderTabId,
+            title: "Shell")
+        else {
+            NSLog("[ct] reconnect: placeholder tab create failed")
+            return
+        }
+        tabs = [placeholder]
+        activeTabId = placeholder.id
+        pendingPeerTabOutput.removeAll()
+        pendingPeerFocusedTabId = nil
+        splitPaneGrids.removeAll()
+        activeEditor = nil
+        resetSharedInputState()
+        showSessionNotification("Reconnected to session")
     }
 
     /// Presents the native macOS share sheet pre-loaded with the session URL,
