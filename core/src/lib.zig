@@ -185,10 +185,11 @@ export fn ct_session_drop_peer(handle: ?*anyopaque, peer_id: u32) void {
     s.dropPeer(peer_id);
 }
 
-/// Pop the next inbound frame. If one is available, copies up to `cap`
-/// bytes into `out`, writes the sending peer id into `*out_peer_id`, and
-/// returns the frame length (may exceed `cap` — caller should treat
-/// `ret > cap` as "buffer too small"). Returns 0 if queue empty.
+/// Pop the next inbound frame. If one is available and fits, copies it into
+/// `out`, writes the sending peer id into `*out_peer_id`, and returns the
+/// frame length. If the frame is larger than `cap`, it stays queued and its
+/// length is returned (`ret > cap` = "grow the buffer and call again; the
+/// same frame will be delivered"). Returns 0 if queue empty.
 export fn ct_session_poll(
     handle: ?*anyopaque,
     out: [*]u8,
@@ -196,12 +197,9 @@ export fn ct_session_poll(
     out_peer_id: *u32,
 ) isize {
     const s: *session_mod.Session = @ptrCast(@alignCast(handle orelse return 0));
-    const frame = s.pollFrame() orelse return 0;
-    defer s.freeFrame(frame);
-    out_peer_id.* = frame.peer_id;
-    const n = @min(frame.payload.len, cap);
-    if (n > 0) @memcpy(out[0..n], frame.payload[0..n]);
-    return @intCast(frame.payload.len);
+    const r = s.pollFrameInto(out[0..cap]) orelse return 0;
+    out_peer_id.* = r.peer_id;
+    return @intCast(r.len);
 }
 
 // ---- Bore supervisor ----------------------------------------------------

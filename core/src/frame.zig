@@ -236,6 +236,7 @@ pub const DecodeError = error{
 
 pub const EncodeError = error{
     BufferTooSmall,
+    FieldTooLong,
 };
 
 // --- decode ---------------------------------------------------------------
@@ -525,6 +526,8 @@ pub fn encode(frame: Frame, out: []u8) EncodeError!usize {
             try w.writeBytes(&p.user_id);
             try w.writeU8(@intFromEnum(p.role));
             try w.writeU32(p.color);
+            // Reject instead of letting the u16 cast panic on a >64 KB field.
+            if (p.name.len > std.math.maxInt(u16)) return error.FieldTooLong;
             try w.writeU16(@intCast(p.name.len));
             try w.writeBytes(p.name);
         },
@@ -533,6 +536,7 @@ pub fn encode(frame: Frame, out: []u8) EncodeError!usize {
         .access_mode => |p| try w.writeU8(@intFromEnum(p.mode)),
         .editor_open => |p| {
             try w.writeU64(p.doc_id);
+            if (p.path.len > std.math.maxInt(u16)) return error.FieldTooLong;
             try w.writeU16(@intCast(p.path.len));
             try w.writeBytes(p.path);
             try w.writeU32(@intCast(p.snapshot.len));
@@ -557,6 +561,7 @@ pub fn encode(frame: Frame, out: []u8) EncodeError!usize {
         .editor_close => |p| try w.writeU64(p.doc_id),
         .tab_open => |p| {
             try w.writeU32(p.tab_id);
+            if (p.title.len > std.math.maxInt(u16)) return error.FieldTooLong;
             try w.writeU16(@intCast(p.title.len));
             try w.writeBytes(p.title);
         },

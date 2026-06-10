@@ -7,9 +7,11 @@
 //! than adopt the new `Io` plumbing we provide the two primitives the session
 //! and bore layers actually need:
 //!
-//!   * `Mutex` — a tiny test-and-set spinlock. Every critical section in this
-//!     codebase is short and non-blocking (an ArrayList push/pop or a peer-list
-//!     snapshot), so a spinlock is correct and avoids any `Io` dependency.
+//!   * `Mutex` — wraps a libc `pthread_mutex_t`. Some critical sections in
+//!     the session layer span blocking socket writes (a peer's `write_mutex`
+//!     is held across `sendFrame`), so a spinlock is NOT acceptable here: a
+//!     contending thread would burn a full core for as long as a slow peer
+//!     stalls the write.
 //!   * `sleep` — libc `nanosleep`, used only by the in-tree unit tests that
 //!     poll for asynchronous socket activity.
 
@@ -22,19 +24,21 @@ const timespec = extern struct {
     tv_nsec: isize,
 };
 
-/// Test-and-set spinlock. Default-initializable so it can be embedded as a
-/// struct field with `= .{}`, matching the old `std.Thread.Mutex` ergonomics.
+/// Blocking mutex over libc pthreads. Default-initializable so it can be
+/// embedded as a struct field with `= .{}`, matching the old
+/// `std.Thread.Mutex` ergonomics (`PTHREAD_MUTEX_INITIALIZER` is all the
+/// default field values on darwin).
 pub const Mutex = struct {
-    state: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    inner: std.c.pthread_mutex_t = .{},
 
     pub fn lock(self: *Mutex) void {
-        while (self.state.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
-        }
+        const rc = std.c.pthread_mutex_lock(&self.inner);
+        std.debug.assert(rc == .SUCCESS);
     }
 
     pub fn unlock(self: *Mutex) void {
-        self.state.store(false, .release);
+        const rc = std.c.pthread_mutex_unlock(&self.inner);
+        std.debug.assert(rc == .SUCCESS);
     }
 };
 

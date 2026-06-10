@@ -19,7 +19,12 @@ const c = @cImport({
     @cInclude("netdb.h");
     @cInclude("unistd.h");
     @cInclude("string.h");
+    @cInclude("errno.h");
 });
+
+fn interrupted() bool {
+    return std.c._errno().* == c.EINTR;
+}
 
 /// Hard ceiling on a single frame's payload. Guards against malicious or
 /// corrupt peers sending huge length prefixes.
@@ -48,11 +53,25 @@ pub const Connection = struct {
         _ = c.close(self.fd);
     }
 
+    /// Disallow further sends/receives without releasing the fd: unblocks a
+    /// thread stuck in read() with EOF. Unlike close, the fd number cannot be
+    /// recycled out from under other threads still using this connection, so
+    /// this is the safe way to tear down a connection cross-thread.
+    pub fn shutdownBoth(self: *Connection) void {
+        if (self.closed) return;
+        _ = c.shutdown(self.fd, c.SHUT_RDWR);
+    }
+
     /// Raw read of up to `buf.len` bytes. Returns the number read (0 = EOF).
     pub fn read(self: *Connection, buf: []u8) !usize {
-        const n = c.read(self.fd, buf.ptr, buf.len);
-        if (n < 0) return error.ReadFailed;
-        return @intCast(n);
+        while (true) {
+            const n = c.read(self.fd, buf.ptr, buf.len);
+            if (n < 0) {
+                if (interrupted()) continue;
+                return error.ReadFailed;
+            }
+            return @intCast(n);
+        }
     }
 
     /// Send one framed message. Blocking.
@@ -86,6 +105,7 @@ fn writeAll(fd: c_int, bytes: []const u8) !void {
     var off: usize = 0;
     while (off < bytes.len) {
         const n = c.write(fd, bytes.ptr + off, bytes.len - off);
+        if (n < 0 and interrupted()) continue;
         if (n <= 0) return error.WriteFailed;
         off += @intCast(n);
     }
@@ -97,7 +117,10 @@ fn readExact(fd: c_int, buf: []u8, allow_eof_at_start: bool) !void {
     var pos: usize = 0;
     while (pos < buf.len) {
         const n = c.read(fd, buf.ptr + pos, buf.len - pos);
-        if (n < 0) return error.ReadFailed;
+        if (n < 0) {
+            if (interrupted()) continue;
+            return error.ReadFailed;
+        }
         if (n == 0) {
             if (pos == 0 and allow_eof_at_start) return error.PeerClosed;
             return error.ReadFailed;
@@ -189,10 +212,13 @@ pub fn connect(allocator: std.mem.Allocator, host: []const u8, port: u16) !Conne
 }
 
 /// Disable Nagle's algorithm so single-keystroke frames and other small
-/// interactive messages leave the socket immediately. Best-effort.
+/// interactive messages leave the socket immediately, and suppress SIGPIPE
+/// so a write to a vanished peer surfaces as EPIPE instead of killing the
+/// whole app. Best-effort.
 fn setNoDelay(fd: c_int) void {
     var one: c_int = 1;
     _ = c.setsockopt(fd, c.IPPROTO_TCP, c.TCP_NODELAY, &one, @sizeOf(c_int));
+    _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_NOSIGPIPE, &one, @sizeOf(c_int));
 }
 
 // --- tests ----------------------------------------------------------------
