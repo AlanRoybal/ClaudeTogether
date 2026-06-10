@@ -78,16 +78,17 @@ pub const Supervisor = struct {
         }
 
         // NUL-terminated argv (execvp wants a null-terminated pointer array).
+        // One defer frees exactly what was duped, on success and error alike;
+        // a separate errdefer would double-free once the loop completed.
         var argv: [9][*c]u8 = undefined;
         var made: usize = 0;
-        errdefer for (0..made) |i| self.allocator.free(std.mem.span(@as([*:0]u8, @ptrCast(argv[i]))));
+        defer for (0..made) |i| self.allocator.free(std.mem.span(@as([*:0]u8, @ptrCast(argv[i]))));
         for (0..argc) |i| {
             const z = try self.allocator.dupeZ(u8, args_buf[i]);
             argv[i] = @ptrCast(z.ptr);
             made += 1;
         }
         argv[argc] = null;
-        defer for (0..argc) |i| self.allocator.free(std.mem.span(@as([*:0]u8, @ptrCast(argv[i]))));
 
         var out_fds: [2]c_int = undefined;
         var err_fds: [2]c_int = undefined;
@@ -113,6 +114,12 @@ pub const Supervisor = struct {
             _ = c.close(out_fds[1]);
             _ = c.close(err_fds[0]);
             _ = c.close(err_fds[1]);
+            // Don't leak the app's other fds (listening sockets, peer
+            // connections, PTY masters) into the tunnel process — they would
+            // keep ports bound and connections half-open for its lifetime.
+            var fd: c_int = 3;
+            const maxfd = c.getdtablesize();
+            while (fd < maxfd) : (fd += 1) _ = c.close(fd);
             _ = c.execvp(argv[0], &argv);
             c._exit(127); // execvp returned → failed
         }
