@@ -98,10 +98,11 @@ pub const Sequence = struct {
         var tmp: [4]u8 = undefined;
         for (self.items.items) |it| {
             if (it.deleted) continue;
-            const n = try std.unicode.utf8Encode(
-                @intCast(it.codepoint),
-                &tmp,
-            );
+            // Items are sanitized on apply, but never trust stored state to
+            // the point of a panic: map anything invalid to U+FFFD here too.
+            const cp: u21 = std.math.cast(u21, it.codepoint) orelse 0xFFFD;
+            const n = std.unicode.utf8Encode(cp, &tmp) catch
+                std.unicode.utf8Encode(0xFFFD, &tmp) catch unreachable;
             try out.appendSlice(allocator, tmp[0..n]);
         }
         return out.toOwnedSlice(allocator);
@@ -142,7 +143,12 @@ pub const Sequence = struct {
                 }
                 // advance local clock so subsequent local ops are > any seen id
                 if (i.id.clock > self.clock) self.clock = i.id.clock;
-                try self.applyInsert(i.id, i.after, i.codepoint);
+                // A hostile peer can ship any u32 as a codepoint (surrogates,
+                // > U+10FFFF). Substitute U+FFFD instead of rejecting so the
+                // item id stays in the sequence and later ops anchored to it
+                // still resolve; the substitution is deterministic, so all
+                // replicas converge.
+                try self.applyInsert(i.id, i.after, sanitizeCodepoint(i.codepoint));
                 return true;
             },
             .delete => |d| {
@@ -355,14 +361,16 @@ pub const Sequence = struct {
                 idx = self.items.items.len;
             }
         }
-        // RGA tiebreak: while the item at idx has the same `after` and its
-        // id > new id, skip forward. This interleaves concurrent inserts at
-        // the same origin in id-descending order.
+        // RGA tiebreak: while the item at idx is a concurrent sibling (same
+        // `after`) with id > new id, skip it — together with its entire
+        // subtree, since its children sit between it and the next sibling in
+        // document order. Skipping only the sibling itself would drop the new
+        // item inside that sibling's subtree and replicas would diverge.
         while (idx < self.items.items.len) {
             const cur = self.items.items[idx];
             const same_origin = sameOptId(cur.after, after);
             if (same_origin and Id.greaterThan(cur.id, id)) {
-                idx += 1;
+                idx = self.subtreeEnd(idx);
             } else break;
         }
         try self.items.insert(self.allocator, idx, .{
@@ -371,6 +379,22 @@ pub const Sequence = struct {
             .codepoint = cp,
             .deleted = false,
         });
+    }
+
+    /// Index one past the subtree rooted at `root_idx`. Document order is a
+    /// depth-first traversal of the origin tree, so a subtree is a contiguous
+    /// run: walk forward while each item's origin lies inside the run.
+    fn subtreeEnd(self: *const Sequence, root_idx: usize) usize {
+        var end = root_idx + 1;
+        outer: while (end < self.items.items.len) : (end += 1) {
+            const a = self.items.items[end].after orelse break;
+            var j = root_idx;
+            while (j < end) : (j += 1) {
+                if (Id.eql(self.items.items[j].id, a)) continue :outer;
+            }
+            break;
+        }
+        return end;
     }
 
     fn sameOptId(a: ?Id, b: ?Id) bool {
@@ -423,6 +447,13 @@ pub const Sequence = struct {
         return null;
     }
 };
+
+/// Map anything that is not a valid Unicode scalar value to U+FFFD.
+fn sanitizeCodepoint(cp: u32) u32 {
+    if (cp > 0x10FFFF) return 0xFFFD;
+    if (cp >= 0xD800 and cp <= 0xDFFF) return 0xFFFD;
+    return cp;
+}
 
 fn readSnapshotU8(bytes: []const u8, pos: *usize) !u8 {
     if (pos.* + 1 > bytes.len) return error.Truncated;
@@ -735,6 +766,54 @@ test "visiblePosOfId not in sequence returns null" {
     try s.loadFromString("abc");
     const bogus = Id{ .client = 999, .clock = 999 };
     try testing.expect(s.visiblePosOfId(bogus) == null);
+}
+
+test "concurrent insert does not land inside a greater sibling's subtree" {
+    var a = Sequence.init(testing.allocator, 1);
+    defer a.deinit();
+    var b = Sequence.init(testing.allocator, 2);
+    defer b.deinit();
+
+    const opX = try a.localInsert(0, 'X');
+    _ = try b.apply(opX);
+
+    // Concurrently: client 1 inserts 'A' after X; client 2 inserts 'B' after
+    // X and then a child 'b' after B.
+    const opA = try a.localInsert(1, 'A');
+    const opB = try b.localInsert(1, 'B');
+    const opB1 = try b.localInsert(2, 'b');
+
+    // FIFO delivery per sender (the realistic star-topology order).
+    _ = try a.apply(opB);
+    _ = try a.apply(opB1);
+    _ = try b.apply(opA);
+
+    const sA = try a.toUtf8(testing.allocator);
+    defer testing.allocator.free(sA);
+    const sB = try b.toUtf8(testing.allocator);
+    defer testing.allocator.free(sB);
+    try testing.expectEqualStrings(sA, sB);
+    // 'A' must land after B's whole subtree, never between B and b.
+    try testing.expectEqualStrings("XBbA", sA);
+}
+
+test "apply sanitizes invalid codepoints instead of panicking" {
+    var s = Sequence.init(testing.allocator, 1);
+    defer s.deinit();
+    // Surrogate and out-of-range values from a hostile peer.
+    _ = try s.apply(.{ .insert = .{
+        .id = .{ .client = 9, .clock = 1 },
+        .after = null,
+        .codepoint = 0xD800,
+    } });
+    _ = try s.apply(.{ .insert = .{
+        .id = .{ .client = 9, .clock = 2 },
+        .after = .{ .client = 9, .clock = 1 },
+        .codepoint = 0xFFFFFFFF,
+    } });
+    const got = try s.toUtf8(testing.allocator);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("\u{FFFD}\u{FFFD}", got);
 }
 
 test "apply insert before its origin arrives falls back to end" {
