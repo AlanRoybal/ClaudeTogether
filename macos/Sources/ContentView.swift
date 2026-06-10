@@ -1973,6 +1973,10 @@ final class TerminalModel: ObservableObject {
                   data.count,
                   sessionManager.role == .host ? "host" : "peer",
                   pty != nil ? "Y" : "N")
+            // Host-side enforcement: inbound input can only have come from a
+            // peer; in view-only mode drop it. The sender-side gate is purely
+            // advisory — a modified client just skips it.
+            if sessionManager.role == .host, sessionManager.accessMode == .viewOnly { return }
             if let packet = try? SharedInputCodec.decode(data) {
                 handleSharedInputPacket(packet)
                 return
@@ -2097,6 +2101,8 @@ final class TerminalModel: ObservableObject {
             else {
                 return
             }
+            // Host-side view-only enforcement (see .inputOp).
+            if sessionManager.accessMode == .viewOnly { return }
             if let packet = try? SharedInputCodec.decode(data) {
                 handleSharedInputPacket(packet)
                 return
@@ -2217,6 +2223,8 @@ final class TerminalModel: ObservableObject {
 
         case .paneInput(let paneId, let data):
             guard sessionManager.role == .host, !data.isEmpty else { return }
+            // Host-side view-only enforcement (see .inputOp).
+            if sessionManager.accessMode == .viewOnly { return }
             for tab in tabs {
                 if let pane = tab.splitPane, pane.id == paneId, let pty = pane.pty {
                     pty.send(Array(data))

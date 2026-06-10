@@ -103,13 +103,19 @@ pub const Session = struct {
         }
         if (self.accept_thread) |t| t.join();
 
-        // Close peer sockets — reader threads will exit on read error.
+        // Shut peer sockets down — reader threads see EOF, exit, and each
+        // closes its own socket (the single owner of the fd's lifetime).
         self.mutex.lock();
-        for (self.peers.items) |p| p.conn.close();
+        for (self.peers.items) |p| {
+            p.write_mutex.lock();
+            p.conn.shutdownBoth();
+            p.write_mutex.unlock();
+        }
         self.mutex.unlock();
 
         for (self.peers.items) |p| {
             if (p.thread) |t| t.join();
+            p.conn.close(); // no-op if the reader thread already closed it
         }
 
         // Drain leftover inbound buffers.
@@ -175,14 +181,14 @@ pub const Session = struct {
         };
     }
 
-    /// Host only: close a peer's TCP connection. The reader thread detects the
-    /// close, calls markDead, and pushes a peer_disconnected event.
+    /// Host only: shut down a peer's TCP connection. The reader thread sees
+    /// EOF, calls markDead (peer_disconnected event), and closes the socket.
     pub fn dropPeer(self: *Session, peer_id: u32) void {
         self.mutex.lock();
         defer self.mutex.unlock();
         for (self.peers.items) |p| {
             if (p.id == peer_id) {
-                p.conn.close();
+                p.conn.shutdownBoth();
                 break;
             }
         }
@@ -195,6 +201,36 @@ pub const Session = struct {
         defer self.mutex.unlock();
         if (self.inbound.items.len == 0) return null;
         return self.inbound.orderedRemove(0);
+    }
+
+    pub const PollCopy = struct {
+        peer_id: u32,
+        len: usize,
+        copied: bool,
+    };
+
+    /// Copy the next inbound frame into `out` and dequeue it. If the head
+    /// frame is larger than `out`, it STAYS queued and its length is reported
+    /// with `copied == false`, so the caller can grow its buffer and retry —
+    /// the same frame is returned by the next call. Returns null if empty.
+    pub fn pollFrameInto(self: *Session, out: []u8) ?PollCopy {
+        self.mutex.lock();
+        if (self.inbound.items.len == 0) {
+            self.mutex.unlock();
+            return null;
+        }
+        const head = self.inbound.items[0];
+        if (head.payload.len > out.len) {
+            const r = PollCopy{ .peer_id = head.peer_id, .len = head.payload.len, .copied = false };
+            self.mutex.unlock();
+            return r;
+        }
+        const f = self.inbound.orderedRemove(0);
+        self.mutex.unlock();
+        if (f.payload.len > 0) @memcpy(out[0..f.payload.len], f.payload);
+        const r = PollCopy{ .peer_id = f.peer_id, .len = f.payload.len, .copied = true };
+        self.allocator.free(f.payload);
+        return r;
     }
 
     pub fn freeFrame(self: *Session, f: InboundFrame) void {
@@ -212,23 +248,48 @@ pub const Session = struct {
 
     // --- internals --------------------------------------------------------
 
+    /// Takes ownership of `conn`: on any error the connection is closed here
+    /// and the caller must not touch it again.
     fn addPeer(self: *Session, conn: transport.Connection) !void {
-        const p = try self.allocator.create(Peer);
+        const p = self.allocator.create(Peer) catch |err| {
+            var dead = conn;
+            dead.close();
+            return err;
+        };
         self.mutex.lock();
         p.* = .{
             .id = self.next_peer_id,
             .conn = conn,
         };
         self.next_peer_id += 1;
-        try self.peers.append(self.allocator, p);
-        const peer_id = p.id;
+        self.peers.append(self.allocator, p) catch |err| {
+            self.mutex.unlock();
+            p.conn.close();
+            self.allocator.destroy(p);
+            return err;
+        };
         self.events.append(self.allocator, .{
             .kind = .peer_connected,
-            .peer_id = peer_id,
+            .peer_id = p.id,
         }) catch {};
         self.mutex.unlock();
 
-        p.thread = try std.Thread.spawn(.{}, readerLoop, .{ self, p });
+        p.thread = std.Thread.spawn(.{}, readerLoop, .{ self, p }) catch |err| {
+            // Unregister the peer: with no reader thread nothing services the
+            // socket, and leaving it listed would make deinit close a stale
+            // fd a second time.
+            self.mutex.lock();
+            for (self.peers.items, 0..) |it, i| {
+                if (it == p) {
+                    _ = self.peers.orderedRemove(i);
+                    break;
+                }
+            }
+            self.mutex.unlock();
+            p.conn.close();
+            self.allocator.destroy(p);
+            return err;
+        };
     }
 
     fn acceptLoop(self: *Session) void {
@@ -242,15 +303,20 @@ pub const Session = struct {
             // it with an error which we treat as shutdown.
             if (self.listener == null) return;
             const conn = self.listener.?.accept() catch return;
-            self.addPeer(conn) catch {
-                var dead = conn;
-                dead.close();
-                continue;
-            };
+            // addPeer owns conn and closes it on failure.
+            self.addPeer(conn) catch continue;
         }
     }
 
     fn readerLoop(self: *Session, p: *Peer) void {
+        // Reader exit is the single place a live peer's socket is released.
+        // Take the write lock so no writer is mid-send on the fd when it
+        // closes; cross-thread teardown uses shutdownBoth() to get us here.
+        defer {
+            p.write_mutex.lock();
+            p.conn.close();
+            p.write_mutex.unlock();
+        }
         // Conservative per-read buffer. Bounded by transport.max_frame_bytes
         // for correctness; actual allocations are sized to the header.
         var hdr: [4]u8 = undefined;
@@ -320,6 +386,11 @@ pub const Session = struct {
         defer self.mutex.unlock();
         if (p.dead) return;
         p.dead = true;
+        // Unblock the reader thread (it owns the close); without this a
+        // write-side failure would leave the reader parked in read() and the
+        // fd held until deinit — host sessions are long-lived, so every
+        // disconnect would leak a socket.
+        p.conn.shutdownBoth();
         if (!self.shutting_down) {
             self.events.append(self.allocator, .{
                 .kind = .peer_disconnected,

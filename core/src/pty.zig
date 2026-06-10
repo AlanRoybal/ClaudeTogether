@@ -8,6 +8,7 @@ const c = @cImport({
     @cInclude("signal.h");
     @cInclude("errno.h");
     @cInclude("stdlib.h");
+    @cInclude("sys/wait.h");
 });
 
 pub const SpawnResult = extern struct {
@@ -39,8 +40,9 @@ pub fn spawn(
         _ = c.setenv("COLORTERM", "truecolor", 1);
         const execv_argv: [*c][*c]u8 = @ptrCast(@constCast(argv));
         _ = c.execvp(argv[0], execv_argv);
-        // if execvp returns, it failed
-        c.exit(127);
+        // if execvp returns, it failed; _exit so the fork doesn't run the
+        // parent's inherited atexit handlers
+        c._exit(127);
     }
 
     // parent: make master non-blocking
@@ -69,4 +71,16 @@ pub fn isRaw(fd: c_int) bool {
 
 pub fn kill(pid: c_int) void {
     _ = c.kill(pid, c.SIGTERM);
+    // Reap asynchronously: nothing else ever waits on PTY children, so
+    // without this every closed tab leaves a zombie for the app's lifetime.
+    // A detached thread blocks in waitpid until the child actually exits.
+    const t = std.Thread.spawn(.{}, reap, .{pid}) catch {
+        _ = c.waitpid(pid, null, c.WNOHANG); // best-effort fallback
+        return;
+    };
+    t.detach();
+}
+
+fn reap(pid: c_int) void {
+    _ = c.waitpid(pid, null, 0);
 }

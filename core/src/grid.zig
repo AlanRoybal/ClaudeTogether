@@ -143,6 +143,7 @@ pub const Grid = struct {
     active_url_id: u8 = 0,
 
     pub fn init(alloc: std.mem.Allocator, cols: u16, rows: u16) !Grid {
+        if (cols == 0 or rows == 0) return error.InvalidSize;
         const sz: usize = @as(usize, cols) * @as(usize, rows);
         const primary = try alloc.alloc(Cell, sz);
         errdefer alloc.free(primary);
@@ -183,6 +184,7 @@ pub const Grid = struct {
     }
 
     fn resizeWithPolicy(self: *Grid, cols: u16, rows: u16, preserve_bottom: bool) !void {
+        if (cols == 0 or rows == 0) return error.InvalidSize;
         if (cols == self.cols and rows == self.rows) return;
         const old_cols = self.cols;
         const old_rows = self.rows;
@@ -408,8 +410,14 @@ pub const Grid = struct {
         self.clearRows(top, amt);
     }
 
-    fn csi(self: *Grid, c: vt.Csi) void {
+    fn csi(self: *Grid, c_in: vt.Csi) void {
         defer self.epoch +%= 1;
+        // Params come from untrusted PTY/peer bytes as i32; clamp once so the
+        // u16 casts below cannot overflow regardless of how the Csi was built.
+        var c = c_in;
+        for (c.params[0..c.param_count]) |*p| {
+            if (p.* > 65535) p.* = 65535;
+        }
         if (c.private == '?') {
             self.privateMode(c);
             return;
@@ -437,8 +445,8 @@ pub const Grid = struct {
                 self.cursor_y = @intCast(@min(@as(i32, self.rows) - 1, row - 1));
                 self.cursor_x = @intCast(@min(@as(i32, self.cols) - 1, col - 1));
             },
-            'J' => self.eraseDisplay(@intCast(@max(0, c.get(0, 0)))),
-            'K' => self.eraseLine(@intCast(@max(0, c.get(0, 0)))),
+            'J' => self.eraseDisplay(clampU8(c.get(0, 0))),
+            'K' => self.eraseLine(clampU8(c.get(0, 0))),
             'L' => self.insertLines(@intCast(@max(1, c.get(0, 1)))),
             'M' => self.deleteLines(@intCast(@max(1, c.get(0, 1)))),
             'P' => self.deleteChars(@intCast(@max(1, c.get(0, 1)))),
@@ -623,13 +631,16 @@ pub const Grid = struct {
     }
 
     fn eraseDisplay(self: *Grid, mode: u8) void {
+        // After printing a full line, cursor_x parks at cols ("pending wrap");
+        // clamp so the inclusive-end modes stay in bounds.
+        const cx = @min(self.cursor_x, self.cols - 1);
         switch (mode) {
             0 => {
-                const start = self.cellIdx(self.cursor_x, self.cursor_y);
+                const start = self.cellIdx(cx, self.cursor_y);
                 for (self.cells[start..]) |*c| c.* = .{ .bg = self.sgr_bg };
             },
             1 => {
-                const end = self.cellIdx(self.cursor_x, self.cursor_y) + 1;
+                const end = self.cellIdx(cx, self.cursor_y) + 1;
                 for (self.cells[0..end]) |*c| c.* = .{ .bg = self.sgr_bg };
             },
             2, 3 => {
@@ -642,11 +653,13 @@ pub const Grid = struct {
     fn eraseLine(self: *Grid, mode: u8) void {
         const row_start = @as(usize, self.cursor_y) * self.cols;
         const row = self.cells[row_start .. row_start + self.cols];
+        // Clamp the pending-wrap position (cursor_x == cols) into the row.
+        const cx = @min(self.cursor_x, self.cols - 1);
         switch (mode) {
-            0 => for (row[self.cursor_x..]) |*c| {
+            0 => for (row[cx..]) |*c| {
                 c.* = .{ .bg = self.sgr_bg };
             },
-            1 => for (row[0 .. self.cursor_x + 1]) |*c| {
+            1 => for (row[0 .. cx + 1]) |*c| {
                 c.* = .{ .bg = self.sgr_bg };
             },
             2 => for (row) |*c| {
@@ -686,26 +699,26 @@ pub const Grid = struct {
                 49 => self.sgr_bg = DEFAULT_BG,
                 38 => {
                     if (i + 1 < c.param_count and c.params[i + 1] == 5 and i + 2 < c.param_count) {
-                        self.sgr_fg = xterm256(@intCast(@max(0, c.params[i + 2])));
+                        self.sgr_fg = xterm256(clampU8(c.params[i + 2]));
                         i += 2;
                     } else if (i + 1 < c.param_count and c.params[i + 1] == 2 and i + 4 < c.param_count) {
                         self.sgr_fg = rgb(
-                            @intCast(@max(0, c.params[i + 2])),
-                            @intCast(@max(0, c.params[i + 3])),
-                            @intCast(@max(0, c.params[i + 4])),
+                            clampU8(c.params[i + 2]),
+                            clampU8(c.params[i + 3]),
+                            clampU8(c.params[i + 4]),
                         );
                         i += 4;
                     }
                 },
                 48 => {
                     if (i + 1 < c.param_count and c.params[i + 1] == 5 and i + 2 < c.param_count) {
-                        self.sgr_bg = xterm256(@intCast(@max(0, c.params[i + 2])));
+                        self.sgr_bg = xterm256(clampU8(c.params[i + 2]));
                         i += 2;
                     } else if (i + 1 < c.param_count and c.params[i + 1] == 2 and i + 4 < c.param_count) {
                         self.sgr_bg = rgb(
-                            @intCast(@max(0, c.params[i + 2])),
-                            @intCast(@max(0, c.params[i + 3])),
-                            @intCast(@max(0, c.params[i + 4])),
+                            clampU8(c.params[i + 2]),
+                            clampU8(c.params[i + 3]),
+                            clampU8(c.params[i + 4]),
                         );
                         i += 4;
                     }
@@ -778,6 +791,10 @@ pub const Grid = struct {
         return n;
     }
 };
+
+fn clampU8(v: i32) u8 {
+    return @intCast(@max(0, @min(255, v)));
+}
 
 fn setAttrBit(a: *u16, bit: u4, on: bool) void {
     const mask: u16 = @as(u16, 1) << bit;

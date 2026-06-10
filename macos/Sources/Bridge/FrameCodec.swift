@@ -345,6 +345,12 @@ enum FrameCodec {
             return .fsDelta(FSSyncDelta(kind: kind, path: path, data: payload))
         case .fsSnapshot:
             let count = try r.readU32()
+            // `count` comes off the wire: bound it against the bytes actually
+            // present (each entry is at least 3 bytes) before reserving, or a
+            // 12-byte hostile frame forces a ~4-billion-element allocation.
+            guard Int(count) <= r.remainingCount / 3 else {
+                throw FrameCodecError.truncated
+            }
             var entries: [FSSnapshotEntry] = []
             entries.reserveCapacity(Int(count))
             for _ in 0..<Int(count) {
@@ -532,6 +538,8 @@ enum FrameCodec {
 private struct Reader {
     let data: Data
     var pos: Int = 0
+
+    var remainingCount: Int { data.count - pos }
 
     mutating func readU8() throws -> UInt8 {
         guard pos + 1 <= data.count else { throw FrameCodecError.truncated }

@@ -7,19 +7,24 @@ final class TermCore {
     private var handle: OpaquePointer?
     private(set) var cols: UInt16
     private(set) var rows: UInt16
-    private var buf: [ct_cell]
+    // Manually-managed storage so `snapshot()` can hand out a pointer that
+    // stays valid until the next resize. Escaping a pointer out of an Array's
+    // withUnsafeBufferPointer is undefined behavior.
+    private var buf: UnsafeMutableBufferPointer<ct_cell>
 
     init?(cols: UInt16, rows: UInt16) {
         guard let h = ct_term_new(cols, rows) else { return nil }
         self.handle = h
         self.cols = cols
         self.rows = rows
-        self.buf = [ct_cell](
-            repeating: ct_cell(),
-            count: Int(cols) * Int(rows))
+        self.buf = .allocate(capacity: Int(cols) * Int(rows))
+        self.buf.initialize(repeating: ct_cell())
     }
 
-    deinit { close() }
+    deinit {
+        close()
+        buf.deallocate()
+    }
 
     func close() {
         if let h = handle { ct_term_free(h) }
@@ -42,21 +47,19 @@ final class TermCore {
         }
         self.cols = cols
         self.rows = rows
-        self.buf = [ct_cell](
-            repeating: ct_cell(),
-            count: Int(cols) * Int(rows))
+        buf.deallocate()
+        buf = .allocate(capacity: Int(cols) * Int(rows))
+        buf.initialize(repeating: ct_cell())
     }
 
     /// Copies the current cell grid into the internal buffer and returns a
-    /// read-only view. Valid until the next call to `snapshot()`.
+    /// read-only view. Valid until the next `resize` or deinit.
     func snapshot() -> UnsafeBufferPointer<ct_cell> {
         guard let h = handle else {
             return UnsafeBufferPointer(start: nil, count: 0)
         }
-        buf.withUnsafeMutableBufferPointer { p in
-            _ = ct_term_snapshot(h, p.baseAddress, p.count)
-        }
-        return buf.withUnsafeBufferPointer { $0 }
+        _ = ct_term_snapshot(h, buf.baseAddress, buf.count)
+        return UnsafeBufferPointer(buf)
     }
 
     var scrollbackLength: Int {
@@ -160,8 +163,12 @@ final class TermCore {
         let len = buf.withUnsafeMutableBufferPointer { p in
             ct_term_cell_url(h, col, row, p.baseAddress, p.count)
         }
-        guard len > 0,
-              let str = String(bytes: buf[..<len], encoding: .utf8),
+        // ct_term_cell_url returns the FULL url length, which can exceed the
+        // buffer; only `min(len, cap)` bytes were copied. Without the clamp a
+        // hostile >2 KB OSC 8 URL traps the range subscript.
+        let n = min(len, buf.count)
+        guard n > 0,
+              let str = String(bytes: buf[..<n], encoding: .utf8),
               let url = URL(string: str)
         else { return nil }
         return url

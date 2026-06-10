@@ -120,10 +120,11 @@ int ct_session_send_to(ct_session *s,
                        uint32_t peer_id,
                        const uint8_t *bytes, size_t len);
 
-/* Pop the next inbound frame. Writes up to `cap` bytes into `out` and the
- * sending peer id into `*out_peer_id`. Returns the full frame length (which
- * may exceed `cap` — caller should grow its buffer and retry). Returns 0
- * when the queue is empty. */
+/* Pop the next inbound frame. If it fits in `cap`, copies it into `out`,
+ * writes the sending peer id into `*out_peer_id`, and dequeues it. If the
+ * frame is larger than `cap` it STAYS queued and its full length is returned,
+ * so the caller can grow its buffer and call again to receive the same frame.
+ * Returns 0 when the queue is empty. */
 ptrdiff_t ct_session_poll(ct_session *s,
                           uint8_t *out, size_t cap,
                           uint32_t *out_peer_id);

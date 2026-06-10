@@ -116,10 +116,18 @@ private func loadItermColors(from url: URL) throws -> TerminalTheme {
 
     func extractColor(_ key: String) throws -> UInt32 {
         guard let sub = plist[key] as? [String: Any] else { throw ThemeImportError.missingField(key) }
-        let r = (sub["Red Component"] as? Double) ?? 0
-        let g = (sub["Green Component"] as? Double) ?? 0
-        let b = (sub["Blue Component"] as? Double) ?? 0
-        return (UInt32(r * 255) << 16) | (UInt32(g * 255) << 8) | UInt32(b * 255)
+        // Clamp before converting: UInt32(Double) traps on negative/NaN, and
+        // ThemeLibrary imports every file in the themes dir at startup — one
+        // malformed component would crash the app on every launch.
+        func channel(_ key: String) -> UInt32 {
+            let v = (sub[key] as? Double) ?? 0
+            guard v.isFinite else { return 0 }
+            return UInt32(min(max(v, 0), 1) * 255)
+        }
+        let r = channel("Red Component")
+        let g = channel("Green Component")
+        let b = channel("Blue Component")
+        return (r << 16) | (g << 8) | b
     }
 
     let bg     = try extractColor("Background Color")

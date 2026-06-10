@@ -566,22 +566,33 @@ final class MetalTerminalNSView: NSView {
     /// Returns the text covered by the current selection, or nil if nothing
     /// is selected. Uses the grid snapshot so it reads live terminal content.
     private func selectedText() -> String? {
-        guard let a = selectionAnchor, let h = selectionHead else { return nil }
-        let startsBefore = a.row < h.row || (a.row == h.row && a.col <= h.col)
-        let start = startsBefore ? a : h
-        let end   = startsBefore ? h : a
-        if start.col == end.col && start.row == end.row { return nil }
+        guard var a = selectionAnchor, var h = selectionHead else { return nil }
 
         let snap = grid.snapshot()
         let cols = Int(grid.cols)
         let rows = Int(grid.rows)
         guard cols > 0, rows > 0, snap.count >= cols * rows else { return nil }
 
+        // The selection endpoints were clamped to the grid size at mouse-down;
+        // if the grid has shrunk since (resize, font change) they can now lie
+        // outside it — re-clamp or the ranges below trap.
+        a = (col: min(a.col, cols - 1), row: min(a.row, rows - 1))
+        h = (col: min(h.col, cols - 1), row: min(h.row, rows - 1))
+
+        let startsBefore = a.row < h.row || (a.row == h.row && a.col <= h.col)
+        let start = startsBefore ? a : h
+        let end   = startsBefore ? h : a
+        if start.col == end.col && start.row == end.row { return nil }
+
         var result = ""
         for r in start.row...end.row {
             let colStart = r == start.row ? start.col : 0
             let colEnd   = r == end.row   ? end.col   : cols - 1
             var line = ""
+            guard colStart <= colEnd else {
+                if r != end.row { result += "\n" }
+                continue
+            }
             for c in colStart...colEnd {
                 guard c < cols && r < rows else { break }
                 let cell = snap[r * cols + c]
@@ -863,7 +874,7 @@ struct MetalTerminalView: NSViewRepresentable {
         self.currentMatchIndex = currentMatchIndex
     }
 
-    func makeNSView(context: Context) -> MetalTerminalNSView {
+    func makeNSView(context: Context) -> NSView {
         guard let v = MetalTerminalNSView(
             grid: grid,
             onKey: onKey,
@@ -872,14 +883,13 @@ struct MetalTerminalView: NSViewRepresentable {
             fontName: fontName,
             pointSize: fontSize)
         else {
+            // Retrying the same failable init would fail for the same reason;
+            // degrade to a plain label instead of crashing on a force-unwrap.
             NSLog("MetalTerminalNSView init failed — Metal unavailable")
-            return MetalTerminalNSView(
-                grid: grid,
-                onKey: { _ in },
-                onResize: { _, _ in },
-                onMouseCell: { _, _ in false },
-                fontName: fontName,
-                pointSize: fontSize)!
+            let placeholder = NSTextField(
+                labelWithString: "Terminal rendering is unavailable (Metal could not be initialized).")
+            placeholder.alignment = .center
+            return placeholder
         }
         v.inputEnabled = inputEnabled
         v.onPaste = onPaste
@@ -890,7 +900,8 @@ struct MetalTerminalView: NSViewRepresentable {
         return v
     }
 
-    func updateNSView(_ nsView: MetalTerminalNSView, context: Context) {
+    func updateNSView(_ nsView: NSView, context: Context) {
+        guard let nsView = nsView as? MetalTerminalNSView else { return }
         nsView.updateGrid(grid)
         nsView.updateHandlers(
             onKey: onKey,
@@ -910,7 +921,8 @@ struct MetalTerminalView: NSViewRepresentable {
         nsView.renderer.currentMatchIndex = currentMatchIndex
     }
 
-    static func dismantleNSView(_ nsView: MetalTerminalNSView, coordinator: ()) {
+    static func dismantleNSView(_ nsView: NSView, coordinator: ()) {
+        guard let nsView = nsView as? MetalTerminalNSView else { return }
         nsView.mtkView.delegate = nil
         nsView.mtkView.isPaused = true
     }
