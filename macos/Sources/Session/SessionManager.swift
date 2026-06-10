@@ -747,7 +747,12 @@ final class SessionManager: ObservableObject {
     private func handleDisconnected(_ peerID: UInt32) {
         if role == .host {
             if let gone = transportToIdentity.removeValue(forKey: peerID) {
-                participants.removeAll { $0.identity == gone }
+                // A reconnecting peer may already be back on a new transport
+                // connection before the old socket's death is noticed — only
+                // drop them from the roster when this was their last one.
+                if !transportToIdentity.values.contains(gone) {
+                    participants.removeAll { $0.identity == gone }
+                }
                 broadcastRoster()
             }
         } else {
