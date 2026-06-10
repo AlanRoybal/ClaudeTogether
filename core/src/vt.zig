@@ -163,10 +163,11 @@ pub const Parser = struct {
             return .{ .osc = slice };
         }
         if (b == 0x1B) {
-            // ST sequence: ESC \ ; discard the trailing \
-            // Simpler: treat as terminator immediately, then swallow the \
+            // ST sequence: ESC \ ; hand the trailing \ to the escape state so it
+            // is consumed as a (harmless) .esc event instead of printed.
             const slice = self.osc_buf[0..self.osc_len];
-            self.state = .ground; // next char (\) will be ignored by ESC handler
+            self.state = .escape;
+            self.esc_intermediate = 0;
             return .{ .osc = slice };
         }
         if (self.osc_len < MAX_OSC) {
@@ -181,7 +182,9 @@ pub const Parser = struct {
         if (idx >= MAX_PARAMS) return;
         var cur = self.csi.params[idx];
         if (cur < 0) cur = 0;
-        cur = cur * 10 + @as(i32, b - '0');
+        // Saturate: hostile/garbage input like ESC[99999999999999A must not
+        // overflow i32, and no real control function needs params > 65535.
+        cur = if (cur >= 65535) 65535 else @min(cur * 10 + @as(i32, b - '0'), 65535);
         self.csi.params[idx] = cur;
     }
 
