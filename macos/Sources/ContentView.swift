@@ -1000,9 +1000,13 @@ final class TerminalModel: ObservableObject {
 
         let cwd = rootPath ?? FileManager.default.homeDirectoryForCurrentUser.path
         let p = PTYSession()
-        p.onOutput = { [weak self] bytes in
+        p.onOutput = { [weak self, weak p] bytes in
             guard let self else { return }
             grid.feed(bytes)
+            let queryReply = grid.term.takeQueryResponse()
+            if !queryReply.isEmpty {
+                p?.send(queryReply)
+            }
             if self.sessionManager.state == .running {
                 self.sessionManager.sendPanePtyOutput(paneId: paneId, data: Data(bytes))
             }
@@ -1099,9 +1103,16 @@ final class TerminalModel: ObservableObject {
             return nil
         }
         // Host: PTY output → feed this tab's grid AND fan out to peers.
-        pty.onOutput = { [weak self] bytes in
+        pty.onOutput = { [weak self, weak pty] bytes in
             guard let self = self else { return }
             grid.feed(bytes)
+            // Answer terminal capability queries (kitty CSI ? u, DA1) the
+            // running app embedded in its output. Only the PTY owner replies;
+            // peer grids queue the same bytes and simply never drain them.
+            let queryReply = grid.term.takeQueryResponse()
+            if !queryReply.isEmpty {
+                pty?.send(queryReply)
+            }
             let shouldShare = self.sessionManager.role == .host
                 && self.sessionManager.state == .running
             NSLog("[ct] pty->out tab=%u bytes=%d share=%@",
@@ -1896,7 +1907,7 @@ final class TerminalModel: ObservableObject {
            let pane = tabs.first(where: { $0.id == tabId })?.splitPane
         {
             pane.grid.scrollToBottom()
-            let paneBytes = normalizedShiftReturn(bytes)
+            let paneBytes = resolvedShiftReturn(bytes, grid: pane.grid)
             if let pty = pane.pty {
                 pty.send(paneBytes)
             } else if sessionManager.role == .peer, sessionManager.state == .running {
@@ -1909,10 +1920,12 @@ final class TerminalModel: ObservableObject {
         if handleSharedInputKey(bytes, tabId: tabId) {
             return
         }
-        // Shared input didn't consume the key (raw mode, view-only, local
-        // tab) — from here every path forwards raw bytes to a PTY, where
-        // Shift+Return must look like a plain Return.
-        let bytes = normalizedShiftReturn(bytes)
+        // Shared input didn't consume the key (no session, view-only, TUI) —
+        // from here every path forwards raw bytes to a PTY, so translate the
+        // Shift+Return sentinel into whatever the running app understands.
+        let bytes = resolvedShiftReturn(
+            bytes,
+            grid: tabs.first(where: { $0.id == tabId })?.grid)
         if let pty = tabs.first(where: { $0.id == tabId })?.pty {
             pty.send(bytes)
             return
@@ -1927,8 +1940,24 @@ final class TerminalModel: ObservableObject {
         }
     }
 
-    private func normalizedShiftReturn(_ bytes: [UInt8]) -> [UInt8] {
-        bytes == TerminalKeySequences.shiftReturn ? [0x0D] : bytes
+    /// Translates the Shift+Return sentinel for direct PTY delivery, by
+    /// descending capability of the running app:
+    /// - kitty keyboard protocol pushed (Claude Code, codex): send the real
+    ///   CSI-u encoding; the app inserts the newline itself.
+    /// - line-mode app with bracketed paste (zsh/bash prompts, claude
+    ///   without kitty): paste a bare newline into the edit buffer.
+    /// - anything else (vim and other alt-screen TUIs): a plain Return,
+    ///   byte-identical to the pre-Shift+Enter behavior.
+    private func resolvedShiftReturn(_ bytes: [UInt8], grid: GridModel?) -> [UInt8] {
+        guard bytes == TerminalKeySequences.shiftReturn else { return bytes }
+        guard let grid else { return [0x0D] }
+        if grid.term.kittyKeyboardFlags & 1 != 0 {
+            return TerminalKeySequences.shiftReturn
+        }
+        if !grid.isUsingAlternateScreen, grid.term.bracketedPasteMode {
+            return Array("\u{1B}[200~\n\u{1B}[201~".utf8)
+        }
+        return [0x0D]
     }
 
     func handleTerminalMouseCell(col: UInt16, row: UInt16, forTabId tabId: UInt32) -> Bool {

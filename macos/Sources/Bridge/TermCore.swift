@@ -141,6 +141,25 @@ final class TermCore {
         return ct_term_bracketed_paste_mode(h) == 1
     }
 
+    /// Kitty keyboard protocol flags pushed by the running app
+    /// (CSI > flags u). Bit 0 (disambiguate escape codes) means modified
+    /// keys like Shift+Enter should be sent CSI-u encoded.
+    var kittyKeyboardFlags: UInt32 {
+        guard let h = handle else { return 0 }
+        return ct_term_kitty_flags(h)
+    }
+
+    /// Drains pending terminal-query replies (kitty CSI ? u, DA1) generated
+    /// while feeding output. The PTY owner writes these back to the PTY.
+    func takeQueryResponse() -> [UInt8] {
+        guard let h = handle else { return [] }
+        var buf = [UInt8](repeating: 0, count: 64)
+        let n = buf.withUnsafeMutableBufferPointer { p in
+            ct_term_take_response(h, p.baseAddress, p.count)
+        }
+        return Array(buf.prefix(n))
+    }
+
     /// DECSET 1006 — xterm SGR encoding. The only encoding we currently
     /// emit; if this bit is missing the running app likely expects the
     /// legacy X10 byte format which we don't synthesize today.
