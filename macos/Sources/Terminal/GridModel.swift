@@ -130,15 +130,16 @@ final class GridModel: ObservableObject {
     func snapshot() -> UnsafeBufferPointer<ct_cell> {
         let base = term.snapshot()
         let scrollOffset = effectiveScrollOffset()
-        guard scrollOffset > 0 || overlay != nil else { return base }
+        let rowShift = overlayBottomOverflow()
+        guard scrollOffset > 0 || rowShift > 0 || overlay != nil else { return base }
 
         if overlaySnapshot.count != base.count {
             if overlaySnapshot.baseAddress != nil { overlaySnapshot.deallocate() }
             overlaySnapshot = .allocate(capacity: base.count)
             overlaySnapshot.initialize(repeating: ct_cell())
         }
-        if scrollOffset > 0 {
-            copyScrolledSnapshot(primary: base, offset: scrollOffset)
+        if scrollOffset > 0 || rowShift > 0 {
+            copyWindowedSnapshot(primary: base)
         } else {
             for i in 0..<base.count {
                 overlaySnapshot[i] = base[i]
@@ -149,15 +150,14 @@ final class GridModel: ObservableObject {
             return UnsafeBufferPointer(overlaySnapshot)
         }
 
+        let positions = overlayLayoutPositions(overlay)
         let maxCursorOffset = overlay.cursors.map(\.offset).max() ?? 0
-        let span = max(1, max(overlay.textScalars.count, maxCursorOffset + 1))
+        let span = min(
+            positions.count,
+            max(1, max(overlay.textScalars.count, maxCursorOffset + 1)))
         var styleIndex: Int?
         for offset in 0..<span {
-            if let idx = linearIndex(
-                forOffset: offset,
-                anchorCol: overlay.anchorCol,
-                anchorRow: overlay.anchorRow)
-            {
+            if let idx = linearIndex(forPrimaryLinear: positions[offset]) {
                 styleIndex = idx
                 break
             }
@@ -171,21 +171,15 @@ final class GridModel: ObservableObject {
         let blank = blankCell(from: styleCell)
 
         for offset in 0..<span {
-            guard let idx = linearIndex(
-                forOffset: offset,
-                anchorCol: overlay.anchorCol,
-                anchorRow: overlay.anchorRow)
-            else {
+            guard let idx = linearIndex(forPrimaryLinear: positions[offset]) else {
                 continue
             }
             overlaySnapshot[idx] = blank
         }
 
         for (offset, scalar) in overlay.textScalars.enumerated() {
-            guard let idx = linearIndex(
-                forOffset: offset,
-                anchorCol: overlay.anchorCol,
-                anchorRow: overlay.anchorRow)
+            guard scalar != "\n",
+                  let idx = linearIndex(forPrimaryLinear: positions[offset])
             else {
                 continue
             }
@@ -221,16 +215,27 @@ final class GridModel: ObservableObject {
 
     func inputOverlayOffset(atCol col: UInt16, row: UInt16) -> Int? {
         guard let overlay else { return nil }
+        guard Int(row) < Int(rows) else { return nil }
         let cols = max(Int(self.cols), 1)
-        guard let primaryRow = primaryRow(forVisibleRow: Int(row)) else {
-            return nil
-        }
-        let start = Int(overlay.anchorRow) * cols + Int(overlay.anchorCol)
+        // Resolve the clicked visible row to primary coordinates without an
+        // upper bound: a shifted multi-line overlay legitimately occupies
+        // rows past the live grid bottom.
+        let primaryRow = windowStartRow() + Int(row) - term.scrollbackLength
+        guard primaryRow >= 0 else { return nil }
         let target = primaryRow * cols + Int(col)
-        let end = start + overlay.textScalars.count
-        guard target >= start else { return nil }
-        guard target <= end || primaryRow == end / cols else { return nil }
-        return min(max(0, target - start), overlay.textScalars.count)
+        let positions = overlayLayoutPositions(overlay)
+        // Exact cell hit wins; clicks past the end of a line snap to the
+        // last offset laid out on that row.
+        var lineEnd: Int?
+        for (offset, linear) in positions.enumerated() {
+            if linear == target {
+                return min(offset, overlay.textScalars.count)
+            }
+            if linear / cols == primaryRow, linear < target {
+                lineEnd = offset
+            }
+        }
+        return lineEnd
     }
 
     /// Updates or inserts a peer cursor. Called by session code when a
@@ -254,13 +259,12 @@ final class GridModel: ObservableObject {
             return
         }
 
+        let positions = overlayLayoutPositions(overlay)
         var next: [UserCursor] = []
         next.reserveCapacity(overlay.cursors.count)
         for cursor in overlay.cursors {
-            guard let position = gridPosition(
-                forOffset: cursor.offset,
-                anchorCol: overlay.anchorCol,
-                anchorRow: overlay.anchorRow)
+            let offset = min(max(0, cursor.offset), positions.count - 1)
+            guard let position = gridPosition(forPrimaryLinear: positions[offset])
             else {
                 continue
             }
@@ -312,29 +316,45 @@ final class GridModel: ObservableObject {
         epoch &+= 1
     }
 
-    private func gridPosition(forOffset offset: Int,
-                              anchorCol: UInt16,
-                              anchorRow: UInt16) -> (col: UInt16, row: UInt16)?
+    /// Grid layout of the overlay text: one linear primary-grid index per
+    /// scalar offset, plus a trailing entry for the caret-at-end position.
+    /// A newline occupies the cell after the last glyph on its row and moves
+    /// layout to the start of the next row; all other scalars advance by one
+    /// cell, wrapping naturally at the right edge.
+    private func overlayLayoutPositions(_ overlay: InputOverlay) -> [Int] {
+        let cols = max(Int(self.cols), 1)
+        var linear = Int(overlay.anchorRow) * cols + Int(overlay.anchorCol)
+        var positions: [Int] = []
+        positions.reserveCapacity(overlay.textScalars.count + 1)
+        for scalar in overlay.textScalars {
+            positions.append(linear)
+            linear = scalar == "\n" ? (linear / cols + 1) * cols : linear + 1
+        }
+        positions.append(linear)
+        return positions
+    }
+
+    /// Rows by which the overlay block extends past the bottom of the grid.
+    /// The visible window shifts up by this amount so multi-line input typed
+    /// at a bottom-row prompt stays fully visible.
+    private func overlayBottomOverflow() -> Int {
+        guard let overlay, !term.isUsingAlternateScreen else { return 0 }
+        let cols = max(Int(self.cols), 1)
+        guard let lastLinear = overlayLayoutPositions(overlay).last else { return 0 }
+        return max(0, lastLinear / cols - (Int(rows) - 1))
+    }
+
+    private func gridPosition(forPrimaryLinear linear: Int) -> (col: UInt16, row: UInt16)?
     {
         let cols = max(Int(self.cols), 1)
-        let start = Int(anchorRow) * cols + Int(anchorCol)
-        let linear = start + max(0, offset)
-        let primaryRow = linear / cols
-        guard let visibleRow = visibleRow(forPrimaryRow: primaryRow) else {
+        guard let visibleRow = visibleRow(forPrimaryRow: linear / cols) else {
             return nil
         }
         return (UInt16(linear % cols), UInt16(visibleRow))
     }
 
-    private func linearIndex(forOffset offset: Int,
-                             anchorCol: UInt16,
-                             anchorRow: UInt16) -> Int?
-    {
-        let pos = gridPosition(
-            forOffset: offset,
-            anchorCol: anchorCol,
-            anchorRow: anchorRow)
-        guard let pos else { return nil }
+    private func linearIndex(forPrimaryLinear linear: Int) -> Int? {
+        guard let pos = gridPosition(forPrimaryLinear: linear) else { return nil }
         return linearIndex(col: pos.col, row: pos.row)
     }
 
@@ -355,6 +375,7 @@ final class GridModel: ObservableObject {
 
     private func windowStartRow(scrollOffset: Int? = nil) -> Int {
         term.scrollbackLength - (scrollOffset ?? effectiveScrollOffset())
+            + overlayBottomOverflow()
     }
 
     private func visibleRow(forPrimaryRow primaryRow: Int) -> Int? {
@@ -364,21 +385,12 @@ final class GridModel: ObservableObject {
         return visibleRow
     }
 
-    private func primaryRow(forVisibleRow visibleRow: Int) -> Int? {
-        let absoluteRow = windowStartRow() + visibleRow
-        let primaryRow = absoluteRow - term.scrollbackLength
-        guard primaryRow >= 0, primaryRow < Int(rows) else { return nil }
-        return primaryRow
-    }
-
-    private func copyScrolledSnapshot(primary: UnsafeBufferPointer<ct_cell>,
-                                      offset: Int)
-    {
+    private func copyWindowedSnapshot(primary: UnsafeBufferPointer<ct_cell>) {
         guard !overlaySnapshot.isEmpty else { return }
         let cols = max(Int(self.cols), 1)
         let rows = max(Int(self.rows), 1)
         let scrollbackLength = term.scrollbackLength
-        let startRow = scrollbackLength - offset
+        let startRow = windowStartRow()
 
         var visibleRow = 0
         if startRow < scrollbackLength {
@@ -405,6 +417,12 @@ final class GridModel: ObservableObject {
             if srcStart + cols <= primary.count {
                 for i in 0..<cols {
                     overlaySnapshot[dstStart + i] = primary[srcStart + i]
+                }
+            } else {
+                // Rows past the live grid (a shifted multi-line overlay draws
+                // into them) render as blank cells in the default style.
+                for i in 0..<cols {
+                    overlaySnapshot[dstStart + i] = ct_cell()
                 }
             }
             visibleRow += 1
