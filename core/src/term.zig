@@ -162,6 +162,23 @@ export fn ct_term_bracketed_paste_mode(t: ?*Term) c_int {
     return 0;
 }
 
+/// Returns the kitty keyboard protocol flags pushed by the running app
+/// (CSI > flags u). Bit 0 (disambiguate escape codes) means modified keys
+/// like Shift+Enter should be sent CSI-u encoded (\x1b[13;2u).
+export fn ct_term_kitty_flags(t: ?*Term) u32 {
+    if (t) |p| return p.grid.kitty_flags;
+    return 0;
+}
+
+/// Drains pending terminal-query replies (kitty CSI ? u, DA1) generated
+/// while feeding output. The PTY owner writes these bytes back to the PTY;
+/// peers (no PTY) never call this and the small queue simply overwrites.
+/// Returns the number of bytes written into `out`.
+export fn ct_term_take_response(t: ?*Term, out: [*]u8, cap: usize) usize {
+    const term = t orelse return 0;
+    return term.grid.takeResponse(out[0..cap]);
+}
+
 /// Retrieve the OSC 8 URL for the cell at (col, row), if any.
 /// Writes up to `cap` bytes (NOT NUL-terminated) into `out`.
 /// Returns the URL length, or 0 if the cell has no URL or coords are out of bounds.

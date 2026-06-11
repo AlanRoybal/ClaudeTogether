@@ -89,6 +89,16 @@ uint32_t ct_term_dirty_epoch(ct_term *t);
 uint32_t ct_term_mouse_mode(ct_term *t);
 int      ct_term_bracketed_paste_mode(ct_term *t);
 
+/* Kitty keyboard protocol flags pushed by the running app (CSI > flags u).
+ * Bit 0 set means modified keys (e.g. Shift+Enter) should be sent CSI-u
+ * encoded. */
+uint32_t ct_term_kitty_flags(ct_term *t);
+
+/* Drains pending terminal-query replies (kitty CSI ? u, DA1) generated while
+ * feeding output. The PTY owner writes these bytes back to the PTY.
+ * Returns the number of bytes written into `out`. */
+size_t   ct_term_take_response(ct_term *t, uint8_t *out, size_t cap);
+
 /* Retrieve the OSC 8 URL for the cell at (col, row), if any.
  * Writes up to `cap` bytes (NOT NUL-terminated) into `out`.
  * Returns the URL length, or 0 if the cell has no URL. */
