@@ -1896,10 +1896,11 @@ final class TerminalModel: ObservableObject {
            let pane = tabs.first(where: { $0.id == tabId })?.splitPane
         {
             pane.grid.scrollToBottom()
+            let paneBytes = normalizedShiftReturn(bytes)
             if let pty = pane.pty {
-                pty.send(bytes)
+                pty.send(paneBytes)
             } else if sessionManager.role == .peer, sessionManager.state == .running {
-                sessionManager.sendPaneInput(paneId: pane.id, data: Data(bytes))
+                sessionManager.sendPaneInput(paneId: pane.id, data: Data(paneBytes))
             }
             return
         }
@@ -1908,6 +1909,10 @@ final class TerminalModel: ObservableObject {
         if handleSharedInputKey(bytes, tabId: tabId) {
             return
         }
+        // Shared input didn't consume the key (raw mode, view-only, local
+        // tab) — from here every path forwards raw bytes to a PTY, where
+        // Shift+Return must look like a plain Return.
+        let bytes = normalizedShiftReturn(bytes)
         if let pty = tabs.first(where: { $0.id == tabId })?.pty {
             pty.send(bytes)
             return
@@ -1920,6 +1925,10 @@ final class TerminalModel: ObservableObject {
                 sessionManager.sendTabInput(tabId: tabId, data: payload)
             }
         }
+    }
+
+    private func normalizedShiftReturn(_ bytes: [UInt8]) -> [UInt8] {
+        bytes == TerminalKeySequences.shiftReturn ? [0x0D] : bytes
     }
 
     func handleTerminalMouseCell(col: UInt16, row: UInt16, forTabId tabId: UInt32) -> Bool {
@@ -2442,6 +2451,9 @@ final class TerminalModel: ObservableObject {
         switch bytes {
         case [0x0D]:
             return SharedInputRequest(actor: actor, kind: .commit)
+        case TerminalKeySequences.shiftReturn:
+            // Shift+Enter: start a new line in the block instead of committing.
+            return SharedInputRequest(actor: actor, kind: .insertText, text: "\n")
         case [0x7F]:
             return SharedInputRequest(actor: actor, kind: .backspace)
         case [0x03]:
@@ -2611,8 +2623,7 @@ final class TerminalModel: ObservableObject {
                 // activation time (see activateSharedInputAtCurrentCursor),
                 // so we just send the committed line and Enter.
                 sharedInputNeedsLineClear.remove(tabId)
-                let payload = Array(line.utf8) + [0x0D]
-                pty.send(payload)
+                pty.send(committedLinePayload(line, tabId: tabId))
             }
         case .interrupt:
             syncGridSharedInputOverlay(tabId: tabId)
@@ -2624,6 +2635,24 @@ final class TerminalModel: ObservableObject {
                 pty.send([0x03])
             }
         }
+    }
+
+    /// Bytes sent to the PTY for a committed shared-input line. Multi-line
+    /// blocks (Shift+Enter) go through bracketed paste when the foreground
+    /// app advertises it (zsh/readline keep the block as one editable buffer);
+    /// otherwise each newline degrades to a CR, equivalent to typing the
+    /// lines one at a time.
+    private func committedLinePayload(_ line: String, tabId: UInt32) -> [UInt8] {
+        guard line.contains("\n") else {
+            return Array(line.utf8) + [0x0D]
+        }
+        if tabs.first(where: { $0.id == tabId })?.grid.term.bracketedPasteMode == true {
+            return Array("\u{1B}[200~".utf8)
+                + Array(line.utf8)
+                + Array("\u{1B}[201~".utf8)
+                + [0x0D]
+        }
+        return Array(line.replacingOccurrences(of: "\n", with: "\r").utf8) + [0x0D]
     }
 
     private func handleHostPtyOutput(tabId: UInt32) {
@@ -3297,7 +3326,7 @@ final class TerminalModel: ObservableObject {
     }
 
     private func lastPathToken(in text: String) -> String {
-        text.components(separatedBy: .whitespaces).last ?? ""
+        text.components(separatedBy: .whitespacesAndNewlines).last ?? ""
     }
 
     /// True when the token being completed is the command word (no prior

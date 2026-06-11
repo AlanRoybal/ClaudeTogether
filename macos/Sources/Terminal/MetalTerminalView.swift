@@ -635,7 +635,13 @@ final class MetalTerminalNSView: NSView {
             if command { return [0x01] } // Ctrl-A: beginning of line.
             if option { return Array("\u{1B}b".utf8) } // Meta-b: previous word.
             return Array("\u{1B}[D".utf8)
-        case kVK_Return:     return [0x0D]
+        case kVK_Return:
+            // NSEvent reports Shift+Return as a plain \r, so encode it as the
+            // xterm CSI-u sequence to keep it distinguishable downstream. The
+            // shared input line turns it into a newline insert; every raw PTY
+            // path normalizes it back to \r (see TerminalModel.handleKey).
+            if flags.contains(.shift) { return TerminalKeySequences.shiftReturn }
+            return [0x0D]
         case kVK_Tab:        return [0x09]
         case kVK_Delete:
             if command { return [0x15] } // Ctrl-U: delete to beginning.
@@ -766,6 +772,13 @@ final class MetalTerminalNSView: NSView {
         }
         return currentLayoutDrawableSize()
     }
+}
+
+enum TerminalKeySequences {
+    /// xterm CSI-u (modifyOtherKeys) encoding of Shift+Return. Never sent to
+    /// a PTY: it exists so the model can tell Shift+Enter apart from Enter,
+    /// and is normalized back to \r on every raw-byte path.
+    static let shiftReturn: [UInt8] = Array("\u{1B}[13;2u".utf8)
 }
 
 enum TerminalPasteSanitizer {
