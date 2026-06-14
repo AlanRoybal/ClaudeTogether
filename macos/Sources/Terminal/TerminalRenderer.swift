@@ -78,6 +78,15 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     /// floor doesn't re-run the search every frame. Cleared when the theme
     /// changes (the themed keys change with it).
     private var contrastAdjustCache: [UInt64: UInt32] = [:]
+    /// When true, neutral (grayscale) block backgrounds an app draws with the
+    /// opposite light/dark polarity to the active theme — e.g. Claude Code's
+    /// dark user-message bar shown on a light theme — are remapped to a subtle
+    /// theme-derived highlight so the bar reads as native to the theme instead
+    /// of a fixed dark/light strip. Runs per-renderer, so each participant in a
+    /// shared session sees it resolved against their own theme.
+    var adaptBlockBackgrounds: Bool = true
+    /// Cache of themedBg → theme-adapted block background. Cleared on theme change.
+    private var blockBgAdaptCache: [UInt32: UInt32] = [:]
 
     private(set) var cols: UInt16 = 80
     private(set) var rows: UInt16 = 24
@@ -249,6 +258,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         fgColorMap = newTheme.fgColorMap
         bgColorMap = newTheme.bgColorMap
         contrastAdjustCache.removeAll(keepingCapacity: true)
+        blockBgAdaptCache.removeAll(keepingCapacity: true)
         let bg = newTheme.background
         view?.clearColor = MTLClearColor(
             red:   Double((bg >> 16) & 0xFF) / 255,
@@ -401,7 +411,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                     // We still emit a BG quad for every cell so selection
                     // highlighting is solid; only the text glyph pass skips
                     // trailing halves.
-                    let pBg = bgColorMap[c.bg] ?? c.bg
+                    let pBg = themeAdaptedBlockBackground(bgColorMap[c.bg] ?? c.bg)
                     let fg = unpack(contrastAdjustedForeground(
                         fgColorMap[c.fg] ?? c.fg, on: pBg))
                     let bg = unpack(pBg)
@@ -645,6 +655,37 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             255)
     }
 
+    // MARK: theme-adaptive block backgrounds
+
+    /// Remaps a fixed neutral block background (e.g. Claude Code's user-message
+    /// bar) to a subtle theme-derived highlight when its light/dark polarity is
+    /// opposite the active theme — so it stops reading as a foreign dark/light
+    /// strip and instead matches the theme. Colored backgrounds (hue present),
+    /// the theme's own background, and same-polarity neutrals pass through
+    /// unchanged. Memoized per themed background color.
+    private func themeAdaptedBlockBackground(_ bg: UInt32) -> UInt32 {
+        guard adaptBlockBackgrounds else { return bg }
+        if bg == theme.background { return bg }
+        if let cached = blockBgAdaptCache[bg] { return cached }
+
+        let result: UInt32
+        let r = (bg >> 16) & 0xFF, g = (bg >> 8) & 0xFF, b = bg & 0xFF
+        let chroma = Int(max(r, max(g, b))) - Int(min(r, min(g, b)))
+        // Only touch near-neutral blocks whose polarity fights the theme.
+        if chroma <= 28,
+           (relativeLuminance(bg) < 0.5) != (relativeLuminance(theme.background) < 0.5)
+        {
+            // A subtle elevation off the theme background — toward the theme
+            // foreground, so it darkens on light themes and lightens on dark
+            // ones. Distinct from selectionBg to avoid looking like a selection.
+            result = blend(theme.background, theme.foreground, 0.16)
+        } else {
+            result = bg
+        }
+        blockBgAdaptCache[bg] = result
+        return result
+    }
+
     // MARK: minimum-contrast floor
 
     /// Returns `fg` unchanged if it already meets `minimumContrastRatio`
@@ -769,7 +810,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
 
             let fg = unpack(contrastAdjustedForeground(
                 fgColorMap[startCell.fg] ?? startCell.fg,
-                on: bgColorMap[startCell.bg] ?? startCell.bg))
+                on: themeAdaptedBlockBackground(bgColorMap[startCell.bg] ?? startCell.bg)))
             var ti = TextInstance()
             ti.gridPos   = SIMD2<UInt16>(UInt16(x), UInt16(y))
             ti.offset    = SIMD2<Int16>(Int16(entry.bearingX),
