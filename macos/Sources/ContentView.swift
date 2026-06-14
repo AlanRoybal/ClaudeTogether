@@ -413,6 +413,12 @@ final class TerminalModel: ObservableObject {
     private var sharedInputs: [UInt32: SharedInputState] = [:]
     private var sharedInputPromptTimers: [UInt32: Timer] = [:]
     private var sharedInputTransientOutputTimers: [UInt32: Timer] = [:]
+    /// Number of structural newlines we've forwarded to the foreground app to
+    /// keep its own input box the same height as a multi-line shared-input
+    /// block. Only non-zero for apps that manage their own input box (kitty
+    /// keyboard protocol: Claude Code, codex). Keyed by tab id. See
+    /// `syncForegroundAppInputBoxHeight`.
+    private var sharedInputAppBoxExtraLines: [UInt32: Int] = [:]
     /// Tabs whose shared input was activated with pre-existing text (typed
     /// before sharing started, or recalled via ↑ history). The commit handler
     /// prepends Ctrl+U to clear the shell's readline buffer before sending
@@ -1000,9 +1006,13 @@ final class TerminalModel: ObservableObject {
 
         let cwd = rootPath ?? FileManager.default.homeDirectoryForCurrentUser.path
         let p = PTYSession()
-        p.onOutput = { [weak self] bytes in
+        p.onOutput = { [weak self, weak p] bytes in
             guard let self else { return }
             grid.feed(bytes)
+            let queryReply = grid.term.takeQueryResponse()
+            if !queryReply.isEmpty {
+                p?.send(queryReply)
+            }
             if self.sessionManager.state == .running {
                 self.sessionManager.sendPanePtyOutput(paneId: paneId, data: Data(bytes))
             }
@@ -1099,9 +1109,16 @@ final class TerminalModel: ObservableObject {
             return nil
         }
         // Host: PTY output → feed this tab's grid AND fan out to peers.
-        pty.onOutput = { [weak self] bytes in
+        pty.onOutput = { [weak self, weak pty] bytes in
             guard let self = self else { return }
             grid.feed(bytes)
+            // Answer terminal capability queries (kitty CSI ? u, DA1) the
+            // running app embedded in its output. Only the PTY owner replies;
+            // peer grids queue the same bytes and simply never drain them.
+            let queryReply = grid.term.takeQueryResponse()
+            if !queryReply.isEmpty {
+                pty?.send(queryReply)
+            }
             let shouldShare = self.sessionManager.role == .host
                 && self.sessionManager.state == .running
             NSLog("[ct] pty->out tab=%u bytes=%d share=%@",
@@ -1896,10 +1913,11 @@ final class TerminalModel: ObservableObject {
            let pane = tabs.first(where: { $0.id == tabId })?.splitPane
         {
             pane.grid.scrollToBottom()
+            let paneBytes = resolvedShiftReturn(bytes, grid: pane.grid)
             if let pty = pane.pty {
-                pty.send(bytes)
+                pty.send(paneBytes)
             } else if sessionManager.role == .peer, sessionManager.state == .running {
-                sessionManager.sendPaneInput(paneId: pane.id, data: Data(bytes))
+                sessionManager.sendPaneInput(paneId: pane.id, data: Data(paneBytes))
             }
             return
         }
@@ -1908,6 +1926,12 @@ final class TerminalModel: ObservableObject {
         if handleSharedInputKey(bytes, tabId: tabId) {
             return
         }
+        // Shared input didn't consume the key (no session, view-only, TUI) —
+        // from here every path forwards raw bytes to a PTY, so translate the
+        // Shift+Return sentinel into whatever the running app understands.
+        let bytes = resolvedShiftReturn(
+            bytes,
+            grid: tabs.first(where: { $0.id == tabId })?.grid)
         if let pty = tabs.first(where: { $0.id == tabId })?.pty {
             pty.send(bytes)
             return
@@ -1920,6 +1944,26 @@ final class TerminalModel: ObservableObject {
                 sessionManager.sendTabInput(tabId: tabId, data: payload)
             }
         }
+    }
+
+    /// Translates the Shift+Return sentinel for direct PTY delivery, by
+    /// descending capability of the running app:
+    /// - kitty keyboard protocol pushed (Claude Code, codex): send the real
+    ///   CSI-u encoding; the app inserts the newline itself.
+    /// - line-mode app with bracketed paste (zsh/bash prompts, claude
+    ///   without kitty): paste a bare newline into the edit buffer.
+    /// - anything else (vim and other alt-screen TUIs): a plain Return,
+    ///   byte-identical to the pre-Shift+Enter behavior.
+    private func resolvedShiftReturn(_ bytes: [UInt8], grid: GridModel?) -> [UInt8] {
+        guard bytes == TerminalKeySequences.shiftReturn else { return bytes }
+        guard let grid else { return [0x0D] }
+        if grid.term.kittyKeyboardFlags & 1 != 0 {
+            return TerminalKeySequences.shiftReturn
+        }
+        if !grid.isUsingAlternateScreen, grid.term.bracketedPasteMode {
+            return Array("\u{1B}[200~\n\u{1B}[201~".utf8)
+        }
+        return [0x0D]
     }
 
     func handleTerminalMouseCell(col: UInt16, row: UInt16, forTabId tabId: UInt32) -> Bool {
@@ -2442,6 +2486,9 @@ final class TerminalModel: ObservableObject {
         switch bytes {
         case [0x0D]:
             return SharedInputRequest(actor: actor, kind: .commit)
+        case TerminalKeySequences.shiftReturn:
+            // Shift+Enter: start a new line in the block instead of committing.
+            return SharedInputRequest(actor: actor, kind: .insertText, text: "\n")
         case [0x7F]:
             return SharedInputRequest(actor: actor, kind: .backspace)
         case [0x03]:
@@ -2567,6 +2614,12 @@ final class TerminalModel: ObservableObject {
         _ = state.ensureParticipant(request.actor, bumpRevision: false)
         let effect = state.apply(request, bumpRevision: true)
         sharedInputs[tabId] = state
+        // Grow/shrink a self-managing foreground app's input box to match the
+        // block's line count before painting, so multi-line input expands the
+        // app's own box instead of overdrawing its UI. No-op for plain shells.
+        if case .none = effect {
+            syncForegroundAppInputBoxHeight(tabId: tabId)
+        }
         syncGridSharedInputOverlay(tabId: tabId)
         broadcastSharedInputSnapshot(tabId: tabId)
         handleSharedInputEffect(tabId: tabId, effect)
@@ -2609,10 +2662,13 @@ final class TerminalModel: ObservableObject {
                 sharedInputPromptTimers.removeValue(forKey: tabId)?.invalidate()
                 // The shell's readline buffer was cleared with Ctrl+U at
                 // activation time (see activateSharedInputAtCurrentCursor),
-                // so we just send the committed line and Enter.
+                // so we just send the committed line and Enter. For a
+                // self-managing app whose box we grew to mirror the block,
+                // first collapse those empty structural lines so the committed
+                // text pastes into a clean single-line box.
                 sharedInputNeedsLineClear.remove(tabId)
-                let payload = Array(line.utf8) + [0x0D]
-                pty.send(payload)
+                pty.send(clearForwardedAppInputBox(tabId: tabId)
+                    + committedLinePayload(line, tabId: tabId))
             }
         case .interrupt:
             syncGridSharedInputOverlay(tabId: tabId)
@@ -2621,9 +2677,30 @@ final class TerminalModel: ObservableObject {
                let pty = tabs.first(where: { $0.id == tabId })?.pty
             {
                 sharedInputPromptTimers.removeValue(forKey: tabId)?.invalidate()
+                // Ctrl+C clears the app's own input, so just drop our tracker
+                // without sending collapse backspaces.
+                sharedInputAppBoxExtraLines[tabId] = nil
                 pty.send([0x03])
             }
         }
+    }
+
+    /// Bytes sent to the PTY for a committed shared-input line. Multi-line
+    /// blocks (Shift+Enter) go through bracketed paste when the foreground
+    /// app advertises it (zsh/readline keep the block as one editable buffer);
+    /// otherwise each newline degrades to a CR, equivalent to typing the
+    /// lines one at a time.
+    private func committedLinePayload(_ line: String, tabId: UInt32) -> [UInt8] {
+        guard line.contains("\n") else {
+            return Array(line.utf8) + [0x0D]
+        }
+        if tabs.first(where: { $0.id == tabId })?.grid.term.bracketedPasteMode == true {
+            return Array("\u{1B}[200~".utf8)
+                + Array(line.utf8)
+                + Array("\u{1B}[201~".utf8)
+                + [0x0D]
+        }
+        return Array(line.replacingOccurrences(of: "\n", with: "\r").utf8) + [0x0D]
     }
 
     private func handleHostPtyOutput(tabId: UInt32) {
@@ -2858,6 +2935,9 @@ final class TerminalModel: ObservableObject {
                                        bumpRevision: Bool) {
         sharedInputTransientOutputTimers.removeValue(forKey: tabId)?.invalidate()
         sharedInputNeedsLineClear.remove(tabId)
+        // The app has moved on (real output / teardown); drop our box-height
+        // tracker without trying to collapse its lines.
+        sharedInputAppBoxExtraLines[tabId] = nil
         var state = sharedInputs[tabId] ?? SharedInputState()
         _ = state.deactivate(bumpRevision: bumpRevision)
         sharedInputs[tabId] = state
@@ -2890,9 +2970,78 @@ final class TerminalModel: ObservableObject {
             return
         }
         let cursor = grid.term.cursor()
-        state.overrideAnchor(anchorCol: cursor.x, anchorRow: cursor.y)
+        let extraLines = sharedInputAppBoxExtraLines[tabId] ?? 0
+        if extraLines > 0 {
+            // The foreground app manages its own (now multi-line) input box and
+            // we've grown it by `extraLines` rows to match the overlay. Its
+            // cursor therefore sits on the LAST input row; the overlay must
+            // stay anchored at the FIRST input row so it paints over the whole
+            // box. Keep the input-start column (line 1's prompt end) intact —
+            // the app's cursor column on continuation lines doesn't map to it.
+            let anchorRow = max(0, Int(cursor.y) - extraLines)
+            state.overrideAnchor(anchorCol: state.anchorCol,
+                                 anchorRow: UInt16(anchorRow))
+        } else {
+            state.overrideAnchor(anchorCol: cursor.x, anchorRow: cursor.y)
+        }
         sharedInputs[tabId] = state
         syncGridSharedInputOverlay(tabId: tabId)
+    }
+
+    /// True when the foreground app on `tabId` advertises the kitty keyboard
+    /// protocol — the apps (Claude Code, codex) that draw and manage their own
+    /// multi-line input box, as opposed to plain shell prompts.
+    private func foregroundAppManagesInputBox(tabId: UInt32) -> Bool {
+        guard let grid = tabs.first(where: { $0.id == tabId })?.grid else {
+            return false
+        }
+        return grid.term.kittyKeyboardFlags & 1 != 0
+    }
+
+    /// Keep a self-managing foreground app's own input box the same height as
+    /// the multi-line shared-input block by forwarding bare structural
+    /// newlines (Shift+Enter, CSI-u) when the block grows and backspaces when
+    /// it shrinks. Without this the overlay's extra lines paint on top of the
+    /// app's unchanged UI; with it, the app reserves the vertical space (its
+    /// box grows, pushing its own status/footer down) so the block reads as a
+    /// real expanding input. Host-only; the app only ever receives empty
+    /// structural lines — the actual text is reconciled on commit.
+    private func syncForegroundAppInputBoxHeight(tabId: UInt32) {
+        guard sessionManager.role == .host,
+              let tab = tabs.first(where: { $0.id == tabId }),
+              let pty = tab.pty,
+              let state = sharedInputs[tabId], state.isActive,
+              foregroundAppManagesInputBox(tabId: tabId)
+        else {
+            return
+        }
+        let desired = state.textScalars.reduce(0) { $0 + ($1 == "\n" ? 1 : 0) }
+        let current = sharedInputAppBoxExtraLines[tabId] ?? 0
+        guard desired != current else { return }
+        // The app is about to repaint its (re)sized box — don't let that output
+        // tear the overlay down.
+        preserveSharedInputAcrossTransientOutput(tabId: tabId)
+        if desired > current {
+            var payload: [UInt8] = []
+            for _ in 0..<(desired - current) {
+                payload.append(contentsOf: TerminalKeySequences.shiftReturn)
+            }
+            pty.send(payload)
+        } else {
+            // Collapse the empty structural lines the app is still holding.
+            pty.send(Array(repeating: UInt8(0x7F), count: current - desired))
+        }
+        sharedInputAppBoxExtraLines[tabId] = desired
+    }
+
+    /// Collapse any structural lines we forwarded to the foreground app back to
+    /// a single empty input line, so the committed block can be pasted cleanly.
+    /// Returns the bytes to send the app to clear them (empty when none).
+    private func clearForwardedAppInputBox(tabId: UInt32) -> [UInt8] {
+        let extra = sharedInputAppBoxExtraLines[tabId] ?? 0
+        sharedInputAppBoxExtraLines[tabId] = nil
+        guard extra > 0 else { return [] }
+        return Array(repeating: UInt8(0x7F), count: extra)
     }
 
     private func broadcastTerminalSnapshot() {
@@ -3297,7 +3446,7 @@ final class TerminalModel: ObservableObject {
     }
 
     private func lastPathToken(in text: String) -> String {
-        text.components(separatedBy: .whitespaces).last ?? ""
+        text.components(separatedBy: .whitespacesAndNewlines).last ?? ""
     }
 
     /// True when the token being completed is the command word (no prior
@@ -3401,6 +3550,7 @@ final class TerminalModel: ObservableObject {
         }
         sharedInputPromptTimers.removeAll()
         sharedInputTransientOutputTimers.removeAll()
+        sharedInputAppBoxExtraLines.removeAll()
         sharedInputs.removeAll()
         syncAllGridSharedInputOverlays()
         inputAutocomplete.dismiss()

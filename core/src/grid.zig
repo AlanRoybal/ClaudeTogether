@@ -137,6 +137,21 @@ pub const Grid = struct {
 
     bracketed_paste_mode: bool = true,
 
+    /// Kitty keyboard protocol (CSI u) progressive-enhancement flags set by
+    /// the running app via CSI > flags u (push) / CSI < n u (pop) /
+    /// CSI = flags ; mode u (set). Bit 0 (disambiguate escape codes) is what
+    /// the Swift host consults to decide whether modified keys like
+    /// Shift+Enter should be sent CSI-u encoded.
+    kitty_flags: u8 = 0,
+    kitty_stack: [8]u8 = [_]u8{0} ** 8,
+    kitty_depth: u8 = 0,
+
+    /// Pending reply bytes for terminal queries found in the output stream
+    /// (kitty CSI ? u, DA1 CSI c). The host drains this via takeResponse and
+    /// writes it back to the PTY; peers have no PTY and simply drop it.
+    response_buf: [64]u8 = undefined,
+    response_len: u8 = 0,
+
     // OSC 8 hyperlink state
     url_pool: [256]?[]const u8 = [_]?[]const u8{null} ** 256,
     url_next_id: u8 = 1,   // cycles 1–255; 0 reserved for "no link"
@@ -419,7 +434,26 @@ pub const Grid = struct {
             if (p.* > 65535) p.* = 65535;
         }
         if (c.private == '?') {
+            if (c.final == 'u') {
+                // Kitty keyboard protocol query: reply with current flags.
+                self.queueResponseFmt("\x1b[?{d}u", .{self.kitty_flags});
+                return;
+            }
             self.privateMode(c);
+            return;
+        }
+        // Privately-prefixed sequences (CSI >/=/< ...) are distinct control
+        // functions — letting them fall through would misread e.g. the kitty
+        // pop CSI < u as SCORC restore-cursor and CSI > 4;2 m as SGR.
+        if (c.private == '>' or c.private == '<' or c.private == '=') {
+            self.kittyKeyboard(c);
+            return;
+        }
+        if (c.final == 'c' and c.get(0, 0) == 0) {
+            // DA1: identify as a VT220-class color terminal. Apps (crossterm,
+            // notably) use the DA1 reply as the terminator for capability
+            // probes like the kitty CSI ? u query.
+            self.queueResponse("\x1b[?62;22c");
             return;
         }
         switch (c.final) {
@@ -467,6 +501,63 @@ pub const Grid = struct {
             'u' => self.restoreCursor(),
             else => {},
         }
+    }
+
+    /// CSI with a '>'/'<'/'=' private prefix. The only ones we act on are the
+    /// kitty keyboard protocol stack ops (final 'u'); the rest (XTMODKEYS
+    /// CSI > m, XTVERSION CSI > q, ...) are deliberately ignored.
+    fn kittyKeyboard(self: *Grid, c: vt.Csi) void {
+        if (c.final != 'u') return;
+        switch (c.private) {
+            '>' => { // push current flags, then set
+                if (self.kitty_depth < self.kitty_stack.len) {
+                    self.kitty_stack[self.kitty_depth] = self.kitty_flags;
+                    self.kitty_depth += 1;
+                }
+                self.kitty_flags = @intCast(@max(0, @min(31, c.get(0, 0))));
+            },
+            '<' => { // pop n entries
+                var n = @max(1, c.get(0, 1));
+                while (n > 0) : (n -= 1) {
+                    if (self.kitty_depth == 0) {
+                        self.kitty_flags = 0;
+                        break;
+                    }
+                    self.kitty_depth -= 1;
+                    self.kitty_flags = self.kitty_stack[self.kitty_depth];
+                }
+            },
+            '=' => { // set flags in place (mode param: 1 set, 2 or, 3 clear)
+                const flags: u8 = @intCast(@max(0, @min(31, c.get(0, 0))));
+                switch (c.get(1, 1)) {
+                    2 => self.kitty_flags |= flags,
+                    3 => self.kitty_flags &= ~flags,
+                    else => self.kitty_flags = flags,
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn queueResponse(self: *Grid, bytes: []const u8) void {
+        if (self.response_len + bytes.len > self.response_buf.len) return;
+        @memcpy(self.response_buf[self.response_len..][0..bytes.len], bytes);
+        self.response_len += @intCast(bytes.len);
+    }
+
+    fn queueResponseFmt(self: *Grid, comptime fmt: []const u8, args: anytype) void {
+        var tmp: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&tmp, fmt, args) catch return;
+        self.queueResponse(s);
+    }
+
+    /// Copies pending query replies into `out` and clears the queue.
+    /// Returns the number of bytes copied.
+    pub fn takeResponse(self: *Grid, out: []u8) usize {
+        const n = @min(out.len, @as(usize, self.response_len));
+        @memcpy(out[0..n], self.response_buf[0..n]);
+        self.response_len = 0;
+        return n;
     }
 
     fn privateMode(self: *Grid, c: vt.Csi) void {
@@ -1073,4 +1164,77 @@ test "mouse modes via DECSET/DECRST update bitmask" {
     disable_all.params[3] = 1015;
     g.apply(.{ .csi = disable_all });
     try std.testing.expectEqual(@as(u32, 0), g.mouse_mode);
+}
+
+test "kitty keyboard push/pop tracks flags and leaves cursor alone" {
+    var g = try Grid.init(std.testing.allocator, 10, 5);
+    defer g.deinit();
+    g.cursor_x = 4;
+    g.cursor_y = 3;
+
+    // CSI > 1 u — push (what Claude Code emits around every keystroke).
+    var push = vt.Csi{ .final = 'u', .private = '>', .param_count = 1 };
+    push.params[0] = 1;
+    g.apply(.{ .csi = push });
+    try std.testing.expectEqual(@as(u8, 1), g.kitty_flags);
+    try std.testing.expectEqual(@as(u16, 4), g.cursor_x);
+    try std.testing.expectEqual(@as(u16, 3), g.cursor_y);
+
+    // CSI < u — pop. Must NOT be treated as SCORC restore-cursor.
+    const pop = vt.Csi{ .final = 'u', .private = '<', .param_count = 0 };
+    g.apply(.{ .csi = pop });
+    try std.testing.expectEqual(@as(u8, 0), g.kitty_flags);
+    try std.testing.expectEqual(@as(u16, 4), g.cursor_x);
+    try std.testing.expectEqual(@as(u16, 3), g.cursor_y);
+
+    // Pop on an empty stack stays at zero.
+    g.apply(.{ .csi = pop });
+    try std.testing.expectEqual(@as(u8, 0), g.kitty_flags);
+}
+
+test "kitty set mode ors and clears flags" {
+    var g = try Grid.init(std.testing.allocator, 4, 2);
+    defer g.deinit();
+    var set = vt.Csi{ .final = 'u', .private = '=', .param_count = 2 };
+    set.params[0] = 5;
+    set.params[1] = 1; // mode 1: assign
+    g.apply(.{ .csi = set });
+    try std.testing.expectEqual(@as(u8, 5), g.kitty_flags);
+    set.params[0] = 2;
+    set.params[1] = 2; // mode 2: or
+    g.apply(.{ .csi = set });
+    try std.testing.expectEqual(@as(u8, 7), g.kitty_flags);
+    set.params[0] = 5;
+    set.params[1] = 3; // mode 3: clear
+    g.apply(.{ .csi = set });
+    try std.testing.expectEqual(@as(u8, 2), g.kitty_flags);
+}
+
+test "kitty query and DA1 queue replies" {
+    var g = try Grid.init(std.testing.allocator, 4, 2);
+    defer g.deinit();
+
+    var push = vt.Csi{ .final = 'u', .private = '>', .param_count = 1 };
+    push.params[0] = 1;
+    g.apply(.{ .csi = push });
+
+    const query = vt.Csi{ .final = 'u', .private = '?', .param_count = 0 };
+    g.apply(.{ .csi = query });
+    const da1 = vt.Csi{ .final = 'c', .param_count = 0 };
+    g.apply(.{ .csi = da1 });
+
+    var buf: [64]u8 = undefined;
+    const n = g.takeResponse(&buf);
+    try std.testing.expectEqualStrings("\x1b[?1u\x1b[?62;22c", buf[0..n]);
+    try std.testing.expectEqual(@as(usize, 0), g.takeResponse(&buf));
+}
+
+test "XTMODKEYS CSI > 4;2 m does not touch SGR state" {
+    var g = try Grid.init(std.testing.allocator, 4, 2);
+    defer g.deinit();
+    var mod = vt.Csi{ .final = 'm', .private = '>', .param_count = 2 };
+    mod.params[0] = 4;
+    mod.params[1] = 2;
+    g.apply(.{ .csi = mod });
+    try std.testing.expectEqual(@as(u16, 0), g.sgr_attrs);
 }
