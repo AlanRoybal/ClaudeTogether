@@ -65,6 +65,19 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     private(set) var theme: TerminalTheme = .defaultDark
     private var fgColorMap: [UInt32: UInt32] = [:]
     private var bgColorMap: [UInt32: UInt32] = [:]
+    /// Minimum WCAG contrast ratio enforced between glyph foreground and its
+    /// cell background. Apps that draw their own blocks (e.g. Claude Code's
+    /// user-message bar) often pick a fixed dark background but leave the text
+    /// at the terminal default foreground; on a light theme that default maps
+    /// to a dark color, leaving the text dark-on-dark. Lifting the foreground
+    /// to meet this floor keeps such text legible on every theme — and because
+    /// it runs per-renderer, each participant in a shared session gets it
+    /// applied against their own theme. 1.0 disables it.
+    var minimumContrastRatio: Double = 3.0
+    /// Cache of (themedFg, themedBg) → contrast-adjusted fg so the per-cell
+    /// floor doesn't re-run the search every frame. Cleared when the theme
+    /// changes (the themed keys change with it).
+    private var contrastAdjustCache: [UInt64: UInt32] = [:]
 
     private(set) var cols: UInt16 = 80
     private(set) var rows: UInt16 = 24
@@ -235,6 +248,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         theme = newTheme
         fgColorMap = newTheme.fgColorMap
         bgColorMap = newTheme.bgColorMap
+        contrastAdjustCache.removeAll(keepingCapacity: true)
         let bg = newTheme.background
         view?.clearColor = MTLClearColor(
             red:   Double((bg >> 16) & 0xFF) / 255,
@@ -387,8 +401,10 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                     // We still emit a BG quad for every cell so selection
                     // highlighting is solid; only the text glyph pass skips
                     // trailing halves.
-                    let fg = unpack(fgColorMap[c.fg] ?? c.fg)
-                    let bg = unpack(bgColorMap[c.bg] ?? c.bg)
+                    let pBg = bgColorMap[c.bg] ?? c.bg
+                    let fg = unpack(contrastAdjustedForeground(
+                        fgColorMap[c.fg] ?? c.fg, on: pBg))
+                    let bg = unpack(pBg)
 
                     // BG: render the terminal's actual background. Colored
                     // collaborator blocks are composited in the cursor pass.
@@ -629,6 +645,68 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             255)
     }
 
+    // MARK: minimum-contrast floor
+
+    /// Returns `fg` unchanged if it already meets `minimumContrastRatio`
+    /// against `bg`; otherwise shifts it toward black or white (whichever the
+    /// background contrasts with more), just far enough to reach the floor.
+    /// Hue is preserved as much as the floor allows. Results are memoized.
+    private func contrastAdjustedForeground(_ fg: UInt32, on bg: UInt32) -> UInt32 {
+        guard minimumContrastRatio > 1.0 else { return fg }
+        let key = (UInt64(fg) << 32) | UInt64(bg)
+        if let cached = contrastAdjustCache[key] { return cached }
+
+        let result: UInt32
+        if contrastRatio(fg, bg) >= minimumContrastRatio {
+            result = fg
+        } else {
+            // Push toward whichever endpoint the background contrasts with more.
+            let target: UInt32 = relativeLuminance(bg) < 0.5 ? 0xFFFFFF : 0x000000
+            if contrastRatio(target, bg) <= minimumContrastRatio {
+                result = target // floor unreachable; best effort
+            } else {
+                var lo = 0.0, hi = 1.0
+                for _ in 0..<12 {
+                    let mid = (lo + hi) / 2
+                    if contrastRatio(blend(fg, target, mid), bg) >= minimumContrastRatio {
+                        hi = mid
+                    } else {
+                        lo = mid
+                    }
+                }
+                result = blend(fg, target, hi)
+            }
+        }
+        contrastAdjustCache[key] = result
+        return result
+    }
+
+    private func blend(_ a: UInt32, _ b: UInt32, _ t: Double) -> UInt32 {
+        func lerp(_ ca: UInt32, _ cb: UInt32) -> UInt32 {
+            UInt32((Double(ca) + (Double(cb) - Double(ca)) * t).rounded())
+        }
+        let r = lerp((a >> 16) & 0xFF, (b >> 16) & 0xFF)
+        let g = lerp((a >>  8) & 0xFF, (b >>  8) & 0xFF)
+        let bl = lerp( a        & 0xFF,  b        & 0xFF)
+        return (r << 16) | (g << 8) | bl
+    }
+
+    private func contrastRatio(_ a: UInt32, _ b: UInt32) -> Double {
+        let la = relativeLuminance(a), lb = relativeLuminance(b)
+        return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+    }
+
+    private func relativeLuminance(of component: UInt32) -> Double {
+        let n = Double(component) / 255.0
+        return n <= 0.04045 ? n / 12.92 : pow((n + 0.055) / 1.055, 2.4)
+    }
+
+    private func relativeLuminance(_ packed: UInt32) -> Double {
+        0.2126 * relativeLuminance(of: (packed >> 16) & 0xFF)
+            + 0.7152 * relativeLuminance(of: (packed >> 8) & 0xFF)
+            + 0.0722 * relativeLuminance(of: packed & 0xFF)
+    }
+
     private func makeTextInstance(
         cell: ct_cell,
         col: UInt16,
@@ -689,7 +767,9 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             guard let entry = atlas.entry(forSequence: seq),
                   entry.pixelW > 0, entry.pixelH > 0 else { continue }
 
-            let fg = unpack(fgColorMap[startCell.fg] ?? startCell.fg)
+            let fg = unpack(contrastAdjustedForeground(
+                fgColorMap[startCell.fg] ?? startCell.fg,
+                on: bgColorMap[startCell.bg] ?? startCell.bg))
             var ti = TextInstance()
             ti.gridPos   = SIMD2<UInt16>(UInt16(x), UInt16(y))
             ti.offset    = SIMD2<Int16>(Int16(entry.bearingX),
