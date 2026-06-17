@@ -208,6 +208,12 @@ struct TabState: Identifiable {
     /// background for this participant. Cleared on focus.
     var hasUnreadOutput: Bool = false
 
+    /// Host-only: pinned tabs anchor at the far left of the strip (before all
+    /// unpinned tabs) and are protected from accidental closing. Purely a
+    /// host-local display concern — no wire-protocol involvement, so peers are
+    /// unaffected. See issue #69.
+    var isPinned: Bool = false
+
     /// True if the underlying tool is a full-screen TUI — detected via the
     /// alt-screen DECSET (vim, htop, less). Such tabs fall back to
     /// creator-only input.
@@ -866,6 +872,12 @@ final class TerminalModel: ObservableObject {
         guard sessionManager.role == .host else { return }
         guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
         let tab = tabs[idx]
+        // Close protection: a pinned tab must be unpinned before it can close.
+        // The strip hides its close button, so this guards the Cmd-W path.
+        if tab.isPinned {
+            NSSound.beep()
+            return
+        }
         tab.pty?.terminate()
         tabs.remove(at: idx)
         sharedInputs.removeValue(forKey: id)
@@ -900,8 +912,37 @@ final class TerminalModel: ObservableObject {
         guard fromIndex != toIndex,
               tabs.indices.contains(fromIndex),
               tabs.indices.contains(toIndex) else { return }
+        // A tab can't be dragged across the pin boundary: pinned tabs stay
+        // within the pinned group and unpinned within the unpinned group.
+        let pinned = pinnedCount
+        let target: Int
+        if tabs[fromIndex].isPinned {
+            target = min(toIndex, pinned - 1)
+        } else {
+            target = max(toIndex, pinned)
+        }
+        guard target != fromIndex else { return }
         tabs.move(fromOffsets: IndexSet(integer: fromIndex),
-                  toOffset: toIndex < fromIndex ? toIndex : toIndex + 1)
+                  toOffset: target < fromIndex ? target : target + 1)
+    }
+
+    /// Number of pinned tabs, which (by invariant) always occupy the leading
+    /// slots of `tabs`.
+    var pinnedCount: Int { tabs.prefix(while: { $0.isPinned }).count }
+
+    /// Host: toggle a tab's pinned state and re-anchor it. Pinning moves the
+    /// tab to the end of the pinned group (far left); unpinning moves it to the
+    /// front of the unpinned group. Relative order within each group is kept.
+    /// Purely host-local — no peer/wire involvement.
+    func togglePin(id: UInt32) {
+        guard sessionManager.role == .host else { return }
+        guard let idx = tabs.firstIndex(where: { $0.id == id }) else { return }
+        var tab = tabs.remove(at: idx)
+        tab.isPinned.toggle()
+        // After removal, the leading run of pinned tabs marks the boundary.
+        // Pinned tabs insert at its end; unpinned at its front.
+        let boundary = tabs.prefix(while: { $0.isPinned }).count
+        tabs.insert(tab, at: boundary)
     }
 
     /// Update which tab this local user is focused on. Focus is local to
