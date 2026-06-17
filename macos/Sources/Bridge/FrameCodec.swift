@@ -42,6 +42,11 @@ enum FrameTag: UInt8 {
     case paneInput     = 0x1E
     case paneCursorPos = 0x1F
     case kick = 0x20
+    // Access-control social flow (0x21..0x22). A view-only peer asks the
+    // host for full access; the host either flips the access mode (grant)
+    // or sends a denial so the peer gets feedback instead of silence.
+    case requestControl = 0x21
+    case controlDenied  = 0x22
 }
 
 enum SessionRole: UInt8 {
@@ -149,6 +154,8 @@ enum Frame {
     case paneInput(paneId: UInt32, data: Data)
     case paneCursorPos(UserIdentity, paneId: UInt32, col: UInt16, row: UInt16)
     case kick(UserIdentity)
+    case requestControl(UserIdentity)
+    case controlDenied(UserIdentity)
 }
 
 /// Which direction a split divides the terminal viewport.
@@ -308,6 +315,12 @@ enum FrameCodec {
             appendU16(&out, row)
         case .kick(let id):
             out.append(FrameTag.kick.rawValue)
+            out.append(contentsOf: id.bytes)
+        case .requestControl(let id):
+            out.append(FrameTag.requestControl.rawValue)
+            out.append(contentsOf: id.bytes)
+        case .controlDenied(let id):
+            out.append(FrameTag.controlDenied.rawValue)
             out.append(contentsOf: id.bytes)
         }
         return out
@@ -496,6 +509,12 @@ enum FrameCodec {
         case .kick:
             let id = try UserIdentity.from(exactly16: Array(try r.readBytes(16)))
             return .kick(id)
+        case .requestControl:
+            let id = try UserIdentity.from(exactly16: Array(try r.readBytes(16)))
+            return .requestControl(id)
+        case .controlDenied:
+            let id = try UserIdentity.from(exactly16: Array(try r.readBytes(16)))
+            return .controlDenied(id)
         }
     }
 

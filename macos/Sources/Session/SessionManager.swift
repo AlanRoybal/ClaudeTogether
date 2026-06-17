@@ -474,6 +474,24 @@ final class SessionManager: ObservableObject {
         broadcast(.accessMode(accessMode))
     }
 
+    /// Peer only: ask the host for full access. Harmless if already full —
+    /// the host simply ignores a request when the session isn't view-only.
+    func sendControlRequest() {
+        guard role == .peer, state == .running else { return }
+        broadcast(.requestControl(localIdentity))
+    }
+
+    /// Host only: decline a peer's control request so they get explicit
+    /// feedback rather than silence. Granting is handled by the existing
+    /// `setAccessMode(.full)` path — no separate "granted" frame is needed
+    /// because the access-mode broadcast already tells the peer.
+    func denyControlRequest(_ identity: UserIdentity) {
+        guard role == .host, state == .running else { return }
+        guard let peerID = transportToIdentity.first(where: { $0.value == identity })?.key
+        else { return }
+        send(.controlDenied(identity), toTransportPeerID: peerID)
+    }
+
     /// Host only: remove a participant by identity. Sends a kick frame so the
     /// peer can display a "you were removed" message, then closes their socket.
     func kickPeer(_ identity: UserIdentity) {

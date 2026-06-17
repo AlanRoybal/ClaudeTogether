@@ -425,7 +425,11 @@ private func sessionMenuItems(model: TerminalModel) -> some View {
         if model.sessionManager.role == .host {
             Picker("Access Mode", selection: Binding(
                 get: { model.sessionManager.accessMode },
-                set: { model.sessionManager.setAccessMode($0) }
+                set: {
+                    model.sessionManager.setAccessMode($0)
+                    // A manual mode change supersedes any pending request.
+                    model.pendingControlRequest = nil
+                }
             )) {
                 Text("Full Access").tag(AccessMode.full)
                 Text("View Only").tag(AccessMode.viewOnly)
@@ -434,6 +438,9 @@ private func sessionMenuItems(model: TerminalModel) -> some View {
             let accessLabel = model.sessionManager.accessMode == .full
                 ? "Access: Full" : "Access: View Only"
             Button(accessLabel) {}.disabled(true)
+            if model.sessionManager.accessMode == .viewOnly {
+                Button("Request Control") { model.requestControl() }
+            }
         }
 
         Divider()
