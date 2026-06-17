@@ -37,11 +37,13 @@ struct TabStripView: View {
                         index: idx,
                         isActive: tab.id == model.activeTabId,
                         canClose: model.sessionManager.role == .host,
+                        isPinned: tab.isPinned,
                         isDragging: draggingTabId == tab.id,
                         hasUnreadOutput: tab.hasUnreadOutput,
                         theme: theme,
                         onSelect: { model.focusTab(id: tab.id) },
-                        onClose: { model.closeTab(id: tab.id) })
+                        onClose: { model.closeTab(id: tab.id) },
+                        onTogglePin: { model.togglePin(id: tab.id) })
                     .frame(maxWidth: .infinity)
                     .background(frameCapture(for: tab.id))
                     .offset(x: dragOffset(for: tab.id))
@@ -135,6 +137,10 @@ struct TabStripView: View {
         .onPreferenceChange(TabFrameKey.self) { tabFrames = $0 }
     }
 
+    private func isPinned(_ id: UInt32) -> Bool {
+        model.tabs.first(where: { $0.id == id })?.isPinned ?? false
+    }
+
     private func frameCapture(for id: UInt32) -> some View {
         GeometryReader { geo in
             Color.clear.preference(
@@ -175,6 +181,8 @@ struct TabStripView: View {
                        let order = previewOrder,
                        fromIdx + 1 < order.count {
                         let rightId = order[fromIdx + 1]
+                        // Don't let a tab cross the pin boundary.
+                        if isPinned(rightId) != tab.isPinned { return }
                         if let rightFrame = tabFrames[rightId], visualRightEdge > rightFrame.midX {
                             var newOrder = order
                             newOrder.move(fromOffsets: IndexSet(integer: fromIdx), toOffset: fromIdx + 2)
@@ -188,6 +196,8 @@ struct TabStripView: View {
                        let order = previewOrder,
                        fromIdx > 0 {
                         let leftId = order[fromIdx - 1]
+                        // Don't let a tab cross the pin boundary.
+                        if isPinned(leftId) != tab.isPinned { return }
                         if let leftFrame = tabFrames[leftId], visualLeftEdge < leftFrame.midX {
                             var newOrder = order
                             newOrder.move(fromOffsets: IndexSet(integer: fromIdx), toOffset: fromIdx - 1)
@@ -264,11 +274,13 @@ private struct TabStripButton: View {
     let index: Int
     let isActive: Bool
     let canClose: Bool
+    let isPinned: Bool
     let isDragging: Bool
     let hasUnreadOutput: Bool
     let theme: TerminalTheme
     let onSelect: () -> Void
     let onClose: () -> Void
+    let onTogglePin: () -> Void
 
     @State private var isHovered = false
     @State private var isXHovered = false
@@ -277,23 +289,43 @@ private struct TabStripButton: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            // Close button — always reserves space to prevent layout shifts.
+            // Leading control — always reserves space to prevent layout shifts.
+            // A pinned tab shows a pin glyph (no close button); clicking it
+            // unpins. An unpinned tab shows the close button (host only).
             if canClose {
-                Button(action: onClose) {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundColor(theme.swiftUIForeground.opacity(isXHovered ? 0.85 : 0.3))
-                        .frame(width: 14, height: 14)
-                        .background(
-                            RoundedRectangle(cornerRadius: 3, style: .continuous)
-                                .fill(theme.swiftUIForeground.opacity(isXHovered ? 0.15 : 0))
-                        )
+                if isPinned {
+                    Button(action: onTogglePin) {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundColor(theme.swiftUIForeground.opacity(isXHovered ? 0.85 : 0.5))
+                            .frame(width: 14, height: 14)
+                            .background(
+                                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                    .fill(theme.swiftUIForeground.opacity(isXHovered ? 0.15 : 0))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { isXHovered = $0 }
+                    .accessibilityLabel("Unpin tab \(title)")
+                    .help("Unpin \(title)")
+                    .padding(.leading, 6)
+                } else {
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundColor(theme.swiftUIForeground.opacity(isXHovered ? 0.85 : 0.3))
+                            .frame(width: 14, height: 14)
+                            .background(
+                                RoundedRectangle(cornerRadius: 3, style: .continuous)
+                                    .fill(theme.swiftUIForeground.opacity(isXHovered ? 0.15 : 0))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .onHover { isXHovered = $0 }
+                    .accessibilityLabel("Close tab \(title)")
+                    .help("Close \(title)")
+                    .padding(.leading, 6)
                 }
-                .buttonStyle(.plain)
-                .onHover { isXHovered = $0 }
-                .accessibilityLabel("Close tab \(title)")
-                .help("Close \(title)")
-                .padding(.leading, 6)
             }
 
             // Title — fills remaining space, tap selects the tab.
@@ -338,5 +370,14 @@ private struct TabStripButton: View {
         .opacity(isDragging ? 0.7 : 1.0)
         .shadow(color: isDragging ? .black.opacity(0.2) : .clear, radius: 5, x: 0, y: 2)
         .animation(.easeInOut(duration: 0.12), value: isDragging)
+        .contextMenu {
+            // Tab actions are host-only, mirroring the close/new affordances.
+            if canClose {
+                Button(isPinned ? "Unpin Tab" : "Pin Tab", action: onTogglePin)
+                if !isPinned {
+                    Button("Close Tab", action: onClose)
+                }
+            }
+        }
     }
 }
