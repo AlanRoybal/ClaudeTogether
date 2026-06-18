@@ -2,12 +2,15 @@ import SwiftUI
 
 struct FindBarView: View {
     @ObservedObject var state: SearchState
+    var theme: TerminalTheme = .defaultDark
     @FocusState private var fieldFocused: Bool
 
     var body: some View {
         HStack(spacing: 6) {
             TextField("Find", text: $state.query)
                 .textFieldStyle(.plain)
+                .foregroundStyle(theme.popupForeground)
+                .tint(theme.popupAccent)
                 .focused($fieldFocused)
                 .frame(minWidth: 120)
                 .onSubmit { state.selectNext() }
@@ -15,7 +18,7 @@ struct FindBarView: View {
             if !state.query.isEmpty {
                 matchLabel
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.popupSecondaryForeground)
                     .fixedSize()
 
                 Divider().frame(height: 14)
@@ -45,9 +48,11 @@ struct FindBarView: View {
             }
             .buttonStyle(.plain)
         }
+        .foregroundStyle(theme.popupForeground)
+        .tint(theme.popupAccent)
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .themedPopupSurface(theme, cornerRadius: 8, shadowRadius: 8)
         .onAppear { fieldFocused = true }
         .onKeyPress(.escape) {
             state.close()

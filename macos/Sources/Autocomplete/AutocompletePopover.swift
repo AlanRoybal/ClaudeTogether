@@ -135,6 +135,7 @@ struct SharedInputCompletionHintsOverlay: View {
 /// selection through the bound `AutocompleteState`.
 struct AutocompletePopover: View {
     @ObservedObject var state: AutocompleteState
+    var theme: TerminalTheme = .defaultDark
 
     var body: some View {
         if state.visible, !state.items.isEmpty {
@@ -144,8 +145,8 @@ struct AutocompletePopover: View {
                         Text(item)
                             .font(.system(size: 12, design: .monospaced))
                             .foregroundStyle(index == state.selectedIndex
-                                             ? Color.white
-                                             : Color.primary)
+                                             ? theme.popupOnAccent
+                                             : theme.popupForeground)
                             .lineLimit(1)
                             .truncationMode(.tail)
                             .padding(.vertical, 3)
@@ -153,17 +154,13 @@ struct AutocompletePopover: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .background(index == state.selectedIndex
-                                ? Color.accentColor
+                                ? theme.popupSelectionBackground
                                 : Color.clear)
                 }
             }
             .frame(maxWidth: 320)
-            .background(.ultraThinMaterial)
-            .overlay(
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(Color.primary.opacity(0.18), lineWidth: 1))
             .clipShape(RoundedRectangle(cornerRadius: 6))
-            .shadow(color: Color.black.opacity(0.28), radius: 8, x: 0, y: 4)
+            .themedPopupSurface(theme, cornerRadius: 6, shadowRadius: 8)
             .allowsHitTesting(false)
         }
     }

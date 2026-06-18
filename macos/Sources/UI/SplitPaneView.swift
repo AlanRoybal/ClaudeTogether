@@ -68,7 +68,7 @@ struct SplitPaneView: View {
                 theme: model.terminalTheme)
             if searchState.isVisible {
                 VStack {
-                    FindBarView(state: searchState)
+                    FindBarView(state: searchState, theme: model.terminalTheme)
                         .padding(.horizontal, 12)
                         .padding(.top, 8)
                     Spacer()

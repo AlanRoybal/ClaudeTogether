@@ -64,6 +64,7 @@ struct ContentView: View {
                    .contains(where: { $0.identity == req.identity }) {
                 ControlRequestBanner(
                     name: req.name,
+                    theme: model.terminalTheme,
                     onGrant: { model.grantControlRequest() },
                     onDeny: { model.denyControlRequest() })
                     .padding(.top, titleBarInset + 8)
@@ -75,10 +76,12 @@ struct ContentView: View {
             if let message = model.sessionNotificationMessage {
                 Text(message)
                     .font(.caption.weight(.medium))
+                    .foregroundStyle(model.terminalTheme.popupForeground)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
-                    .background(.thinMaterial, in: Capsule())
-                    .overlay(Capsule().stroke(.secondary.opacity(0.25)))
+                    .background(model.terminalTheme.popupSurface, in: Capsule())
+                    .overlay(Capsule().stroke(model.terminalTheme.popupBorder, lineWidth: 1))
+                    .shadow(color: model.terminalTheme.popupShadow, radius: 8, y: 3)
                     .padding(.top, titleBarInset + 8)
                     .transition(.opacity)
                     .frame(maxWidth: .infinity, alignment: .center)
@@ -96,15 +99,17 @@ struct ContentView: View {
 /// working and decide when ready.
 private struct ControlRequestBanner: View {
     let name: String
+    let theme: TerminalTheme
     let onGrant: () -> Void
     let onDeny: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: "hand.raised.fill")
-                .foregroundStyle(.yellow)
+                .foregroundStyle(theme.popupAccent)
             Text("\(name) is requesting control")
                 .font(.callout.weight(.medium))
+                .foregroundStyle(theme.popupForeground)
             Spacer(minLength: 8)
             Button("Deny", role: .cancel, action: onDeny)
                 .controlSize(.small)
@@ -113,12 +118,11 @@ private struct ControlRequestBanner: View {
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent)
         }
+        .tint(theme.popupAccent)
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(.secondary.opacity(0.25)))
         .frame(maxWidth: 460)
-        .shadow(radius: 8, y: 2)
+        .themedPopupSurface(theme)
     }
 }
 
@@ -4216,6 +4220,7 @@ private struct SnapshotStyle: Equatable {
 struct SharedInputAutocompleteOverlay: View {
     @ObservedObject var grid: GridModel
     @ObservedObject var autocomplete: AutocompleteState
+    var theme: TerminalTheme = .defaultDark
 
     private let estItemHeight: CGFloat = 22
     private let estPadding: CGFloat = 8
@@ -4228,7 +4233,7 @@ struct SharedInputAutocompleteOverlay: View {
                let local = grid.cursors.first(where: { $0.isLocal })
             {
                 let position = computePosition(geo: geo, local: local)
-                AutocompletePopover(state: autocomplete)
+                AutocompletePopover(state: autocomplete, theme: theme)
                     .frame(width: estWidth, alignment: .leading)
                     .offset(x: position.x, y: position.y)
             }

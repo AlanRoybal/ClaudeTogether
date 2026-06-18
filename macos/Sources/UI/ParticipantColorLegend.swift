@@ -39,27 +39,22 @@ struct ParticipantColorLegend: View {
 struct ParticipantColorLegendCard: View {
     let participants: [SessionManager.Participant]
     let localIdentity: UserIdentity
+    var theme: TerminalTheme = .defaultDark
 
     var body: some View {
         if participants.count > 1 {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Cursor Colors")
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(theme.popupSecondaryForeground)
                 ParticipantColorLegend(
                     participants: participants,
                     localIdentity: localIdentity,
                     compact: true)
+                    .foregroundStyle(theme.popupForeground)
             }
             .padding(10)
-            .background(.ultraThinMaterial,
-                        in: RoundedRectangle(cornerRadius: 12,
-                                             style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .stroke(.white.opacity(0.10), lineWidth: 1)
-            }
-            .shadow(color: .black.opacity(0.18), radius: 10, y: 4)
+            .themedPopupSurface(theme, cornerRadius: 12)
         }
     }
 }
