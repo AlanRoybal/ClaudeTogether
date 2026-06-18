@@ -57,14 +57,6 @@ struct ContentView: View {
             if model.isViewOnlyPeer {
                 HStack(spacing: 8) {
                     Spacer()
-                    Button {
-                        model.requestControl()
-                    } label: {
-                        Label("Request Control", systemImage: "hand.raised")
-                            .font(.caption.weight(.semibold))
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
                     Text("View Only")
                         .font(.caption.weight(.semibold))
                         .padding(.horizontal, 8)
