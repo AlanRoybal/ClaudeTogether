@@ -270,6 +270,7 @@ struct PreferencesView: View {
                         panel.allowsOtherFileTypes = true
                         panel.message = "Choose a .claudetheme or .itermcolors file"
                         panel.prompt = "Import"
+                        panel.appearance = model.terminalTheme.nsAppearance
                         if panel.runModal() == .OK, let url = panel.url {
                             try? model.themeLibrary.importFile(from: url)
                         }

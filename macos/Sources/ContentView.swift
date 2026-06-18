@@ -788,7 +788,7 @@ final class TerminalModel: ObservableObject {
     /// Let the host choose a project root folder for file sync. Does not open
     /// a new terminal tab. Required before starting a shared session.
     func pickProjectFolder() {
-        guard let folder = FolderPicker.pick() else { return }
+        guard let folder = FolderPicker.pick(appearance: terminalTheme.nsAppearance) else { return }
         rootPath = folder
         fileSyncWatcher = nil
         fileSyncApplier.configure(rootPath: nil)
@@ -1640,7 +1640,7 @@ final class TerminalModel: ObservableObject {
         // Sharing requires an explicit project root for file sync. If none has
         // been chosen yet, prompt the user before proceeding.
         if rootPath == nil {
-            guard let folder = FolderPicker.pick() else { return }
+            guard let folder = FolderPicker.pick(appearance: terminalTheme.nsAppearance) else { return }
             rootPath = folder
             fileSyncApplier.configure(rootPath: nil)
         }
@@ -1803,6 +1803,9 @@ final class TerminalModel: ObservableObject {
         alert.accessoryView = input
         alert.addButton(withTitle: "Join")
         alert.addButton(withTitle: "Cancel")
+        // Match the alert's light/dark to the active terminal theme so it reads
+        // as part of the app rather than foreign system chrome.
+        alert.window.appearance = terminalTheme.nsAppearance
         alert.window.initialFirstResponder = input
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
@@ -1834,7 +1837,8 @@ final class TerminalModel: ObservableObject {
         }
         let host = String(hostPort[..<colon])
         guard let peerRoot = FolderPicker.pick(
-            prompt: "Choose the local folder this peer should use as the session root"
+            prompt: "Choose the local folder this peer should use as the session root",
+            appearance: terminalTheme.nsAppearance
         ) else {
             return
         }
@@ -1887,7 +1891,8 @@ final class TerminalModel: ObservableObject {
         }
         let host = String(addr[..<colon])
         guard let peerRoot = FolderPicker.pick(
-            prompt: "Choose the local folder this peer should use as the session root"
+            prompt: "Choose the local folder this peer should use as the session root",
+            appearance: terminalTheme.nsAppearance
         ) else { return }
         endSession()
         sessionManager.stop()
@@ -1940,6 +1945,9 @@ final class TerminalModel: ObservableObject {
         let delegate = CopyLinkPickerDelegate(url: url)
         picker.delegate = delegate
         _sharePickerDelegate = delegate
+        // The picker anchors to the main window and inherits its appearance,
+        // which WindowThemeSetter already keeps aligned with the active theme's
+        // light/dark — so no extra theming is needed here.
         picker.show(relativeTo: .zero, of: anchor, preferredEdge: .minY)
     }
 
@@ -3834,6 +3842,7 @@ final class TerminalModel: ObservableObject {
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Close Without Saving")
         alert.addButton(withTitle: "Cancel")
+        alert.window.appearance = terminalTheme.nsAppearance
 
         switch alert.runModal() {
         case .alertFirstButtonReturn:
