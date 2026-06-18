@@ -7,18 +7,29 @@ struct FindBarView: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            TextField("Find", text: $state.query)
-                .textFieldStyle(.plain)
-                .foregroundStyle(theme.popupForeground)
-                .tint(theme.popupAccent)
-                .focused($fieldFocused)
-                .frame(minWidth: 120)
-                .onSubmit { state.selectNext() }
+            // Custom placeholder: SwiftUI's built-in TextField placeholder
+            // ignores foregroundStyle and renders in a fixed muted system color
+            // that washes out on themed surfaces. Drawing it ourselves keeps it
+            // tied to the theme foreground so it stays legible on any theme.
+            ZStack(alignment: .leading) {
+                if state.query.isEmpty {
+                    Text("Find")
+                        .foregroundStyle(theme.popupForeground.opacity(0.5))
+                        .allowsHitTesting(false)
+                }
+                TextField("", text: $state.query)
+                    .textFieldStyle(.plain)
+                    .foregroundStyle(theme.popupForeground)
+                    .tint(theme.popupAccent)
+                    .focused($fieldFocused)
+                    .onSubmit { state.selectNext() }
+            }
+            .frame(minWidth: 120)
 
             if !state.query.isEmpty {
                 matchLabel
                     .font(.caption)
-                    .foregroundStyle(theme.popupSecondaryForeground)
+                    .foregroundStyle(theme.popupForeground.opacity(0.7))
                     .fixedSize()
 
                 Divider().frame(height: 14)
