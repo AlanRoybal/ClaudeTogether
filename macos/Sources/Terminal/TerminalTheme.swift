@@ -314,6 +314,60 @@ extension TerminalTheme {
     }
 }
 
+// MARK: - Popup / overlay colors
+//
+// All app popups (banners, toasts, the find bar, autocomplete, alerts) derive
+// their colors from the active theme so they read as part of the terminal
+// rather than as foreign system chrome. Works for both built-in and custom
+// themes — every value is computed from `background`/`foreground`/`cursorColor`.
+extension TerminalTheme {
+    /// Packed RGB of the elevated popup surface. Blends the foreground into the
+    /// background so the surface sits visibly above the terminal on any theme
+    /// (lightens dark themes, darkens light ones).
+    var popupSurfaceRGB: UInt32 {
+        blendColor(background, foreground, t: isDark ? 0.13 : 0.07)
+    }
+
+    /// Elevated surface background for popups, banners, and overlays.
+    var popupSurface: Color { Color(packedRGB: popupSurfaceRGB) }
+
+    /// Stronger surface for selected/highlighted rows inside a popup.
+    var popupSelectionBackground: Color { Color(packedRGB: cursorColor) }
+
+    /// Hairline border separating a popup from the content behind it.
+    var popupBorder: Color { swiftUIForeground.opacity(isDark ? 0.22 : 0.18) }
+
+    /// Primary popup text — the theme foreground.
+    var popupForeground: Color { swiftUIForeground }
+
+    /// Muted secondary text (captions, labels, counts) inside popups.
+    var popupSecondaryForeground: Color {
+        Color(packedRGB: blendColor(foreground, background, t: 0.42))
+    }
+
+    /// Accent color for primary actions and highlights — the theme cursor color.
+    var popupAccent: Color { Color(packedRGB: cursorColor) }
+
+    /// Foreground that stays legible on top of `popupAccent` /
+    /// `popupSelectionBackground`. Chosen by the accent's luminance.
+    var popupOnAccent: Color {
+        let r = Double((cursorColor >> 16) & 0xFF) / 255
+        let g = Double((cursorColor >>  8) & 0xFF) / 255
+        let b = Double( cursorColor        & 0xFF) / 255
+        let lum = 0.299 * r + 0.587 * g + 0.114 * b
+        return lum < 0.55 ? .white : Color(packedRGB: 0x111111)
+    }
+
+    /// Drop-shadow color tuned to the theme's lightness.
+    var popupShadow: Color { Color.black.opacity(isDark ? 0.42 : 0.18) }
+
+    /// AppKit appearance matching the theme so system-drawn dialogs (NSAlert,
+    /// NSOpenPanel, the share sheet) line up light/dark with the terminal.
+    var nsAppearance: NSAppearance? {
+        NSAppearance(named: isDark ? .darkAqua : .aqua)
+    }
+}
+
 extension Color {
     init(packedRGB hex: UInt32) {
         self.init(
