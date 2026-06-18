@@ -54,20 +54,6 @@ struct ContentView: View {
                     .onAppear { model.openInitialTab() }
             }
 
-            if model.isViewOnlyPeer {
-                HStack(spacing: 8) {
-                    Spacer()
-                    Text("View Only")
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(.secondary.opacity(0.85), in: Capsule())
-                        .foregroundStyle(.white)
-                        .padding(.trailing, 12)
-                }
-                .padding(.top, titleBarInset + 8)
-            }
-
             // Host-side: a peer is asking for full access. Non-blocking banner
             // with one-click Grant/Deny. Auto-hides if the session is already
             // full-access or the requester is no longer connected.
