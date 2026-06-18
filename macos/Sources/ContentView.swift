@@ -54,24 +54,71 @@ struct ContentView: View {
                     .onAppear { model.openInitialTab() }
             }
 
-            if model.isViewOnlyPeer {
-                HStack {
-                    Spacer()
-                    Text("View Only")
-                        .font(.caption.weight(.semibold))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(.secondary.opacity(0.85), in: Capsule())
-                        .foregroundStyle(.white)
-                        .padding(.trailing, 12)
-                }
-                .padding(.top, titleBarInset + 8)
+            // Host-side: a peer is asking for full access. Non-blocking banner
+            // with one-click Grant/Deny. Auto-hides if the session is already
+            // full-access or the requester is no longer connected.
+            if let req = model.pendingControlRequest,
+               model.sessionManager.role == .host,
+               model.sessionManager.accessMode == .viewOnly,
+               model.sessionManager.participants
+                   .contains(where: { $0.identity == req.identity }) {
+                ControlRequestBanner(
+                    name: req.name,
+                    onGrant: { model.grantControlRequest() },
+                    onDeny: { model.denyControlRequest() })
+                    .padding(.top, titleBarInset + 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+
+            // Brief auto-dismissing status toast (joins/leaves, request sent,
+            // request denied, reconnects).
+            if let message = model.sessionNotificationMessage {
+                Text(message)
+                    .font(.caption.weight(.medium))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(.thinMaterial, in: Capsule())
+                    .overlay(Capsule().stroke(.secondary.opacity(0.25)))
+                    .padding(.top, titleBarInset + 8)
+                    .transition(.opacity)
+                    .frame(maxWidth: .infinity, alignment: .center)
             }
 
         }
         .ignoresSafeArea(edges: .top)
         .frame(minWidth: 800, minHeight: 550)
         .background(WindowThemeSetter(theme: model.terminalTheme, titleBarInset: $titleBarInset))
+    }
+}
+
+/// Host-facing banner shown when a view-only peer requests full access.
+/// Deliberately non-blocking (unlike an NSAlert) so the host can keep
+/// working and decide when ready.
+private struct ControlRequestBanner: View {
+    let name: String
+    let onGrant: () -> Void
+    let onDeny: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "hand.raised.fill")
+                .foregroundStyle(.yellow)
+            Text("\(name) is requesting control")
+                .font(.callout.weight(.medium))
+            Spacer(minLength: 8)
+            Button("Deny", role: .cancel, action: onDeny)
+                .controlSize(.small)
+            Button("Grant", action: onGrant)
+                .controlSize(.small)
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(.secondary.opacity(0.25)))
+        .frame(maxWidth: 460)
+        .shadow(radius: 8, y: 2)
     }
 }
 
@@ -360,6 +407,15 @@ final class TerminalModel: ObservableObject {
     /// Brief auto-dismissing status message shown as an overlay banner.
     @Published var sessionNotificationMessage: String? = nil
     private var notificationDismissTask: Task<Void, Never>?
+
+    /// Host-side: a view-only peer currently asking for full access. When set,
+    /// the host sees a non-blocking Grant/Deny banner. Cleared once the host
+    /// decides, the access mode flips to full, or the requester disconnects.
+    struct PendingControlRequest: Equatable {
+        let identity: UserIdentity
+        let name: String
+    }
+    @Published var pendingControlRequest: PendingControlRequest? = nil
 
     /// A placeholder token currently live in the terminal input line.
     /// Carries the actual bytes so it can be expanded on demand or on Enter.
@@ -1897,6 +1953,32 @@ final class TerminalModel: ObservableObject {
         }
     }
 
+    // MARK: request control (access-mode social flow)
+
+    /// Peer only: ask the host for full access and confirm the request was
+    /// sent. No-op unless we're a connected view-only peer.
+    func requestControl() {
+        guard isViewOnlyPeer else { return }
+        sessionManager.sendControlRequest()
+        showSessionNotification("Control request sent to host")
+    }
+
+    /// Host only: grant a pending control request by flipping the session to
+    /// full access — the same machinery as the Access Mode picker.
+    func grantControlRequest() {
+        guard sessionManager.role == .host else { return }
+        sessionManager.setAccessMode(.full)
+        pendingControlRequest = nil
+    }
+
+    /// Host only: decline a pending control request, notifying the peer.
+    func denyControlRequest() {
+        guard sessionManager.role == .host,
+              let req = pendingControlRequest else { return }
+        sessionManager.denyControlRequest(req.identity)
+        pendingControlRequest = nil
+    }
+
     // MARK: keystroke + resize handling
 
     /// Called by MetalTerminalView when the user types. The tab id is
@@ -2364,6 +2446,24 @@ final class TerminalModel: ObservableObject {
                   id == sessionManager.localIdentity else { return }
             showSessionNotification("You were removed from this session.")
             endSession()
+
+        case .requestControl(let id):
+            // Host only. Ignore if the session is already full-access (the
+            // peer's request button is hidden then, but defend in depth) or
+            // the requester isn't a known peer.
+            guard sessionManager.role == .host,
+                  sessionManager.accessMode == .viewOnly,
+                  id != sessionManager.localIdentity,
+                  let participant = sessionManager.participants
+                      .first(where: { $0.identity == id })
+            else { return }
+            pendingControlRequest = PendingControlRequest(
+                identity: id, name: participant.name)
+
+        case .controlDenied(let id):
+            guard sessionManager.role == .peer,
+                  id == sessionManager.localIdentity else { return }
+            showSessionNotification("Host kept the session view-only")
 
         default:
             break
