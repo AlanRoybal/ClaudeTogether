@@ -442,6 +442,14 @@ final class TerminalModel: ObservableObject {
     /// detect joins and leaves without a dedicated diff frame.
     private var previousParticipants: [SessionManager.Participant] = []
 
+    /// Debounce for "left" notifications, keyed by identity. A participant who
+    /// drops and auto-reconnects (#61) momentarily vanishes from the roster;
+    /// without this, every transient blip would spam a "left"/"joined" pair.
+    /// We defer the "left" toast briefly and cancel it (suppressing the paired
+    /// "joined") if the same identity returns within the grace window.
+    private var pendingLeaveTasks: [UserIdentity: DispatchWorkItem] = [:]
+    private let participantLeaveGracePeriod: TimeInterval = 6
+
     /// Guards the one-time "view only" hint so it doesn't spam on every blocked key.
     private var hasShownViewOnlyHint = false
 
@@ -586,16 +594,7 @@ final class TerminalModel: ObservableObject {
                 broadcast: self.sessionManager.role == .host)
             self.syncAllGridSharedInputOverlays()
             self.syncEditorParticipants()
-            for p in newParticipants
-                where !self.previousParticipants.contains(where: { $0.identity == p.identity })
-                   && p.identity != self.sessionManager.localIdentity {
-                self.showSessionNotification("\(p.name) joined")
-            }
-            for p in self.previousParticipants
-                where !newParticipants.contains(where: { $0.identity == p.identity })
-                   && p.identity != self.sessionManager.localIdentity {
-                self.showSessionNotification("\(p.name) left")
-            }
+            self.diffParticipantsForNotifications(newParticipants)
             self.previousParticipants = newParticipants
             // Mode probe is gated on hosting + having a remote peer; the
             // first peer's Hello starts it, the last peer's leave stops it.
@@ -855,6 +854,9 @@ final class TerminalModel: ObservableObject {
         participantFocusedPane.removeAll()
         participantFocusedTab.removeAll()
         tabViewers.removeAll()
+        for task in pendingLeaveTasks.values { task.cancel() }
+        pendingLeaveTasks.removeAll()
+        previousParticipants = []
         sharedInputNeedsLineClear.removeAll()
         for timer in sharedInputTransientOutputTimers.values {
             timer.invalidate()
@@ -1961,6 +1963,48 @@ final class TerminalModel: ObservableObject {
 
     // Held strongly so the picker delegate lives as long as the model.
     private var _sharePickerDelegate: NSObject?
+
+    /// Turn a roster delta into join/leave toasts, debouncing transient
+    /// reconnects so a peer that drops and rejoins (#61) doesn't spam a
+    /// "left"/"joined" pair. A genuine departure still surfaces after a short
+    /// grace period; a genuine arrival shows immediately.
+    private func diffParticipantsForNotifications(
+        _ newParticipants: [SessionManager.Participant])
+    {
+        let local = sessionManager.localIdentity
+        // Arrivals: an identity present now that wasn't before.
+        for p in newParticipants
+            where !previousParticipants.contains(where: { $0.identity == p.identity })
+               && p.identity != local
+        {
+            if let pending = pendingLeaveTasks.removeValue(forKey: p.identity) {
+                // They never really left — cancel the deferred "left" and stay
+                // silent rather than announcing a phantom rejoin.
+                pending.cancel()
+            } else {
+                showSessionNotification("\(p.name) joined")
+            }
+        }
+        // Departures: an identity present before that's gone now. Defer the
+        // toast; if they return within the grace window the arrival path above
+        // cancels it.
+        for p in previousParticipants
+            where !newParticipants.contains(where: { $0.identity == p.identity })
+               && p.identity != local
+        {
+            guard pendingLeaveTasks[p.identity] == nil else { continue }
+            let identity = p.identity
+            let name = p.name
+            let task = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.pendingLeaveTasks.removeValue(forKey: identity)
+                self.showSessionNotification("\(name) left")
+            }
+            pendingLeaveTasks[identity] = task
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + participantLeaveGracePeriod, execute: task)
+        }
+    }
 
     /// Shows a brief auto-dismissing notification banner overlay.
     func showSessionNotification(_ message: String) {
