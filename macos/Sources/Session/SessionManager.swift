@@ -382,6 +382,21 @@ final class SessionManager: ObservableObject {
         }
     }
 
+    /// Host only: relay which tab a participant is currently viewing so every
+    /// peer can render per-tab presence dots (issue #92). Sent to all peers, or
+    /// to a single newly-joined peer when seeding the initial presence snapshot.
+    func sendTabViewing(identity: UserIdentity, tabId: UInt32,
+                        toTransportPeerID peerID: UInt32? = nil)
+    {
+        guard role == .host, state == .running else { return }
+        let frame = Frame.tabViewing(identity: identity, tabId: tabId)
+        if let peerID {
+            send(frame, toTransportPeerID: peerID)
+        } else {
+            broadcast(frame)
+        }
+    }
+
     /// Host only: fan a chunk of PTY output for a specific tab to peers.
     func sendTabPtyOutput(tabId: UInt32, data: Data,
                           toTransportPeerID peerID: UInt32? = nil)
