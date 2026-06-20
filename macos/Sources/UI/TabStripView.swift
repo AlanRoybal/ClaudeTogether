@@ -40,6 +40,7 @@ struct TabStripView: View {
                         isPinned: tab.isPinned,
                         isDragging: draggingTabId == tab.id,
                         hasUnreadOutput: tab.hasUnreadOutput,
+                        viewers: model.remoteViewers(ofTab: tab.id),
                         theme: theme,
                         onSelect: { model.focusTab(id: tab.id) },
                         onClose: { model.closeTab(id: tab.id) },
@@ -250,22 +251,75 @@ private struct AnimatedEllipsisView: View {
                     Circle()
                         .fill(color)
                         .frame(width: dotSize, height: dotSize)
-                        .opacity(opacity(at: t, index: i))
+                        .opacity(tabRumbleOpacity(at: t, index: i))
                 }
             }
         }
         .frame(width: dotSize * 3 + spacing * 2, alignment: .leading)
         .accessibilityHidden(true)
     }
+}
 
-    /// Each dot peaks 1/3 of a cycle apart, easeInOut between 0.2 and 1.0.
-    private func opacity(at t: Double, index: Int) -> Double {
-        let phase = (t - Double(index) / 3.0).truncatingRemainder(dividingBy: 1.0)
-        let wrapped = phase < 0 ? phase + 1.0 : phase
-        // Triangle wave 0..1..0, then ease.
-        let tri = wrapped < 0.5 ? wrapped * 2.0 : (1.0 - wrapped) * 2.0
-        let eased = tri * tri * (3.0 - 2.0 * tri)
-        return 0.2 + 0.8 * eased
+/// Triangle-wave rumble shared by the tab activity ellipsis and the per-tab
+/// presence dots: each dot peaks 1/3 of a cycle apart, eased between 0.2 and
+/// 1.0 (issue #92).
+private func tabRumbleOpacity(at t: Double, index: Int) -> Double {
+    let phase = (t - Double(index) / 3.0).truncatingRemainder(dividingBy: 1.0)
+    let wrapped = phase < 0 ? phase + 1.0 : phase
+    // Triangle wave 0..1..0, then ease.
+    let tri = wrapped < 0.5 ? wrapped * 2.0 : (1.0 - wrapped) * 2.0
+    let eased = tri * tri * (3.0 - 2.0 * tri)
+    return 0.2 + 0.8 * eased
+}
+
+/// Per-tab presence (issue #92): a compact row of participant-colored dots for
+/// the remote users currently viewing a tab. Caps at three dots with a "+N"
+/// overflow. When `animating` (the tab has unread output), the dots rumble with
+/// the same wave as the activity ellipsis, so "who's here" and "activity here"
+/// read as one indicator.
+private struct PresenceDotsView: View {
+    let viewers: [TerminalModel.PresenceDot]
+    let animating: Bool
+    let theme: TerminalTheme
+
+    private let maxDots = 3
+    private let dotSize: CGFloat = 4
+    private let spacing: CGFloat = 2.5
+    private let cycle: TimeInterval = 1.2
+
+    private var shown: [TerminalModel.PresenceDot] { Array(viewers.prefix(maxDots)) }
+    private var overflow: Int { max(0, viewers.count - maxDots) }
+
+    var body: some View {
+        HStack(spacing: spacing) {
+            if animating {
+                TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { context in
+                    let t = context.date.timeIntervalSinceReferenceDate
+                        .truncatingRemainder(dividingBy: cycle) / cycle
+                    dots { tabRumbleOpacity(at: t, index: $0) }
+                }
+            } else {
+                dots { _ in 1.0 }
+            }
+            if overflow > 0 {
+                Text("+\(overflow)")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundColor(theme.swiftUIForeground.opacity(0.5))
+                    .fixedSize()
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private func dots(opacity: @escaping (Int) -> Double) -> some View {
+        HStack(spacing: spacing) {
+            ForEach(Array(shown.enumerated()), id: \.element.id) { idx, viewer in
+                Circle()
+                    .fill(Color(collabRGB: viewer.color))
+                    .frame(width: dotSize, height: dotSize)
+                    .opacity(opacity(idx))
+            }
+        }
     }
 }
 
@@ -277,6 +331,7 @@ private struct TabStripButton: View {
     let isPinned: Bool
     let isDragging: Bool
     let hasUnreadOutput: Bool
+    let viewers: [TerminalModel.PresenceDot]
     let theme: TerminalTheme
     let onSelect: () -> Void
     let onClose: () -> Void
@@ -286,6 +341,17 @@ private struct TabStripButton: View {
     @State private var isXHovered = false
 
     private var showsActivityIndicator: Bool { hasUnreadOutput && !isActive }
+
+    private var accessibilityLabelText: String {
+        var label = "Select tab \(title)"
+        if !viewers.isEmpty {
+            label += viewers.count == 1
+                ? ", 1 participant viewing"
+                : ", \(viewers.count) participants viewing"
+        }
+        if showsActivityIndicator { label += ", new activity" }
+        return label
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -339,7 +405,16 @@ private struct TabStripButton: View {
                                          ? theme.swiftUIForeground
                                          : theme.swiftUIForeground.opacity(0.38))
                         .layoutPriority(1)
-                    if showsActivityIndicator {
+                    // Unified presence/activity cluster (issue #92). Remote
+                    // viewers show as their participant-colored dots on any
+                    // tab; those dots rumble when the tab also has unread
+                    // output. With no viewers, the original grey activity
+                    // ellipsis is preserved unchanged.
+                    if !viewers.isEmpty {
+                        PresenceDotsView(viewers: viewers,
+                                         animating: showsActivityIndicator,
+                                         theme: theme)
+                    } else if showsActivityIndicator {
                         AnimatedEllipsisView(color: theme.swiftUIForeground.opacity(0.55))
                     }
                     Spacer(minLength: 0)
@@ -350,9 +425,7 @@ private struct TabStripButton: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(showsActivityIndicator
-                                ? "Select tab \(title), new activity"
-                                : "Select tab \(title)")
+            .accessibilityLabel(accessibilityLabelText)
 
             // ⌘N shortcut hint.
             if index < 9 {

@@ -299,6 +299,12 @@ final class TerminalModel: ObservableObject {
     /// Which tab is currently focused (the one MetalTerminalView renders).
     @Published var activeTabId: UInt32?
 
+    /// Per-tab presence (issue #92): which tab each participant is currently
+    /// viewing, keyed by identity. Maintained on host and peer; drives the
+    /// colored presence dots in the tab strip. Distinct from
+    /// `participantFocusedTab`, which is host-only shared-input bookkeeping.
+    @Published var tabViewers: [UserIdentity: UInt32] = [:]
+
     @Published var rootPath: String?
     @Published var boreBundlePath: String?  // kept for sidebar diagnostics display
     /// Non-nil when a supported tunnel tool (ngrok or bore) is available.
@@ -848,6 +854,7 @@ final class TerminalModel: ObservableObject {
         splitPaneGrids.removeAll()
         participantFocusedPane.removeAll()
         participantFocusedTab.removeAll()
+        tabViewers.removeAll()
         sharedInputNeedsLineClear.removeAll()
         for timer in sharedInputTransientOutputTimers.values {
             timer.invalidate()
@@ -945,6 +952,7 @@ final class TerminalModel: ObservableObject {
         sharedInputTransientOutputTimers.removeValue(forKey: id)?.invalidate()
         unreadIdleTimers.removeValue(forKey: id)?.invalidate()
         participantFocusedTab = participantFocusedTab.filter { $0.value != id }
+        tabViewers = tabViewers.filter { $0.value != id }
         pendingHostTabInitialSnapshots.remove(id)
         pendingHostTabStartCwds.removeValue(forKey: id)
         pendingHostTabStartWorkItems.removeValue(forKey: id)?.cancel()
@@ -2204,6 +2212,9 @@ final class TerminalModel: ObservableObject {
                 // Send current tab list (TabOpen + per-tab snapshot + TabFocus)
                 // to the joining peer so it materializes the same tabs we have.
                 sendTabSnapshots(toTransportPeerID: peerID)
+                // Seed per-tab presence so the joining peer renders existing
+                // viewers' dots immediately (issue #92).
+                sendTabViewingSnapshot(toTransportPeerID: peerID)
                 // Legacy bare-PtyOutput snapshot for backward compat.
                 broadcastTerminalSnapshot()
                 broadcastSharedInputSnapshots()
@@ -2285,6 +2296,7 @@ final class TerminalModel: ObservableObject {
                 }
                 let previousId = participantFocusedTab[identity]
                 participantFocusedTab[identity] = tabId
+                noteTabViewer(identity, viewing: tabId)
                 if let previousId, previousId != tabId {
                     syncSharedInputParticipants(tabId: previousId, broadcast: true)
                 }
@@ -2298,6 +2310,17 @@ final class TerminalModel: ObservableObject {
                 } else if !tabs.contains(where: { $0.id == tabId }) {
                     pendingPeerFocusedTabId = tabId
                 }
+            }
+        case .tabViewing(let identity, let tabId):
+            // Per-tab presence relay from the host (issue #92). Peers apply it
+            // directly to render presence dots; the host is the source and
+            // ignores any echo. Skip our own identity — we track that locally
+            // through `recordLocalTabFocus` for immediate feedback.
+            guard sessionManager.role == .peer,
+                  identity != sessionManager.localIdentity
+            else { return }
+            if tabViewers[identity] != tabId {
+                tabViewers[identity] = tabId
             }
         case .tabPtyOutput(let tabId, let data):
             guard sessionManager.role == .peer else { return }
@@ -2567,6 +2590,45 @@ final class TerminalModel: ObservableObject {
         if broadcast, sessionManager.state == .running {
             sessionManager.sendTabFocus(tabId: tabId)
         }
+        noteTabViewer(sessionManager.localIdentity, viewing: tabId)
+    }
+
+    /// Record that `identity` is now viewing `tabId` for per-tab presence dots
+    /// (issue #92) and, on the host, relay it to every peer. Idempotent. The
+    /// host is the hub: it learns peers' focus from `tabFocus` frames and its
+    /// own from `recordLocalTabFocus`, then fans the merged picture out so all
+    /// clients (including itself) can render presence consistently.
+    private func noteTabViewer(_ identity: UserIdentity, viewing tabId: UInt32) {
+        if tabViewers[identity] != tabId {
+            tabViewers[identity] = tabId
+        }
+        if sessionManager.role == .host {
+            sessionManager.sendTabViewing(identity: identity, tabId: tabId)
+        }
+    }
+
+    /// A remote participant currently viewing a tab, with their roster color.
+    struct PresenceDot: Identifiable, Equatable {
+        let id: UserIdentity
+        let color: UInt32
+    }
+
+    /// Remote participants (self excluded) currently viewing `tabId`, paired
+    /// with their roster colors. Filtered to the live roster so a departed
+    /// participant's stale `tabViewers` entry never renders, and sorted for a
+    /// stable left-to-right dot order. Drives the tab-strip presence dots
+    /// (issue #92).
+    func remoteViewers(ofTab tabId: UInt32) -> [PresenceDot] {
+        guard !tabViewers.isEmpty else { return [] }
+        let local = sessionManager.localIdentity
+        let parts = sessionManager.participants
+        return tabViewers.compactMap { identity, focused -> PresenceDot? in
+            guard focused == tabId, identity != local,
+                  let p = parts.first(where: { $0.identity == identity })
+            else { return nil }
+            return PresenceDot(id: identity, color: p.color)
+        }
+        .sorted { $0.id.bytes.lexicographicallyPrecedes($1.id.bytes) }
     }
 
     private func isHostSharedLineSession(tabId: UInt32) -> Bool {
@@ -2688,6 +2750,7 @@ final class TerminalModel: ObservableObject {
             if participantFocusedTab[request.actor] != tabId {
                 let previousId = participantFocusedTab[request.actor]
                 participantFocusedTab[request.actor] = tabId
+                noteTabViewer(request.actor, viewing: tabId)
                 if let previousId, previousId != tabId {
                     syncSharedInputParticipants(tabId: previousId, broadcast: true)
                 }
@@ -3280,6 +3343,21 @@ final class TerminalModel: ObservableObject {
         if let activeId = activeTabId {
             sessionManager.sendTabFocus(
                 tabId: activeId,
+                toTransportPeerID: peerID)
+        }
+    }
+
+    /// Host only: seed a newly-joined peer with the current per-tab presence
+    /// map so existing viewers' dots appear immediately (issue #92). Only sends
+    /// entries whose tab still exists.
+    private func sendTabViewingSnapshot(toTransportPeerID peerID: UInt32) {
+        guard sessionManager.role == .host,
+              sessionManager.state == .running
+        else { return }
+        let liveTabIds = Set(tabs.map(\.id))
+        for (identity, tabId) in tabViewers where liveTabIds.contains(tabId) {
+            sessionManager.sendTabViewing(
+                identity: identity, tabId: tabId,
                 toTransportPeerID: peerID)
         }
     }
