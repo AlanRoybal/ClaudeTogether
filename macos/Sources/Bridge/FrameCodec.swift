@@ -47,6 +47,12 @@ enum FrameTag: UInt8 {
     // or sends a denial so the peer gets feedback instead of silence.
     case requestControl = 0x21
     case controlDenied  = 0x22
+    // Per-tab presence (issue #92). The host relays each participant's
+    // currently-viewed tab to all peers so every client can render presence
+    // dots on the tab strip. Distinct from `tabFocus`, which carries no
+    // identity and drives shared-input bookkeeping. Swift-only, like the pane
+    // and access-control frames above (the zig core relays it opaquely).
+    case tabViewing = 0x23
 }
 
 enum SessionRole: UInt8 {
@@ -156,6 +162,7 @@ enum Frame {
     case kick(UserIdentity)
     case requestControl(UserIdentity)
     case controlDenied(UserIdentity)
+    case tabViewing(identity: UserIdentity, tabId: UInt32)
 }
 
 /// Which direction a split divides the terminal viewport.
@@ -322,6 +329,10 @@ enum FrameCodec {
         case .controlDenied(let id):
             out.append(FrameTag.controlDenied.rawValue)
             out.append(contentsOf: id.bytes)
+        case .tabViewing(let id, let tabId):
+            out.append(FrameTag.tabViewing.rawValue)
+            out.append(contentsOf: id.bytes)
+            appendU32(&out, tabId)
         }
         return out
     }
@@ -515,6 +526,10 @@ enum FrameCodec {
         case .controlDenied:
             let id = try UserIdentity.from(exactly16: Array(try r.readBytes(16)))
             return .controlDenied(id)
+        case .tabViewing:
+            let id = try UserIdentity.from(exactly16: Array(try r.readBytes(16)))
+            let tabId = try r.readU32()
+            return .tabViewing(identity: id, tabId: tabId)
         }
     }
 
