@@ -1816,6 +1816,17 @@ final class TerminalModel: ObservableObject {
             secret: tool.server.isEmpty ? "" : SessionManager.boreSecret)
     }
 
+    /// Show a themed, non-fatal error when a join attempt can't proceed.
+    private func presentJoinError(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = "Couldn't join session"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.window.appearance = terminalTheme.nsAppearance
+        alert.runModal()
+    }
+
     func promptJoin() {
         let alert = NSAlert()
         alert.messageText = "Join shared session"
@@ -1856,6 +1867,12 @@ final class TerminalModel: ObservableObject {
               !hostPort[..<colon].isEmpty
         else {
             NSLog("join: malformed \(raw)")
+            presentJoinError("That doesn't look like a valid session link or host:port address.")
+            return
+        }
+        // Fail closed: refuse to join without the end-to-end encryption key.
+        guard extractedKey != nil else {
+            presentJoinError("This link is missing its encryption key (#k=...). Ask the host to re-share the session URL.")
             return
         }
         let host = String(hostPort[..<colon])
@@ -1905,6 +1922,13 @@ final class TerminalModel: ObservableObject {
         else { return }
         let keyStr = comps.queryItems?.first(where: { $0.name == "k" })?.value
         let extractedKey = keyStr.flatMap { SessionKey(base64url: $0) }
+        // Fail closed: sessions are end-to-end encrypted, so a link with no
+        // (or an undecodable) key would connect in plaintext and silently
+        // garble against the encrypting host. Refuse with a clear error.
+        guard extractedKey != nil else {
+            presentJoinError("This link is missing its encryption key. Ask the host to re-share the session URL.")
+            return
+        }
         guard let colon = addr.lastIndex(of: ":"),
               let port = UInt16(addr[addr.index(after: colon)...]),
               !addr[..<colon].isEmpty
