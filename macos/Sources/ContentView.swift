@@ -2453,6 +2453,12 @@ final class TerminalModel: ObservableObject {
                     userId: userId,
                     anchor: anchor,
                     selectionAnchor: selectionAnchor)
+                // Re-announce the host's own presence so a peer that just opened
+                // the editor — and dropped the host's initial presence frame
+                // because its editor didn't exist yet — counts the host
+                // immediately ("2 editors") instead of waiting for the host's
+                // next caret move.
+                editor.broadcastPresenceNow()
             }
         case .editorSave(let docId):
             guard sessionManager.role == .host else { return }
