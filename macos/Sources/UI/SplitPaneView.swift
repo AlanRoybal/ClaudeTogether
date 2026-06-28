@@ -8,6 +8,12 @@ struct SplitPaneView: View {
     @ObservedObject var model: TerminalModel
     @ObservedObject var searchState: SearchState
 
+    /// The grid for the pane that currently has keyboard focus — Find searches
+    /// and highlights this one, not always the primary pane.
+    private var focusedGrid: GridModel {
+        (tab.activePaneIndex == 1 ? tab.splitPane?.grid : tab.grid) ?? tab.grid
+    }
+
     var body: some View {
         if let pane = tab.splitPane {
             switch tab.splitAxis {
@@ -59,8 +65,8 @@ struct SplitPaneView: View {
                 theme: model.terminalTheme,
                 fontName: model.fontName,
                 ligaturesEnabled: model.ligaturesEnabled,
-                searchMatches: searchState.matches,
-                currentMatchIndex: searchState.currentMatchIndex)
+                searchMatches: tab.activePaneIndex == 0 ? searchState.matches : [],
+                currentMatchIndex: tab.activePaneIndex == 0 ? searchState.currentMatchIndex : nil)
             SharedInputCompletionHintsOverlay(
                 grid: tab.grid,
                 autocomplete: model.inputAutocomplete,
@@ -81,10 +87,13 @@ struct SplitPaneView: View {
         }
         .frame(minWidth: 200, minHeight: 100)
         .onChange(of: searchState.query) { _ in
-            searchState.scan(grid: tab.grid)
+            searchState.scan(grid: focusedGrid)
         }
         .onChange(of: searchState.isVisible) { visible in
-            if visible { searchState.scan(grid: tab.grid) }
+            if visible { searchState.scan(grid: focusedGrid) }
+        }
+        .onChange(of: tab.activePaneIndex) { _ in
+            if searchState.isVisible { searchState.scan(grid: focusedGrid) }
         }
     }
 
@@ -123,8 +132,8 @@ struct SplitPaneView: View {
                 theme: model.terminalTheme,
                 fontName: model.fontName,
                 ligaturesEnabled: model.ligaturesEnabled,
-                searchMatches: [],
-                currentMatchIndex: nil)
+                searchMatches: tab.activePaneIndex == 1 ? searchState.matches : [],
+                currentMatchIndex: tab.activePaneIndex == 1 ? searchState.currentMatchIndex : nil)
             paneFocusIndicator(active: tab.activePaneIndex == 1)
         }
         .frame(minWidth: 200, minHeight: 100)

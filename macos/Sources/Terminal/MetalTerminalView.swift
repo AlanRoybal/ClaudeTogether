@@ -269,11 +269,14 @@ final class MetalTerminalNSView: NSView {
             reportClick(event: event, button: SGRButton.left, pressed: true)
             return
         }
-        // OSC 8: cmd+click opens the hyperlink under the cursor.
+        // OSC 8: cmd+click opens the hyperlink under the cursor. Use the
+        // bounds-checked cell lookup so a click in the reserved corner inset
+        // or past the right edge doesn't clamp onto — and open — the last
+        // cell's link.
         if event.modifierFlags.contains(.command) {
-            let loc = convert(event.locationInWindow, from: nil)
-            let cell = cellAt(point: loc)
-            if let url = grid.term.cellUrl(col: UInt16(cell.col), row: UInt16(cell.row)) {
+            let cell = gridCell(for: event)
+            if cell.inside,
+               let url = grid.term.cellUrl(col: UInt16(cell.col), row: UInt16(cell.row)) {
                 NSWorkspace.shared.open(url)
                 return
             }
@@ -377,6 +380,10 @@ final class MetalTerminalNSView: NSView {
 
     override func flagsChanged(with event: NSEvent) {
         super.flagsChanged(with: event)
+        // The OSC 8 link underline is gated on the live Cmd state, which is not
+        // a grid mutation — force a redraw so it tracks the modifier in lockstep
+        // with the hover cursor instead of waiting for the next unrelated frame.
+        renderer.requestRedraw()
         let c = lastHoverCell
         guard c.col >= 0 else { return }
         updateLinkCursor(col: c.col, row: c.row,
@@ -606,8 +613,10 @@ final class MetalTerminalNSView: NSView {
                     line.append(" ")
                 }
             }
+            // Trim trailing spaces on every line (including the last) so
+            // copied text never carries cell-padding whitespace.
+            while let last = line.last, last == " " { line.removeLast() }
             if r != end.row {
-                while let last = line.last, last == " " { line.removeLast() }
                 result += line + "\n"
             } else {
                 result += line

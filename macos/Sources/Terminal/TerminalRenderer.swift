@@ -310,6 +310,14 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         }
     }
 
+    /// Force a redraw on the next frame even though no grid/renderer mutation
+    /// occurred — used when the live Cmd modifier toggles, which shows/hides
+    /// OSC 8 link underlines.
+    func requestRedraw() {
+        rendererMutationSeq &+= 1
+        if let v = view { v.setNeedsDisplay(v.bounds) }
+    }
+
     func setFontName(_ newName: String) {
         guard newName != fontName else { return }
         fontName = newName

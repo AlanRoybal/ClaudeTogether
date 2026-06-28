@@ -1450,14 +1450,22 @@ final class TerminalModel: ObservableObject {
               let tab = tabs.first(where: { $0.id == activeTabId })
         else { return }
         let bytes = Array("\u{1B}[2J\u{1B}[H\u{1B}[3J".utf8)
-        tab.grid.feed(bytes)
+        // Clear the pane the user is actually focused on, not always the
+        // primary pane.
+        let focusSplit = tab.activePaneIndex == 1, splitPane = tab.splitPane
+        let target = (focusSplit ? splitPane?.grid : tab.grid) ?? tab.grid
+        target.feed(bytes)
         // If we're hosting a shared session, propagate the clear so peers'
         // mirrored grids stay in sync.
         if sessionManager.role == .host, sessionManager.state == .running {
             let payload = Data(bytes)
-            sessionManager.sendTabPtyOutput(tabId: activeTabId, data: payload)
-            if tabs.count <= 1 {
-                sessionManager.sendPtyOutput(payload)
+            if focusSplit, let paneId = splitPane?.id {
+                sessionManager.sendPanePtyOutput(paneId: paneId, data: payload)
+            } else {
+                sessionManager.sendTabPtyOutput(tabId: activeTabId, data: payload)
+                if tabs.count <= 1 {
+                    sessionManager.sendPtyOutput(payload)
+                }
             }
         }
     }
@@ -1516,7 +1524,8 @@ final class TerminalModel: ObservableObject {
         else { return }
         let sanitized = TerminalPasteSanitizer.sanitize(s)
         guard !sanitized.isEmpty else { return }
-        handlePaste(sanitized, forTabId: activeTabId)
+        let paneIndex = tabs.first(where: { $0.id == activeTabId })?.activePaneIndex ?? 0
+        handlePaste(sanitized, forTabId: activeTabId, paneIndex: paneIndex)
     }
 
     func handlePaste(_ sanitized: String, forTabId tabId: UInt32, paneIndex: Int = 0) {

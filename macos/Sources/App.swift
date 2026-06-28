@@ -76,6 +76,7 @@ struct CoTTYApp: App {
                 .keyboardShortcut("d", modifiers: .command)
                 .disabled(model.sessionManager.role != .host
                           || model.activeTabForView?.splitPane != nil
+                          || (model.activeTabForView?.isRawMode ?? false)
                           || model.tabs.isEmpty)
 
                 Button("Split Pane Vertically") {
@@ -84,6 +85,7 @@ struct CoTTYApp: App {
                 .keyboardShortcut("d", modifiers: [.command, .shift])
                 .disabled(model.sessionManager.role != .host
                           || model.activeTabForView?.splitPane != nil
+                          || (model.activeTabForView?.isRawMode ?? false)
                           || model.tabs.isEmpty)
 
                 Button("Close Split Pane") {
