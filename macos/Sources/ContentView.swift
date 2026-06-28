@@ -1582,18 +1582,22 @@ final class TerminalModel: ObservableObject {
     }
 
     func formatWithPrettier() {
-        guard sessionManager.role == .host,
-              let editor = activeEditor,
-              let url = resolveEditorURL(sessionPath: editor.state.path) else { return }
+        guard sessionManager.role == .host, let editor = activeEditor else { return }
+        guard let url = resolveEditorURL(sessionPath: editor.state.path) else {
+            postTerminalNotice("Format failed — could not resolve the editor file path")
+            return
+        }
         saveEditor(docId: editor.state.docId)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["prettier", "--write", url.path]
         process.terminationHandler = { [weak self] proc in
             guard proc.terminationStatus == 0 else {
-                if proc.terminationStatus == 127 {
-                    DispatchQueue.main.async {
+                DispatchQueue.main.async {
+                    if proc.terminationStatus == 127 {
                         self?.postTerminalNotice("prettier not found — install with: npm i -g prettier")
+                    } else {
+                        self?.postTerminalNotice("prettier failed (exit \(proc.terminationStatus)) — see the file for syntax errors")
                     }
                 }
                 return
@@ -4135,7 +4139,13 @@ final class TerminalModel: ObservableObject {
     }
 
     private func postTerminalNotice(_ message: String) {
-        guard activeEditor == nil else { return }
+        // The terminal grid is hidden while the collaborative editor is open,
+        // so route notices to the overlay toast instead of silently dropping
+        // them (e.g. Prettier format errors, which only occur with an editor up).
+        guard activeEditor == nil else {
+            showSessionNotification(message)
+            return
+        }
         let bytes = Array("\r\n[\(message)]\r\n".utf8)
         grid?.feed(bytes)
         if sessionManager.role == .host, sessionManager.state == .running {
