@@ -5,11 +5,6 @@ options:
     macOS: "14.0"
   createIntermediateGroups: true
 
-packages:
-  SwiftTerm:
-    url: https://github.com/migueldeicaza/SwiftTerm
-    from: "1.2.0"
-
 configFiles:
   Debug: Secrets.xcconfig
   Release: Secrets.xcconfig
@@ -49,9 +44,6 @@ targets:
           - $(SRCROOT)/Vendor
         OTHER_LDFLAGS:
           - -lcollabterm
-    dependencies:
-      - package: SwiftTerm
-        product: SwiftTerm
     postBuildScripts:
       - name: Bundle bore helper
         # Bundle bore as nested code under Contents/Helpers. Launching a Mach-O
