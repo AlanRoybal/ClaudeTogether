@@ -16,6 +16,12 @@ final class ThemeLibrary: ObservableObject {
     private var dirFD: Int32 = -1
 
     func load() {
+        reloadThemes()
+        ensureWatching()
+    }
+
+    /// Re-enumerate the themes directory into `themes` (no watch side effects).
+    private func reloadThemes() {
         let fm = FileManager.default
         if !fm.fileExists(atPath: themesDir.path) {
             try? fm.createDirectory(at: themesDir, withIntermediateDirectories: true)
@@ -36,7 +42,6 @@ final class ThemeLibrary: ObservableObject {
         }
         loaded.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         themes = loaded
-        startWatching()
     }
 
     /// Copies a theme file into the themes directory and reloads.
@@ -55,7 +60,7 @@ final class ThemeLibrary: ObservableObject {
 
     // MARK: - FSEvents directory watch
 
-    private func startWatching() {
+    private func ensureWatching() {
         guard fsSource == nil else { return }
         let fd = open(themesDir.path, O_EVTONLY)
         guard fd >= 0 else { return }
@@ -67,14 +72,31 @@ final class ThemeLibrary: ObservableObject {
             queue: .main
         )
         source.setEventHandler { [weak self] in
-            self?.load()
+            guard let self else { return }
+            let flags = source.data
+            self.reloadThemes()
+            // If the directory itself was renamed/deleted, our fd now points at
+            // a dead inode and will never fire again — tear down and re-arm a
+            // fresh watch on the recreated directory.
+            if flags.contains(.delete) || flags.contains(.rename) {
+                self.restartWatching()
+            }
         }
+        // Capture this fd so the handler closes exactly the fd it owns, even if
+        // `dirFD` has since been replaced by a re-armed watch.
         source.setCancelHandler { [weak self] in
-            if let fd = self?.dirFD, fd >= 0 { close(fd) }
-            self?.dirFD = -1
-            self?.fsSource = nil
+            close(fd)
+            if self?.dirFD == fd { self?.dirFD = -1 }
         }
         source.resume()
         fsSource = source
+    }
+
+    /// Cancel the current watch and arm a fresh one (used after the themes
+    /// directory's inode is replaced).
+    private func restartWatching() {
+        fsSource?.cancel()
+        fsSource = nil      // drop our reference now so ensureWatching re-arms
+        ensureWatching()
     }
 }

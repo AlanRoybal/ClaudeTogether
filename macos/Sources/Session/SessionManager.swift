@@ -108,6 +108,15 @@ final class SessionManager: ObservableObject {
     /// Host-only: transport peer id → user identity (filled on Hello).
     private var transportToIdentity: [UInt32: UserIdentity] = [:]
 
+    /// Host-only: identities that were kicked, so a reconnect attempt from the
+    /// same peer is rejected instead of silently re-admitted.
+    private var bannedIdentities: Set<UserIdentity> = []
+
+    /// Decrypt-failure tracking so a wrong-key join fails closed with a clear
+    /// message instead of silently swallowing every frame.
+    private var decryptFailureStreak = 0
+    private var hasDecodedFrame = false
+
     private static let keepAliveInterval: TimeInterval = 15
 
     /// Peer-only auto-reconnect (#61): the host:port of the last successful
@@ -223,6 +232,9 @@ final class SessionManager: ObservableObject {
         }
         participants.removeAll()
         transportToIdentity.removeAll()
+        bannedIdentities.removeAll()
+        decryptFailureStreak = 0
+        hasDecodedFrame = false
         localPort = 0
         publicURL = nil
         lastError = nil
@@ -516,6 +528,9 @@ final class SessionManager: ObservableObject {
         guard let peerID = transportToIdentity.first(where: { $0.value == identity })?.key,
               let h = handle else { return }
 
+        // Remember the kick so a reconnect from the same identity is rejected.
+        bannedIdentities.insert(identity)
+
         // Notify the peer before the socket drops (TCP ordering guarantees delivery).
         send(.kick(identity), toTransportPeerID: peerID)
 
@@ -752,14 +767,36 @@ final class SessionManager: ObservableObject {
             }
             count += 1
             let wire = Data(buf.prefix(n))
-            do {
-                let plain: Data
-                if let key = sessionKey {
+            let plain: Data
+            if let key = sessionKey {
+                do {
                     plain = try key.decrypt(wire)
-                } else {
-                    plain = wire
+                } catch {
+                    // A decrypt/authentication failure means the key doesn't
+                    // match the host (or the ciphertext was tampered with) —
+                    // not a benign frame-decode issue. If we never managed to
+                    // decrypt anything, the secure channel never established;
+                    // tear down with a clear message instead of silently
+                    // retrying every frame forever.
+                    decryptFailureStreak += 1
+                    if !hasDecodedFrame && decryptFailureStreak >= 3 {
+                        let msg = "Couldn't decrypt the session — the encryption key doesn't match the host. Re-join with a fresh link."
+                        // stop() resets state to .idle, so surface the failure
+                        // afterwards so the user actually sees why it ended.
+                        stop()
+                        lastError = msg
+                        state = .failed(msg)
+                        return count
+                    }
+                    continue
                 }
+            } else {
+                plain = wire
+            }
+            do {
                 let frame = try FrameCodec.decode(plain)
+                decryptFailureStreak = 0
+                hasDecodedFrame = true
                 handleFrame(frame, from: peerID)
             } catch {
                 lastError = "decode: \(error)"
@@ -893,6 +930,13 @@ final class SessionManager: ObservableObject {
         switch frame {
         case .hello(let id, let helloRole, let color, let name):
             if role == .host {
+                // A previously-kicked peer trying to reconnect: drop them
+                // again instead of silently re-admitting to the roster.
+                if bannedIdentities.contains(id) {
+                    send(.kick(id), toTransportPeerID: peerID)
+                    if let h = handle { ct_session_drop_peer(h, peerID) }
+                    return
+                }
                 transportToIdentity[peerID] = id
                 upsertParticipant(identity: id, role: helloRole,
                                   name: name, color: color)

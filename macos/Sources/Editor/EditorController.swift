@@ -218,6 +218,10 @@ final class EditorController {
         else {
             return
         }
+        // A range selection should hide any open completion popover.
+        if clampedAnchor != clampedHead {
+            autocomplete.dismiss()
+        }
         bumpEpoch()
         schedulePresence()
     }
@@ -259,7 +263,7 @@ final class EditorController {
             return
         }
         guard changed else { return }
-        refreshText()
+        refreshText(recomputeAC: false)
 
         // Rebase caret. nil anchor == caret was at head; keep at 0.
         if state.localCaret == 0 {
@@ -364,14 +368,16 @@ final class EditorController {
     private func insertText(_ s: String) {
         guard !s.isEmpty else { return }
         var inverses: [InverseOp] = []
+        // Capture caret/selection BEFORE deleting any selection — otherwise
+        // typing over a selection records a nil selection anchor and undo
+        // lands a collapsed caret instead of restoring the typed-over range.
+        let caretBefore = state.localCaret
+        let selBefore = state.localSelectionAnchor
         if state.localSelectionAnchor != nil {
             if let delInv = deleteSelection() {
                 inverses.append(contentsOf: delInv)
             }
         }
-
-        let caretBefore = state.localCaret
-        let selBefore = state.localSelectionAnchor
 
         for scalar in s.unicodeScalars {
             let pos = state.localCaret
@@ -725,11 +731,33 @@ final class EditorController {
 
     /// Replace the entire document content with `text`. Used by external
     /// formatters (e.g. Prettier) that rewrite the file on disk.
+    ///
+    /// This is driven through broadcasting CRDT ops (delete-all then
+    /// insert-all) rather than a raw `loadSnapshot`: a snapshot swap mints a
+    /// fresh id space locally and is never sent to peers, so their open
+    /// editors keep the pre-format document and permanently diverge. Emitting
+    /// real ops keeps every replica converged.
     func replaceText(_ text: String) throws {
-        guard let data = text.data(using: .utf8) else { return }
-        try core.loadSnapshot(data)
+        // Delete the existing document from the end backwards so visible
+        // offsets stay valid as we go; each op is broadcast via `sendOp`.
+        var count = scalarCount
+        while count > 0 {
+            count -= 1
+            _ = deleteOne(at: count)
+        }
+        // Insert the formatted content at the head, one scalar at a time.
+        var pos = 0
+        for scalar in text.unicodeScalars {
+            if let opData = try? core.localInsert(at: pos, codepoint: scalar.value) {
+                sendOp(opData)
+                pos += 1
+            }
+        }
         state.localCaret = 0
         state.localSelectionAnchor = nil
+        // A whole-document rewrite invalidates the id-based undo/redo history.
+        undoStack.removeAll()
+        redoStack.removeAll()
         refreshText()
         state.dirty = true
     }
@@ -802,14 +830,19 @@ final class EditorController {
 
     // MARK: - Utilities
 
-    private func refreshText() {
+    /// Re-materialize text and re-index. `recomputeAC` is false for
+    /// remote-driven refreshes so a peer's edit elsewhere in the document
+    /// doesn't resurface or recompute the local user's autocomplete popover.
+    private func refreshText(recomputeAC: Bool = true) {
         do {
             state.text = try core.toUtf8()
         } catch {
             NSLog("EditorController.refreshText failed: \(error)")
         }
         wordIndex.setText(state.text)
-        recomputeAutocomplete()
+        if recomputeAC {
+            recomputeAutocomplete()
+        }
         scheduleHighlights()
     }
 

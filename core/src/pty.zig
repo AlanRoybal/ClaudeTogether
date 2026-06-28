@@ -75,7 +75,10 @@ pub fn kill(pid: c_int) void {
     // without this every closed tab leaves a zombie for the app's lifetime.
     // A detached thread blocks in waitpid until the child actually exits.
     const t = std.Thread.spawn(.{}, reap, .{pid}) catch {
-        _ = c.waitpid(pid, null, c.WNOHANG); // best-effort fallback
+        // Thread spawn failed (resource exhaustion): block briefly to reap
+        // rather than WNOHANG, which would return before the child exits and
+        // leak a zombie. We already sent SIGTERM, so the child exits promptly.
+        _ = c.waitpid(pid, null, 0);
         return;
     };
     t.detach();

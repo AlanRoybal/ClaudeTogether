@@ -717,7 +717,9 @@ pub const Grid = struct {
 
     fn eraseChars(self: *Grid, n: u16) void {
         const row = self.rowSlice(self.cursor_y);
-        const end = @min(self.cols, self.cursor_x + n);
+        // Widen to u32 first: cursor_x + n can exceed u16 for large ECH params
+        // (params are capped at 65535) and would otherwise wrap before @min.
+        const end: u16 = @intCast(@min(@as(u32, self.cols), @as(u32, self.cursor_x) + @as(u32, n)));
         self.clearRange(row, self.cursor_x, end);
     }
 

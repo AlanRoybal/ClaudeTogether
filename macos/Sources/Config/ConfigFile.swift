@@ -84,14 +84,15 @@ final class ConfigFile: ObservableObject {
                 continue
             }
 
-            // Strip inline comments before splitting on =
-            let stripped = line.components(separatedBy: " #").first ?? line
-            let parts = stripped.split(separator: "=", maxSplits: 1)
-                .map { $0.trimmingCharacters(in: .whitespaces)
-                         .trimmingCharacters(in: CharacterSet(charactersIn: "\"")) }
-            guard parts.count == 2 else { continue }
-            let key = parts[0].lowercased()
-            let val = parts[1]
+            // Split on the first '=', then strip any inline comment from the
+            // value while respecting double quotes (so `theme = "a#b" # note`
+            // keeps `a#b`), then trim surrounding quotes/whitespace.
+            let kv = line.split(separator: "=", maxSplits: 1)
+            guard kv.count == 2 else { continue }
+            let key = kv[0].trimmingCharacters(in: .whitespaces).lowercased()
+            let val = stripInlineComment(String(kv[1]))
+                .trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
 
             switch section {
             case "terminal":
@@ -114,6 +115,19 @@ final class ConfigFile: ObservableObject {
             }
         }
         return vals
+    }
+
+    /// Drop a trailing `# comment` from a TOML value, ignoring `#` that
+    /// appears inside a double-quoted string.
+    private static func stripInlineComment(_ s: String) -> String {
+        var inQuotes = false
+        var result = ""
+        for ch in s {
+            if ch == "\"" { inQuotes.toggle() }
+            if ch == "#" && !inQuotes { break }
+            result.append(ch)
+        }
+        return result
     }
 
     private static func parseBool(_ s: String) -> Bool? {

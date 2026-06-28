@@ -36,16 +36,16 @@ struct CoTTYApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("New Tab") { model.openNewTab() }
                     .keyboardShortcut("t", modifiers: .command)
+                    .disabled(model.sessionManager.role == .peer)
 
                 Button("Close Tab") { model.closeActiveTab() }
                     .keyboardShortcut("w", modifiers: .command)
-                    .disabled(model.tabs.isEmpty)
+                    .disabled(model.tabs.isEmpty || model.sessionManager.role == .peer)
 
                 Divider()
 
                 Button("Choose Project Folder…") { model.pickProjectFolder() }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
-                    .disabled(model.sessionManager.state == .running)
 
                 Divider()
 
@@ -76,6 +76,7 @@ struct CoTTYApp: App {
                 .keyboardShortcut("d", modifiers: .command)
                 .disabled(model.sessionManager.role != .host
                           || model.activeTabForView?.splitPane != nil
+                          || (model.activeTabForView?.isRawMode ?? false)
                           || model.tabs.isEmpty)
 
                 Button("Split Pane Vertically") {
@@ -84,6 +85,7 @@ struct CoTTYApp: App {
                 .keyboardShortcut("d", modifiers: [.command, .shift])
                 .disabled(model.sessionManager.role != .host
                           || model.activeTabForView?.splitPane != nil
+                          || (model.activeTabForView?.isRawMode ?? false)
                           || model.tabs.isEmpty)
 
                 Button("Close Split Pane") {
@@ -134,7 +136,7 @@ struct CoTTYApp: App {
                     .disabled(model.grid == nil)
                 Divider()
                 Button("Increase Font Size") { model.increaseFontSize() }
-                    .keyboardShortcut("+", modifiers: .command)
+                    .keyboardShortcut("=", modifiers: .command)
                 Button("Decrease Font Size") { model.decreaseFontSize() }
                     .keyboardShortcut("-", modifiers: .command)
                 Button("Reset Font Size") { model.resetFontSize() }
@@ -497,8 +499,10 @@ struct HexColorField: View {
                         color = parsed
                         isValid = true
                     } else {
-                        isValid = text.trimmingCharacters(in: .init(charactersIn: "#")).isEmpty || false
-                        isValid = false
+                        // Treat an empty / in-progress field as neutral (not an
+                        // error) so it doesn't flash red while the user types.
+                        let trimmed = val.trimmingCharacters(in: .init(charactersIn: "# "))
+                        isValid = trimmed.isEmpty
                     }
                 }
                 .onAppear { text = String(format: "#%06X", color) }

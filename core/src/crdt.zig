@@ -265,17 +265,17 @@ pub const Sequence = struct {
             for (next.items) |existing| {
                 if (Id.eql(existing.id, id)) return error.InvalidSnapshot;
             }
-            const valid_codepoint = std.math.cast(u21, codepoint) orelse {
-                return error.InvalidSnapshot;
-            };
-            var utf8_buf: [4]u8 = undefined;
-            _ = try std.unicode.utf8Encode(valid_codepoint, &utf8_buf);
+            // Sanitize invalid/surrogate/out-of-range codepoints to U+FFFD
+            // rather than rejecting the whole snapshot — this matches apply(),
+            // so the same hostile value converges identically whether it
+            // arrives as a live op or inside a join snapshot.
+            const safe_cp = sanitizeCodepoint(codepoint);
 
             if (id.clock > max_clock) max_clock = id.clock;
             next.appendAssumeCapacity(.{
                 .id = id,
                 .after = after,
-                .codepoint = codepoint,
+                .codepoint = safe_cp,
                 .deleted = deleted,
             });
         }

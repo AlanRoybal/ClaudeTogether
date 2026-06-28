@@ -126,6 +126,7 @@ final class MetalEditorNSView: NSView {
             controller.state.localSelectionAnchor = 0
             controller.state.localCaret = controller.state.text.unicodeScalars.count
             controller.state.epoch &+= 1
+            controller.autocomplete.dismiss()
             controller.broadcastPresenceNow()
             return true
         default:

@@ -868,10 +868,23 @@ final class TerminalModel: ObservableObject {
         pendingHostTabInitialSnapshots.removeAll()
         pendingPeerTabOutput.removeAll()
         pendingPeerFocusedTabId = nil
-        lastKnownTerminalGridSize = nil
+        // NOTE: deliberately keep `lastKnownTerminalGridSize`. It always holds
+        // the *local* window's measured grid size (every peer/host view reports
+        // its own drawable size via handleResize), and the window doesn't change
+        // size when a session ends. Clearing it forced openInitialTab() to DEFER
+        // the home shell's PTY spawn until the next onResize callback — but a
+        // reused, same-size MetalTerminalView never re-fires onResize, so a
+        // kicked peer was left staring at a blank, never-spawned terminal.
+        // Keeping the size lets openInitialTab() spawn the home shell immediately.
         cancelPendingHostTabStarts()
         pendingHostTabStartCwds.removeAll()
         freshlyRespawnedTabs.removeAll()
+        // Clear paste/drop placeholder state so a stale placeholder from the
+        // ended session can't try to delete phantom bytes in the new shell,
+        // and the "#N" counters restart fresh.
+        activePlaceholder = nil
+        pasteCounter = 0
+        imageDropCounter = 0
         stopSharing()
         stopTitlePolling()
         stopModeProbe()
@@ -943,7 +956,10 @@ final class TerminalModel: ObservableObject {
         let tab = tabs[idx]
         // Close protection: a pinned tab must be unpinned before it can close.
         // The strip hides its close button, so this guards the Cmd-W path.
-        if tab.isPinned {
+        // Exception: if it's the *last* tab, Cmd-W must still be able to end the
+        // session — otherwise a lone pinned tab traps the user (no close button,
+        // no way to end via Cmd-W).
+        if tab.isPinned && tabs.count > 1 {
             NSSound.beep()
             return
         }
@@ -1437,14 +1453,22 @@ final class TerminalModel: ObservableObject {
               let tab = tabs.first(where: { $0.id == activeTabId })
         else { return }
         let bytes = Array("\u{1B}[2J\u{1B}[H\u{1B}[3J".utf8)
-        tab.grid.feed(bytes)
+        // Clear the pane the user is actually focused on, not always the
+        // primary pane.
+        let focusSplit = tab.activePaneIndex == 1, splitPane = tab.splitPane
+        let target = (focusSplit ? splitPane?.grid : tab.grid) ?? tab.grid
+        target.feed(bytes)
         // If we're hosting a shared session, propagate the clear so peers'
         // mirrored grids stay in sync.
         if sessionManager.role == .host, sessionManager.state == .running {
             let payload = Data(bytes)
-            sessionManager.sendTabPtyOutput(tabId: activeTabId, data: payload)
-            if tabs.count <= 1 {
-                sessionManager.sendPtyOutput(payload)
+            if focusSplit, let paneId = splitPane?.id {
+                sessionManager.sendPanePtyOutput(paneId: paneId, data: payload)
+            } else {
+                sessionManager.sendTabPtyOutput(tabId: activeTabId, data: payload)
+                if tabs.count <= 1 {
+                    sessionManager.sendPtyOutput(payload)
+                }
             }
         }
     }
@@ -1503,7 +1527,8 @@ final class TerminalModel: ObservableObject {
         else { return }
         let sanitized = TerminalPasteSanitizer.sanitize(s)
         guard !sanitized.isEmpty else { return }
-        handlePaste(sanitized, forTabId: activeTabId)
+        let paneIndex = tabs.first(where: { $0.id == activeTabId })?.activePaneIndex ?? 0
+        handlePaste(sanitized, forTabId: activeTabId, paneIndex: paneIndex)
     }
 
     func handlePaste(_ sanitized: String, forTabId tabId: UInt32, paneIndex: Int = 0) {
@@ -1569,18 +1594,22 @@ final class TerminalModel: ObservableObject {
     }
 
     func formatWithPrettier() {
-        guard sessionManager.role == .host,
-              let editor = activeEditor,
-              let url = resolveEditorURL(sessionPath: editor.state.path) else { return }
+        guard sessionManager.role == .host, let editor = activeEditor else { return }
+        guard let url = resolveEditorURL(sessionPath: editor.state.path) else {
+            postTerminalNotice("Format failed — could not resolve the editor file path")
+            return
+        }
         saveEditor(docId: editor.state.docId)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = ["prettier", "--write", url.path]
         process.terminationHandler = { [weak self] proc in
             guard proc.terminationStatus == 0 else {
-                if proc.terminationStatus == 127 {
-                    DispatchQueue.main.async {
+                DispatchQueue.main.async {
+                    if proc.terminationStatus == 127 {
                         self?.postTerminalNotice("prettier not found — install with: npm i -g prettier")
+                    } else {
+                        self?.postTerminalNotice("prettier failed (exit \(proc.terminationStatus)) — see the file for syntax errors")
                     }
                 }
                 return
@@ -1803,6 +1832,17 @@ final class TerminalModel: ObservableObject {
             secret: tool.server.isEmpty ? "" : SessionManager.boreSecret)
     }
 
+    /// Show a themed, non-fatal error when a join attempt can't proceed.
+    private func presentJoinError(_ message: String) {
+        let alert = NSAlert()
+        alert.messageText = "Couldn't join session"
+        alert.informativeText = message
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.window.appearance = terminalTheme.nsAppearance
+        alert.runModal()
+    }
+
     func promptJoin() {
         let alert = NSAlert()
         alert.messageText = "Join shared session"
@@ -1843,6 +1883,12 @@ final class TerminalModel: ObservableObject {
               !hostPort[..<colon].isEmpty
         else {
             NSLog("join: malformed \(raw)")
+            presentJoinError("That doesn't look like a valid session link or host:port address.")
+            return
+        }
+        // Fail closed: refuse to join without the end-to-end encryption key.
+        guard extractedKey != nil else {
+            presentJoinError("This link is missing its encryption key (#k=...). Ask the host to re-share the session URL.")
             return
         }
         let host = String(hostPort[..<colon])
@@ -1892,6 +1938,13 @@ final class TerminalModel: ObservableObject {
         else { return }
         let keyStr = comps.queryItems?.first(where: { $0.name == "k" })?.value
         let extractedKey = keyStr.flatMap { SessionKey(base64url: $0) }
+        // Fail closed: sessions are end-to-end encrypted, so a link with no
+        // (or an undecodable) key would connect in plaintext and silently
+        // garble against the encrypting host. Refuse with a clear error.
+        guard extractedKey != nil else {
+            presentJoinError("This link is missing its encryption key. Ask the host to re-share the session URL.")
+            return
+        }
         guard let colon = addr.lastIndex(of: ":"),
               let port = UInt16(addr[addr.index(after: colon)...]),
               !addr[..<colon].isEmpty
@@ -4098,7 +4151,13 @@ final class TerminalModel: ObservableObject {
     }
 
     private func postTerminalNotice(_ message: String) {
-        guard activeEditor == nil else { return }
+        // The terminal grid is hidden while the collaborative editor is open,
+        // so route notices to the overlay toast instead of silently dropping
+        // them (e.g. Prettier format errors, which only occur with an editor up).
+        guard activeEditor == nil else {
+            showSessionNotification(message)
+            return
+        }
         let bytes = Array("\r\n[\(message)]\r\n".utf8)
         grid?.feed(bytes)
         if sessionManager.role == .host, sessionManager.state == .running {
