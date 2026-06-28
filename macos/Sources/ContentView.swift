@@ -868,10 +868,23 @@ final class TerminalModel: ObservableObject {
         pendingHostTabInitialSnapshots.removeAll()
         pendingPeerTabOutput.removeAll()
         pendingPeerFocusedTabId = nil
-        lastKnownTerminalGridSize = nil
+        // NOTE: deliberately keep `lastKnownTerminalGridSize`. It always holds
+        // the *local* window's measured grid size (every peer/host view reports
+        // its own drawable size via handleResize), and the window doesn't change
+        // size when a session ends. Clearing it forced openInitialTab() to DEFER
+        // the home shell's PTY spawn until the next onResize callback — but a
+        // reused, same-size MetalTerminalView never re-fires onResize, so a
+        // kicked peer was left staring at a blank, never-spawned terminal.
+        // Keeping the size lets openInitialTab() spawn the home shell immediately.
         cancelPendingHostTabStarts()
         pendingHostTabStartCwds.removeAll()
         freshlyRespawnedTabs.removeAll()
+        // Clear paste/drop placeholder state so a stale placeholder from the
+        // ended session can't try to delete phantom bytes in the new shell,
+        // and the "#N" counters restart fresh.
+        activePlaceholder = nil
+        pasteCounter = 0
+        imageDropCounter = 0
         stopSharing()
         stopTitlePolling()
         stopModeProbe()
