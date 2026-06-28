@@ -956,7 +956,10 @@ final class TerminalModel: ObservableObject {
         let tab = tabs[idx]
         // Close protection: a pinned tab must be unpinned before it can close.
         // The strip hides its close button, so this guards the Cmd-W path.
-        if tab.isPinned {
+        // Exception: if it's the *last* tab, Cmd-W must still be able to end the
+        // session — otherwise a lone pinned tab traps the user (no close button,
+        // no way to end via Cmd-W).
+        if tab.isPinned && tabs.count > 1 {
             NSSound.beep()
             return
         }
