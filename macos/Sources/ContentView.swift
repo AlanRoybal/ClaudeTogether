@@ -2506,6 +2506,12 @@ final class TerminalModel: ObservableObject {
                     userId: userId,
                     anchor: anchor,
                     selectionAnchor: selectionAnchor)
+                // Re-announce the host's own presence so a peer that just opened
+                // the editor — and dropped the host's initial presence frame
+                // because its editor didn't exist yet — counts the host
+                // immediately ("2 editors") instead of waiting for the host's
+                // next caret move.
+                editor.broadcastPresenceNow()
             }
         case .editorSave(let docId):
             guard sessionManager.role == .host else { return }
@@ -2921,8 +2927,19 @@ final class TerminalModel: ObservableObject {
         }
         var state = sharedInputs[tabId] ?? SharedInputState()
         if !state.isActive {
-            sharedInputs[tabId] = state
-            return
+            // A typing request can land in the brief window when the host's
+            // shared input is deactivated (post-commit / transient PTY output,
+            // before the ~350ms prompt timer re-activates) while a peer is still
+            // optimistically active. The peer already shows this character, so
+            // dropping it here desyncs the on-screen line from the committed
+            // bytes — the classic "echo" -> "cho" first-character loss. Activate
+            // at the current cursor now and apply the keystroke instead.
+            activateSharedInputAtCurrentCursor(tabId: tabId, broadcast: false)
+            state = sharedInputs[tabId] ?? state
+            guard state.isActive else {
+                sharedInputs[tabId] = state
+                return
+            }
         }
         _ = state.ensureParticipant(request.actor, bumpRevision: false)
         let effect = state.apply(request, bumpRevision: true)
