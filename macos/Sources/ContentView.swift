@@ -3530,6 +3530,17 @@ final class TerminalModel: ObservableObject {
         }
 
         var out = ""
+        // Replay the host's screen modes before the repaint so a peer joining
+        // (or refreshing) mid-TUI converges: without these a peer that joins
+        // while claude/vim is running stays on the primary screen with mouse
+        // reporting off and renders the alt-screen repaints as garbage
+        // (BUG-36). Explicit set AND reset so a drifted peer also recovers.
+        let term = grid.term
+        out += term.isUsingAlternateScreen ? "\u{1B}[?1049h" : "\u{1B}[?1049l"
+        out += term.x10Mouse ? "\u{1B}[?1000h" : "\u{1B}[?1000l"
+        out += term.dragMouse ? "\u{1B}[?1002h" : "\u{1B}[?1002l"
+        out += term.anyMotionMouse ? "\u{1B}[?1003h" : "\u{1B}[?1003l"
+        out += term.sgrMouse ? "\u{1B}[?1006h" : "\u{1B}[?1006l"
         // Repaint the host's visible screen so a newly joined peer inherits
         // the current prompt and command line before new output arrives.
         out += "\u{1B}[?25l"
