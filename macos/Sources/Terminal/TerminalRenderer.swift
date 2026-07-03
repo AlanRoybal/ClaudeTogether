@@ -376,7 +376,17 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         let cellH = Float(atlas.cellHeightPx)
         let cols = Int(self.cols)
         let rows = Int(self.rows)
-        let cellCount = cols * rows
+        // The grid normally matches the renderer's measured size, but a
+        // remotely-sized grid (a peer mirror pinned to the host's geometry,
+        // BUG-36) can be larger or smaller than this view. Draw the visible
+        // intersection, and always index the snapshot with the GRID's cols
+        // as the row stride — using the renderer's cols on a mismatched
+        // buffer skews every row.
+        let gridCols = Int(grid.cols)
+        let gridRows = Int(grid.rows)
+        let visCols = min(cols, gridCols)
+        let visRows = min(rows, gridRows)
+        let cellCount = visCols * visRows
 
         var bgInstances: [BgInstance] = []
         var textInstances: [TextInstance] = []
@@ -398,7 +408,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         if !searchMatches.isEmpty {
             for (i, m) in searchMatches.enumerated() {
                 for offset in 0..<m.length {
-                    let idx = m.row * cols + m.colStart + offset
+                    let idx = m.row * gridCols + m.colStart + offset
                     if i == currentMatchIndex {
                         currentMatchCells.insert(idx)
                     } else {
@@ -408,13 +418,13 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             }
         }
 
-        if snap.count >= cellCount {
+        if snap.count >= gridCols * gridRows {
             let atlasW = Float(atlas.atlasWidthPx)
             let atlasH = Float(atlas.atlasHeightPx)
-            for y in 0..<rows {
+            for y in 0..<visRows {
                 var skipUntilX = 0
-                for x in 0..<cols {
-                    let c = snap[y * cols + x]
+                for x in 0..<visCols {
+                    let c = snap[y * gridCols + x]
                     // width==0 marks the trailing half of a CJK wide glyph.
                     // We still emit a BG quad for every cell so selection
                     // highlighting is solid; only the text glyph pass skips
@@ -429,7 +439,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                     // Priority: selection > current search match > other search matches.
                     var bi = BgInstance()
                     bi.gridPos = SIMD2<UInt16>(UInt16(x), UInt16(y))
-                    let cellIdx = y * cols + x
+                    let cellIdx = y * gridCols + x
                     var cellBg = bg
                     if !otherMatchCells.isEmpty, otherMatchCells.contains(cellIdx) {
                         cellBg = searchMatchColor
@@ -463,7 +473,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                     // and shape it as a single glyph spanning N cells.
                     if ligaturesEnabled && TerminalRenderer.ligatureStarters.contains(c.codepoint) {
                         if let ti = makeLigatureTextInstance(
-                            snap: snap, x: x, y: y, cols: cols,
+                            snap: snap, x: x, y: y, cols: gridCols,
                             atlasW: atlasW, atlasH: atlasH,
                             skipUntilX: &skipUntilX)
                         {
@@ -488,7 +498,7 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             var cursorCells: [Int: CursorOverlay.Rect] = [:]
             cursorCells.reserveCapacity(overlay.rects.count)
             for block in overlay.rects {
-                let index = Int(block.row) * cols + Int(block.col)
+                let index = Int(block.row) * gridCols + Int(block.col)
                 guard index >= 0, index < snap.count else { continue }
                 cursorCells[index] = block
             }

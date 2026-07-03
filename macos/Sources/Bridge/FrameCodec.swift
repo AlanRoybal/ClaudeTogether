@@ -53,6 +53,12 @@ enum FrameTag: UInt8 {
     // identity and drives shared-input bookkeeping. Swift-only, like the pane
     // and access-control frames above (the zig core relays it opaquely).
     case tabViewing = 0x23
+    // Host grid geometry (BUG-36). TUIs paint with absolute cursor
+    // addressing for the host PTY's cols/rows, so peers must run their
+    // mirrored grids at the host's geometry, not their own window's.
+    // hostGridSize: cols:u16 | rows:u16. Swift-only; the zig core relays
+    // it opaquely.
+    case hostGridSize = 0x24
 }
 
 enum SessionRole: UInt8 {
@@ -163,6 +169,7 @@ enum Frame {
     case requestControl(UserIdentity)
     case controlDenied(UserIdentity)
     case tabViewing(identity: UserIdentity, tabId: UInt32)
+    case hostGridSize(cols: UInt16, rows: UInt16)
 }
 
 /// Which direction a split divides the terminal viewport.
@@ -333,6 +340,10 @@ enum FrameCodec {
             out.append(FrameTag.tabViewing.rawValue)
             out.append(contentsOf: id.bytes)
             appendU32(&out, tabId)
+        case .hostGridSize(let cols, let rows):
+            out.append(FrameTag.hostGridSize.rawValue)
+            appendU16(&out, cols)
+            appendU16(&out, rows)
         }
         return out
     }
@@ -530,6 +541,10 @@ enum FrameCodec {
             let id = try UserIdentity.from(exactly16: Array(try r.readBytes(16)))
             let tabId = try r.readU32()
             return .tabViewing(identity: id, tabId: tabId)
+        case .hostGridSize:
+            let cols = try r.readU16()
+            let rows = try r.readU16()
+            return .hostGridSize(cols: cols, rows: rows)
         }
     }
 

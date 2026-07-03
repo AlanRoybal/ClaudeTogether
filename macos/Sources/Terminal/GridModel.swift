@@ -48,6 +48,12 @@ final class GridModel: ObservableObject {
     /// live viewport; larger values show older scrollback rows.
     @Published private(set) var scrollOffsetRows: Int = 0
 
+    /// When true this grid mirrors a remote (host) terminal and its geometry
+    /// is authoritative from the wire (hostGridSize frames), not from the
+    /// local view: MetalTerminalNSView must not resize it to the window
+    /// (BUG-36 — absolute-positioned TUI output garbles on any mismatch).
+    var remotelySized = false
+
     /// Bumped whenever the grid or cursor state changes. Currently advisory —
     /// the renderer redraws every frame — but lets SwiftUI views bind to it.
     @Published private(set) var epoch: UInt32 = 0

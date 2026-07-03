@@ -409,6 +409,23 @@ final class SessionManager: ObservableObject {
         }
     }
 
+    /// Host only: publish the host terminal's grid geometry (BUG-36). Peers
+    /// pin their mirrored grids to this size so absolute-positioned TUI
+    /// output (claude, codex, vim) lays out identically on every client.
+    /// Sent on share start, host window resize, and to each joining peer
+    /// before its tab snapshots.
+    func sendHostGridSize(cols: UInt16, rows: UInt16,
+                          toTransportPeerID peerID: UInt32? = nil)
+    {
+        guard role == .host, state == .running else { return }
+        let frame = Frame.hostGridSize(cols: cols, rows: rows)
+        if let peerID {
+            send(frame, toTransportPeerID: peerID)
+        } else {
+            broadcast(frame)
+        }
+    }
+
     /// Host only: fan a chunk of PTY output for a specific tab to peers.
     func sendTabPtyOutput(tabId: UInt32, data: Data,
                           toTransportPeerID peerID: UInt32? = nil)

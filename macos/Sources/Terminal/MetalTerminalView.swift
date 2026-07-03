@@ -87,6 +87,9 @@ final class MetalTerminalNSView: NSView {
 
         renderer.onResize = { [weak self] cols, rows in
             guard let self = self else { return }
+            // Remotely-sized grids (peer mirrors) keep the host's geometry;
+            // the local window only changes how much of them is visible.
+            guard !self.grid.remotelySized else { return }
             self.grid.resize(cols: cols, rows: rows, preserveTop: true)
             self.propagateResizeIfAuthoritative(cols: cols, rows: rows)
         }
@@ -102,7 +105,10 @@ final class MetalTerminalNSView: NSView {
 
         // A reused NSView does not get a fresh resize callback when the model
         // swaps grids, so bring the new grid up to the renderer's live size
-        // immediately.
+        // immediately. Remotely-sized grids keep the host's geometry.
+        if grid.remotelySized {
+            return
+        }
         if let size = currentAuthoritativeGridSize() {
             grid.resize(cols: size.cols, rows: size.rows, preserveTop: true)
         } else {
