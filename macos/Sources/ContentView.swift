@@ -89,7 +89,12 @@ struct ContentView: View {
 
         }
         .ignoresSafeArea(edges: .top)
-        .frame(minWidth: 800, minHeight: 550)
+        // No SwiftUI minimum here: a window can be smaller than any hard
+        // floor (restored frames and programmatic resizes bypass min-size
+        // constraints), and flooring the layout pushes the bottom rows of
+        // the terminal below the window edge. The window-level minimum is
+        // enforced in WindowThemeNSView.applyToWindow via contentMinSize;
+        // content always compresses to the real window size.
         .background(WindowThemeSetter(theme: model.terminalTheme, titleBarInset: $titleBarInset))
     }
 }
@@ -199,6 +204,11 @@ private final class WindowThemeNSView: NSView {
         // (TabStripView), so the system tab bar (window title + "+") at the top
         // is redundant.
         window.tabbingMode = .disallowed
+        // Minimum size lives on the window, not in a SwiftUI .frame floor:
+        // contentMinSize constrains user resizing, while content laid out
+        // for the actual (possibly smaller, e.g. restored) frame never
+        // overflows the window edge.
+        window.contentMinSize = NSSize(width: 800, height: 550)
         window.titlebarAppearsTransparent = true
         window.backgroundColor = color
         window.appearance = NSAppearance(named: theme.isDark ? .darkAqua : .aqua)
