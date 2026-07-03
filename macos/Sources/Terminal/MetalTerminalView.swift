@@ -87,6 +87,9 @@ final class MetalTerminalNSView: NSView {
 
         renderer.onResize = { [weak self] cols, rows in
             guard let self = self else { return }
+            // Remotely-sized grids (peer mirrors) keep the host's geometry;
+            // the local window only changes how much of them is visible.
+            guard !self.grid.remotelySized else { return }
             self.grid.resize(cols: cols, rows: rows, preserveTop: true)
             self.propagateResizeIfAuthoritative(cols: cols, rows: rows)
         }
@@ -102,7 +105,10 @@ final class MetalTerminalNSView: NSView {
 
         // A reused NSView does not get a fresh resize callback when the model
         // swaps grids, so bring the new grid up to the renderer's live size
-        // immediately.
+        // immediately. Remotely-sized grids keep the host's geometry.
+        if grid.remotelySized {
+            return
+        }
         if let size = currentAuthoritativeGridSize() {
             grid.resize(cols: size.cols, rows: size.rows, preserveTop: true)
         } else {
@@ -423,6 +429,26 @@ final class MetalTerminalNSView: NSView {
         let magnitude = max(1, Int(abs(dy) / 12.0))
         if grid.scroll(byRows: dy > 0 ? magnitude : -magnitude) {
             clearSelection()
+            return
+        }
+        // Alt-screen TUIs (claude, vim, htop) own their scroll history — the
+        // grid has nothing to scroll, so a wheel event would otherwise be a
+        // dead no-op. Route it to the app when it has asked for mouse
+        // reporting, even with the sidebar Mouse Mode toggle off: that toggle
+        // exists to keep clicks local for text selection, and the wheel plays
+        // no part in selecting.
+        let term = grid.term
+        if term.isUsingAlternateScreen, term.sgrMouse,
+           term.x10Mouse || term.dragMouse || term.anyMotionMouse
+        {
+            let cell = gridCell(for: event)
+            emitSGR(
+                button: dy > 0 ? SGRButton.scrollUp : SGRButton.scrollDown,
+                col: cell.col,
+                row: cell.row,
+                pressed: true,
+                motion: false,
+                flags: event.modifierFlags)
         }
     }
 

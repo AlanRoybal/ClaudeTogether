@@ -89,7 +89,12 @@ struct ContentView: View {
 
         }
         .ignoresSafeArea(edges: .top)
-        .frame(minWidth: 800, minHeight: 550)
+        // No SwiftUI minimum here: a window can be smaller than any hard
+        // floor (restored frames and programmatic resizes bypass min-size
+        // constraints), and flooring the layout pushes the bottom rows of
+        // the terminal below the window edge. The window-level minimum is
+        // enforced in WindowThemeNSView.applyToWindow via contentMinSize;
+        // content always compresses to the real window size.
         .background(WindowThemeSetter(theme: model.terminalTheme, titleBarInset: $titleBarInset))
     }
 }
@@ -199,6 +204,11 @@ private final class WindowThemeNSView: NSView {
         // (TabStripView), so the system tab bar (window title + "+") at the top
         // is redundant.
         window.tabbingMode = .disallowed
+        // Minimum size lives on the window, not in a SwiftUI .frame floor:
+        // contentMinSize constrains user resizing, while content laid out
+        // for the actual (possibly smaller, e.g. restored) frame never
+        // overflows the window edge.
+        window.contentMinSize = NSSize(width: 800, height: 550)
         window.titlebarAppearsTransparent = true
         window.backgroundColor = color
         window.appearance = NSAppearance(named: theme.isDark ? .darkAqua : .aqua)
@@ -525,6 +535,11 @@ final class TerminalModel: ObservableObject {
     /// Peer-only: TabPtyOutput can arrive before TabOpen during join-time
     /// catch-up, so buffer it until the mirrored tab exists locally.
     private var pendingPeerTabOutput: [UInt32: [Data]] = [:]
+
+    /// Peer-side: the host terminal's grid geometry (BUG-36). Mirrored grids
+    /// are pinned to this size so TUI output lays out exactly as on the host;
+    /// nil until the host announces it (or when joined to a legacy host).
+    private var peerHostGridSize: (cols: UInt16, rows: UInt16)?
     /// Peer-only: same idea for focus announcements during join-time catch-up.
     private var pendingPeerFocusedTabId: UInt32?
     /// Last terminal viewport measured by the renderer. Reused when a new tab
@@ -868,6 +883,7 @@ final class TerminalModel: ObservableObject {
         pendingHostTabInitialSnapshots.removeAll()
         pendingPeerTabOutput.removeAll()
         pendingPeerFocusedTabId = nil
+        peerHostGridSize = nil
         // NOTE: deliberately keep `lastKnownTerminalGridSize`. It always holds
         // the *local* window's measured grid size (every peer/host view reports
         // its own drawable size via handleResize), and the window doesn't change
@@ -1371,11 +1387,19 @@ final class TerminalModel: ObservableObject {
                              preferredSize: (cols: UInt16, rows: UInt16)? = nil)
     -> TabState?
     {
-        let cols = preferredSize?.cols ?? lastKnownTerminalGridSize?.cols ?? 80
-        let rows = preferredSize?.rows ?? lastKnownTerminalGridSize?.rows ?? 24
+        let cols = preferredSize?.cols ?? peerHostGridSize?.cols
+            ?? lastKnownTerminalGridSize?.cols ?? 80
+        let rows = preferredSize?.rows ?? peerHostGridSize?.rows
+            ?? lastKnownTerminalGridSize?.rows ?? 24
         guard let grid = GridModel(cols: cols, rows: rows) else {
             NSLog("GridModel init failed for peer tab %u", id)
             return nil
+        }
+        // Once the host has announced its geometry, mirrored grids are pinned
+        // to it (BUG-36); until then the grid follows the local window as a
+        // legacy fallback.
+        if peerHostGridSize != nil {
+            grid.remotelySized = true
         }
         return TabState(id: id, title: title, pty: nil, grid: grid)
     }
@@ -2238,12 +2262,19 @@ final class TerminalModel: ObservableObject {
     func handleResize(cols: UInt16, rows: UInt16) {
         lastKnownTerminalGridSize = (cols, rows)
         for tab in tabs {
+            // Peer mirrors pinned to the host's geometry (BUG-36) ignore the
+            // local window; only the visible portion changes.
+            if tab.grid.remotelySized { continue }
             preserveSharedInputAcrossTransientOutput(tabId: tab.id)
             tab.pty?.resize(cols: cols, rows: rows)
             tab.grid.resize(cols: cols, rows: rows, preserveTop: true)
             reanchorSharedInputToGridCursor(tabId: tab.id)
         }
         schedulePendingHostTabStarts(cols: cols, rows: rows)
+        // Keep peers' mirrored geometry in lockstep with the host window.
+        if sessionManager.role == .host {
+            sessionManager.sendHostGridSize(cols: cols, rows: rows)
+        }
     }
 
     // MARK: inbound frames
@@ -2306,6 +2337,13 @@ final class TerminalModel: ObservableObject {
                 syncSharedInputParticipants(broadcast: false)
                 sessionManager.sendMode(lastLocalCreatorOnlyMode ? .raw : .line)
                 sessionManager.broadcastAccessMode()
+                // Geometry first (BUG-36): the peer pins its mirrored grids
+                // to the host's cols/rows before any snapshot bytes feed, so
+                // absolute-positioned content lands on the right cells.
+                let gridSize = currentTerminalGridSize()
+                sessionManager.sendHostGridSize(
+                    cols: gridSize.cols, rows: gridSize.rows,
+                    toTransportPeerID: peerID)
                 // Send current tab list (TabOpen + per-tab snapshot + TabFocus)
                 // to the joining peer so it materializes the same tabs we have.
                 sendTabSnapshots(toTransportPeerID: peerID)
@@ -2347,6 +2385,11 @@ final class TerminalModel: ObservableObject {
                 if activeTabId == placeholder.id {
                     activeTabId = nil
                 }
+            }
+            // The host's announced geometry always wins over local window
+            // measurements for mirrored grids (BUG-36).
+            if let hostSize = peerHostGridSize {
+                preferredGridSize = hostSize
             }
             if let idx = tabs.firstIndex(where: { $0.id == tabId }) {
                 tabs[idx].title = title
@@ -2418,6 +2461,15 @@ final class TerminalModel: ObservableObject {
             else { return }
             if tabViewers[identity] != tabId {
                 tabViewers[identity] = tabId
+            }
+        case .hostGridSize(let cols, let rows):
+            guard sessionManager.role == .peer, cols > 0, rows > 0 else { return }
+            peerHostGridSize = (cols, rows)
+            for tab in tabs {
+                tab.grid.remotelySized = true
+                if tab.grid.cols != cols || tab.grid.rows != rows {
+                    tab.grid.resize(cols: cols, rows: rows, preserveTop: true)
+                }
             }
         case .tabPtyOutput(let tabId, let data):
             guard sessionManager.role == .peer else { return }
@@ -3488,6 +3540,17 @@ final class TerminalModel: ObservableObject {
         }
 
         var out = ""
+        // Replay the host's screen modes before the repaint so a peer joining
+        // (or refreshing) mid-TUI converges: without these a peer that joins
+        // while claude/vim is running stays on the primary screen with mouse
+        // reporting off and renders the alt-screen repaints as garbage
+        // (BUG-36). Explicit set AND reset so a drifted peer also recovers.
+        let term = grid.term
+        out += term.isUsingAlternateScreen ? "\u{1B}[?1049h" : "\u{1B}[?1049l"
+        out += term.x10Mouse ? "\u{1B}[?1000h" : "\u{1B}[?1000l"
+        out += term.dragMouse ? "\u{1B}[?1002h" : "\u{1B}[?1002l"
+        out += term.anyMotionMouse ? "\u{1B}[?1003h" : "\u{1B}[?1003l"
+        out += term.sgrMouse ? "\u{1B}[?1006h" : "\u{1B}[?1006l"
         // Repaint the host's visible screen so a newly joined peer inherits
         // the current prompt and command line before new output arrives.
         out += "\u{1B}[?25l"
