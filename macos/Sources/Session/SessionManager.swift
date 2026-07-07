@@ -844,6 +844,9 @@ final class SessionManager: ObservableObject {
                 let frame = try FrameCodec.decode(plain)
                 decryptFailureStreak = 0
                 hasDecodedFrame = true
+                // The link delivered a real frame — it's a live session, not
+                // a flapping transport, so the backoff ladder starts over.
+                reconnectAttempt = 0
                 handleFrame(frame, from: peerID)
             } catch {
                 lastError = "decode: \(error)"
@@ -901,7 +904,10 @@ final class SessionManager: ObservableObject {
             ct_session_free(h)
             handle = nil
         }
-        reconnectAttempt = 0
+        // Deliberately keep `reconnectAttempt`: it only resets after the
+        // revived link proves itself by delivering a frame. Resetting here
+        // would let a flapping host (connect, drop, connect, …) bypass
+        // `maxReconnectAttempts` and retry forever.
         onReconnectBegan?()
         scheduleReconnect()
     }
@@ -964,7 +970,6 @@ final class SessionManager: ObservableObject {
         }
         NSLog("[ct] reconnected after %d attempt(s)", reconnectAttempt)
         handle = h
-        reconnectAttempt = 0
         state = .running
         startPolling()
         startKeepAlive()
