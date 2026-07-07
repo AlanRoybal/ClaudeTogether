@@ -101,7 +101,13 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
 
     /// When true the draw loop attempts ligature substitution for known
     /// programming sequences before falling back to individual-glyph rendering.
-    var ligaturesEnabled: Bool = true { didSet { rendererMutationSeq &+= 1 } }
+    // The didSet guards matter: SwiftUI re-runs updateNSView on every model
+    // publish and re-assigns these properties wholesale, and an unconditional
+    // seq bump would force a full GPU re-encode per SwiftUI pass even when
+    // nothing changed.
+    var ligaturesEnabled: Bool = true {
+        didSet { if ligaturesEnabled != oldValue { rendererMutationSeq &+= 1 } }
+    }
 
     private static let ligatureSequences: [String] = [
         // longest first so greedy matching picks the longest match
@@ -113,6 +119,20 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     ]
     private static let ligatureStarters: Set<UInt32> = {
         Set(ligatureSequences.compactMap { $0.unicodeScalars.first?.value })
+    }()
+
+    /// Sequences bucketed by first scalar, longest first, with the scalar
+    /// values pre-extracted. The draw loop consults this per candidate cell;
+    /// walking `ligatureSequences` and re-splitting each String there costs
+    /// an allocation per sequence per cell per frame.
+    private static let ligaturesByFirstScalar: [UInt32: [(seq: String, scalars: [UInt32])]] = {
+        var table: [UInt32: [(seq: String, scalars: [UInt32])]] = [:]
+        for seq in ligatureSequences {
+            let scalars = seq.unicodeScalars.map(\.value)
+            guard let first = scalars.first else { continue }
+            table[first, default: []].append((seq, scalars))
+        }
+        return table
     }()
 
     /// Cell size in view points (NOT pixels). MetalTerminalNSView uses this
@@ -136,7 +156,9 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
 
     var onResize: ((UInt16, UInt16) -> Void)?
 
-    var cursorVisible = true { didSet { rendererMutationSeq &+= 1 } }
+    var cursorVisible = true {
+        didSet { if cursorVisible != oldValue { rendererMutationSeq &+= 1 } }
+    }
     private var blinkStart = CACurrentMediaTime()
 
     /// Normalized selection range set by the view layer. Both endpoints are
@@ -146,9 +168,13 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     }
 
     /// Current find-bar matches in viewport coordinates. Set by MetalTerminalView.
-    var searchMatches: [SearchMatch] = [] { didSet { rendererMutationSeq &+= 1 } }
+    var searchMatches: [SearchMatch] = [] {
+        didSet { if searchMatches != oldValue { rendererMutationSeq &+= 1 } }
+    }
     /// Index into `searchMatches` for the currently focused match, or nil.
-    var currentMatchIndex: Int? = nil { didSet { rendererMutationSeq &+= 1 } }
+    var currentMatchIndex: Int? = nil {
+        didSet { if currentMatchIndex != oldValue { rendererMutationSeq &+= 1 } }
+    }
 
     /// Bumped by any renderer-state setter that affects `draw(in:)` output but
     /// is not reflected in `GridModel.epoch` (selection, search, theme, font,
@@ -158,6 +184,13 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
     private var lastDrawnGridEpoch: UInt32?
     private var lastDrawnMutationSeq: UInt64?
     private var lastDrawnBlinkPhase: Int?
+
+    /// Guards the shared instance buffers against the CPU overwriting them
+    /// while the previous frame's command buffer is still reading. The draw
+    /// loop writes instances in place, so without this a fast second frame
+    /// (heavy output on a ProMotion display) could tear the still-in-flight
+    /// frame's geometry. value:1 = at most one frame in flight.
+    private let inFlightSemaphore = DispatchSemaphore(value: 1)
 
     init?(view: MTKView, fontName: String = "", pointSize: CGFloat = 13) {
         guard let device = view.device ?? MTLCreateSystemDefaultDevice() else {
@@ -388,14 +421,36 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         let visRows = min(rows, gridRows)
         let cellCount = visCols * visRows
 
-        var bgInstances: [BgInstance] = []
-        var textInstances: [TextInstance] = []
-        var cursorTextInstances: [TextInstance] = []
-        var cursorInstances: [CursorInstance] = []
-        bgInstances.reserveCapacity(cellCount)
-        textInstances.reserveCapacity(cellCount)
-        cursorTextInstances.reserveCapacity(overlay.rects.count)
-        cursorInstances.reserveCapacity(overlay.rects.count)
+        // Size the shared GPU buffers to this frame's worst case up front so
+        // the build loop can write instances straight into them — staging
+        // Swift arrays first costs an alloc + a second full copy per frame.
+        // Per cell: ≤1 bg quad, ≤1 text glyph, ≤1 link underline.
+        ensureBgCapacity(max(1, cellCount))
+        ensureTextCapacity(max(1, cellCount))
+        ensureCursorTextCapacity(max(1, overlay.rects.count))
+        ensureCursorCapacity(max(1, cellCount + overlay.rects.count))
+        guard let bgBuf = bgBuffer,
+              let tBuf = textBuffer,
+              let cursorTextBuf = cursorTextBuffer,
+              let cBuf = cursorBuffer
+        else { return }
+        let bgPtr = bgBuf.contents()
+            .bindMemory(to: BgInstance.self, capacity: bgCapacity)
+        let textPtr = tBuf.contents()
+            .bindMemory(to: TextInstance.self, capacity: textCapacity)
+        let cursorTextPtr = cursorTextBuf.contents()
+            .bindMemory(to: TextInstance.self, capacity: cursorTextCapacity)
+        let cursorPtr = cBuf.contents()
+            .bindMemory(to: CursorInstance.self, capacity: cursorCapacity)
+        // Block until the previous frame's GPU read of these buffers finished
+        // before writing into them. Every path past here must balance this
+        // with exactly one signal (the encoder-guard bailout below, or the
+        // command buffer's completion handler).
+        inFlightSemaphore.wait()
+        var bgCount = 0
+        var textCount = 0
+        var cursorTextCount = 0
+        var cursorCount = 0
 
         let selectionSnapshot = selection   // snapshot so rendering is consistent
         let selectionColor = unpack(theme.selectionBg)
@@ -421,6 +476,8 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         if snap.count >= gridCols * gridRows {
             let atlasW = Float(atlas.atlasWidthPx)
             let atlasH = Float(atlas.atlasHeightPx)
+            // ObjC class message; hoisted out of the per-cell loop.
+            let cmdHeld = NSEvent.modifierFlags.contains(.command)
             for y in 0..<visRows {
                 var skipUntilX = 0
                 for x in 0..<visCols {
@@ -448,12 +505,13 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                         cellBg = searchCurrentColor
                     }
                     bi.color = selectionSnapshot.map { isCellSelected(col: x, row: y, sel: $0) ? selectionColor : cellBg } ?? cellBg
-                    bgInstances.append(bi)
+                    bgPtr[bgCount] = bi
+                    bgCount += 1
 
                     // LINK UNDERLINE: thin strip at the cell baseline for OSC 8
                     // hyperlink cells. Only visible while cmd is held, matching
                     // Ghostty's toggle-on-cmd behavior.
-                    if c.url_id != 0 && NSEvent.modifierFlags.contains(.command) {
+                    if c.url_id != 0 && cmdHeld {
                         let cellHPx = Float(atlas.cellHeightPx)
                         let ulH = max(1.0, cellHPx * 0.07)
                         var li = CursorInstance()
@@ -461,7 +519,8 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                         li.originFrac = SIMD2<Float>(0, (cellHPx - ulH - 0.5) / cellHPx)
                         li.sizeFrac   = SIMD2<Float>(1, ulH / cellHPx)
                         li.color      = fg
-                        cursorInstances.append(li)
+                        cursorPtr[cursorCount] = li
+                        cursorCount += 1
                     }
 
                     // TEXT: skip wide-glyph trailing halves, blanks, and interior
@@ -477,7 +536,8 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                             atlasW: atlasW, atlasH: atlasH,
                             skipUntilX: &skipUntilX)
                         {
-                            textInstances.append(ti)
+                            textPtr[textCount] = ti
+                            textCount += 1
                             continue
                         }
                     }
@@ -490,7 +550,8 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                         atlasW: atlasW,
                         atlasH: atlasH)
                     {
-                        textInstances.append(ti)
+                        textPtr[textCount] = ti
+                        textCount += 1
                     }
                 }
             }
@@ -514,7 +575,8 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                 else {
                     continue
                 }
-                cursorTextInstances.append(ti)
+                cursorTextPtr[cursorTextCount] = ti
+                cursorTextCount += 1
             }
         }
 
@@ -525,32 +587,8 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
             ci.originFrac = r.originFrac
             ci.sizeFrac = r.sizeFrac
             ci.color = r.color
-            cursorInstances.append(ci)
-        }
-
-        ensureBgCapacity(bgInstances.count)
-        ensureTextCapacity(textInstances.count)
-        ensureCursorTextCapacity(cursorTextInstances.count)
-        ensureCursorCapacity(cursorInstances.count)
-        if !bgInstances.isEmpty, let bgBuf = bgBuffer {
-            bgInstances.withUnsafeBytes { raw in
-                _ = memcpy(bgBuf.contents(), raw.baseAddress!, raw.count)
-            }
-        }
-        if !textInstances.isEmpty, let tBuf = textBuffer {
-            textInstances.withUnsafeBytes { raw in
-                _ = memcpy(tBuf.contents(), raw.baseAddress!, raw.count)
-            }
-        }
-        if !cursorTextInstances.isEmpty, let cursorTextBuf = cursorTextBuffer {
-            cursorTextInstances.withUnsafeBytes { raw in
-                _ = memcpy(cursorTextBuf.contents(), raw.baseAddress!, raw.count)
-            }
-        }
-        if !cursorInstances.isEmpty, let cBuf = cursorBuffer {
-            cursorInstances.withUnsafeBytes { raw in
-                _ = memcpy(cBuf.contents(), raw.baseAddress!, raw.count)
-            }
+            cursorPtr[cursorCount] = ci
+            cursorCount += 1
         }
 
         var uniforms = RendererUniforms(
@@ -559,50 +597,56 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
                 Float(view.drawableSize.height)),
             cellSize: SIMD2<Float>(cellW, cellH))
 
-        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else { return }
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: rpd) else {
+            inFlightSemaphore.signal()
+            return
+        }
 
         // Pass 1: BG
-        if !bgInstances.isEmpty, let bgBuf = bgBuffer {
+        if bgCount > 0 {
             enc.setRenderPipelineState(bgPipeline)
             enc.setVertexBuffer(bgBuf, offset: 0, index: 0)
             enc.setVertexBytes(&uniforms, length: MemoryLayout<RendererUniforms>.stride, index: 1)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6,
-                               instanceCount: bgInstances.count)
+                               instanceCount: bgCount)
         }
 
         // Pass 2: TEXT
-        if !textInstances.isEmpty, let tBuf = textBuffer {
+        if textCount > 0 {
             enc.setRenderPipelineState(textPipeline)
             enc.setVertexBuffer(tBuf, offset: 0, index: 0)
             enc.setVertexBytes(&uniforms, length: MemoryLayout<RendererUniforms>.stride, index: 1)
             enc.setFragmentTexture(atlas.texture, index: 0)
             enc.setFragmentSamplerState(sampler, index: 0)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6,
-                               instanceCount: textInstances.count)
+                               instanceCount: textCount)
         }
 
         // Pass 3: CURSOR (colored participant blocks)
-        if !cursorInstances.isEmpty, let cBuf = cursorBuffer {
+        if cursorCount > 0 {
             enc.setRenderPipelineState(cursorPipeline)
             enc.setVertexBuffer(cBuf, offset: 0, index: 0)
             enc.setVertexBytes(&uniforms, length: MemoryLayout<RendererUniforms>.stride, index: 1)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6,
-                               instanceCount: cursorInstances.count)
+                               instanceCount: cursorCount)
         }
 
         // Pass 4: redraw any glyph under a block cursor in a contrasting color
         // so fully colored cursors still leave typed text legible.
-        if !cursorTextInstances.isEmpty, let cursorTextBuf = cursorTextBuffer {
+        if cursorTextCount > 0 {
             enc.setRenderPipelineState(textPipeline)
             enc.setVertexBuffer(cursorTextBuf, offset: 0, index: 0)
             enc.setVertexBytes(&uniforms, length: MemoryLayout<RendererUniforms>.stride, index: 1)
             enc.setFragmentTexture(atlas.texture, index: 0)
             enc.setFragmentSamplerState(sampler, index: 0)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6,
-                               instanceCount: cursorTextInstances.count)
+                               instanceCount: cursorTextCount)
         }
 
         enc.endEncoding()
+        cmd.addCompletedHandler { [inFlightSemaphore] _ in
+            inFlightSemaphore.signal()
+        }
         cmd.present(drawable)
         cmd.commit()
     }
@@ -810,14 +854,15 @@ final class TerminalRenderer: NSObject, MTKViewDelegate {
         skipUntilX: inout Int
     ) -> TextInstance? {
         let startCell = snap[y * cols + x]
-        for seq in TerminalRenderer.ligatureSequences {
-            let scalars = Array(seq.unicodeScalars)
-            guard scalars.first?.value == startCell.codepoint else { continue }
+        guard let candidates =
+            TerminalRenderer.ligaturesByFirstScalar[startCell.codepoint]
+        else { return nil }
+        for (seq, scalars) in candidates {
             guard x + scalars.count <= cols else { continue }
             var ok = true
             for i in 1..<scalars.count {
                 let cell = snap[y * cols + x + i]
-                if cell.codepoint != scalars[i].value || cell.width == 0
+                if cell.codepoint != scalars[i] || cell.width == 0
                     || cell.fg != startCell.fg || cell.attrs != startCell.attrs {
                     ok = false; break
                 }

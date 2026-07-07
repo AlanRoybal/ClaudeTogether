@@ -336,7 +336,7 @@ final class EditorGridModel: ObservableObject {
         }
 
         for (identity, cursor) in state.remoteCursors.sorted(by: {
-            $0.key.uuidValue.uuidString < $1.key.uuidValue.uuidString
+            $0.key.uuidValue < $1.key.uuidValue
         }) {
             let head = controller.visibleOffset(for: cursor.anchor)
             guard let remote = visibleCursor(

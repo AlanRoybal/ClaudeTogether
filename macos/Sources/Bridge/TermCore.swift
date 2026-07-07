@@ -71,6 +71,18 @@ final class TermCore {
                         rowCount: Int,
                         into out: inout [ct_cell]) -> Int
     {
+        return out.withUnsafeMutableBufferPointer { p in
+            copyScrollback(startRow: startRow, rowCount: rowCount, into: p)
+        }
+    }
+
+    /// Variant writing straight into caller-owned storage (the render path's
+    /// windowed snapshot) so scrolled-back frames don't allocate a staging
+    /// array per draw.
+    func copyScrollback(startRow: Int,
+                        rowCount: Int,
+                        into out: UnsafeMutableBufferPointer<ct_cell>) -> Int
+    {
         guard let h = handle,
               startRow >= 0,
               rowCount > 0,
@@ -78,14 +90,12 @@ final class TermCore {
         else {
             return 0
         }
-        return out.withUnsafeMutableBufferPointer { p in
-            Int(ct_term_scrollback_snapshot(
-                h,
-                UInt32(min(startRow, Int(UInt32.max))),
-                UInt32(min(rowCount, Int(UInt32.max))),
-                p.baseAddress,
-                p.count))
-        }
+        return Int(ct_term_scrollback_snapshot(
+            h,
+            UInt32(min(startRow, Int(UInt32.max))),
+            UInt32(min(rowCount, Int(UInt32.max))),
+            out.baseAddress,
+            out.count))
     }
 
     func cursor() -> (x: UInt16, y: UInt16) {
@@ -153,6 +163,9 @@ final class TermCore {
     /// while feeding output. The PTY owner writes these back to the PTY.
     func takeQueryResponse() -> [UInt8] {
         guard let h = handle else { return [] }
+        // Called once per PTY chunk; almost never has anything pending, so
+        // check the length before paying for a drain buffer.
+        guard ct_term_response_len(h) > 0 else { return [] }
         var buf = [UInt8](repeating: 0, count: 64)
         let n = buf.withUnsafeMutableBufferPointer { p in
             ct_term_take_response(h, p.baseAddress, p.count)

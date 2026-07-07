@@ -31,7 +31,9 @@ final class MetalTerminalNSView: NSView {
         didSet { refreshTrackingArea() }
     }
     var theme: TerminalTheme = .defaultDark {
-        didSet { renderer.setTheme(theme) }
+        // Guarded: setTheme clears the contrast/background memo caches and
+        // forces a re-encode, and SwiftUI re-assigns this every updateNSView.
+        didSet { if theme != oldValue { renderer.setTheme(theme) } }
     }
 
     /// Bookkeeping for SGR mouse encoding.
