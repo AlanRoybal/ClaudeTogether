@@ -89,7 +89,47 @@ final class EditorGridModel: ObservableObject {
     }
 
     func offsetForVisibleCell(col: Int, row: Int) -> Int {
-        let targetRow = scrollRow + max(0, row)
+        offset(forWrappedRow: scrollRow + max(0, row), col: max(0, col))
+    }
+
+    /// Number of rows in the wrapped projection of the whole document.
+    var wrappedRowCount: Int { totalRows }
+
+    /// Absolute wrapped-grid position (not scroll-relative) of a document
+    /// offset. Vertical caret motion runs in this space so Up/Down step
+    /// through soft-wrapped rows instead of whole logical lines.
+    func wrappedPosition(forOffset offset: Int) -> (row: Int, col: Int) {
+        positionForOffset(offset)
+    }
+
+    /// Document offset at the visual end of wrapped row `targetRow`: just
+    /// past the last glyph on that row, before any trailing newline. Needed
+    /// because `offset(forWrappedRow:col: .max)` returns the caret *before*
+    /// the last character on a soft-wrapped row — the after-last-char caret
+    /// lives at (row+1, 0) and is excluded from the row scan.
+    func offset(endOfWrappedRow targetRow: Int) -> Int {
+        guard !offsetPositions.isEmpty else { return 0 }
+        let scalars = Array(state.text.unicodeScalars)
+        var end: Int?
+        for (offset, position) in offsetPositions.enumerated() {
+            if position.row < targetRow { continue }
+            if position.row > targetRow { break }
+            // `offset` is a caret on targetRow, preceding scalars[offset].
+            // The glyph counts toward this row's end unless it's the trailing
+            // newline (whose caret-before sits on this row but glyph starts
+            // the next logical line).
+            if offset < scalars.count, scalars[offset] != "\n" {
+                end = offset + 1
+            } else if end == nil {
+                end = offset
+            }
+        }
+        return min(end ?? 0, offsetPositions.count - 1)
+    }
+
+    /// Document offset for an absolute wrapped-grid cell, clamping the
+    /// column into the row's populated range.
+    func offset(forWrappedRow targetRow: Int, col: Int) -> Int {
         let targetCol = max(0, col)
         guard !offsetPositions.isEmpty else { return 0 }
 

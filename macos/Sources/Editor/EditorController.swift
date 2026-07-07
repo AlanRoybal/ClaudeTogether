@@ -647,9 +647,11 @@ final class EditorController {
         case .moveDown:
             state.localCaret = moveVertical(from: state.localCaret, delta: +1)
         case .moveLineStart:
-            state.localCaret = lineStart(before: state.localCaret)
+            let row = gridModel.wrappedPosition(forOffset: state.localCaret).row
+            state.localCaret = gridModel.offset(forWrappedRow: row, col: 0)
         case .moveLineEnd:
-            state.localCaret = lineEnd(atOrAfter: state.localCaret)
+            let row = gridModel.wrappedPosition(forOffset: state.localCaret).row
+            state.localCaret = gridModel.offset(endOfWrappedRow: row)
         case .moveDocStart:
             state.localCaret = 0
         case .moveDocEnd:
@@ -678,43 +680,16 @@ final class EditorController {
         return i
     }
 
-    // Column-preserving vertical motion. Returns caret clamped to doc.
+    // Column-preserving vertical motion in wrapped-grid (visual) space, so
+    // Up/Down step through soft-wrapped rows rather than whole logical
+    // lines. Returns caret clamped to doc.
     private func moveVertical(from caret: Int, delta: Int) -> Int {
-        let chars = scalarArray
-        let lineStartIdx = lineStart(before: caret)
-        let column = caret - lineStartIdx
-
-        if delta < 0 {
-            // Move to previous line.
-            if lineStartIdx == 0 { return caret }
-            // prevLineEnd is the '\n' at lineStartIdx - 1.
-            let prevLineEnd = lineStartIdx - 1
-            let prevLineStart = lineStart(before: prevLineEnd)
-            let prevLineLen = prevLineEnd - prevLineStart
-            return prevLineStart + min(column, prevLineLen)
-        } else {
-            // Move to next line.
-            let currentLineEnd = lineEnd(atOrAfter: caret)
-            if currentLineEnd >= chars.count { return caret }
-            let nextLineStart = currentLineEnd + 1
-            let nextLineEnd = lineEnd(atOrAfter: nextLineStart)
-            let nextLineLen = nextLineEnd - nextLineStart
-            return nextLineStart + min(column, nextLineLen)
+        let pos = gridModel.wrappedPosition(forOffset: caret)
+        let targetRow = pos.row + delta
+        guard targetRow >= 0, targetRow < gridModel.wrappedRowCount else {
+            return caret
         }
-    }
-
-    private func lineStart(before caret: Int) -> Int {
-        let chars = scalarArray
-        var i = caret
-        while i > 0, chars[i - 1] != "\n" { i -= 1 }
-        return i
-    }
-
-    private func lineEnd(atOrAfter caret: Int) -> Int {
-        let chars = scalarArray
-        var i = caret
-        while i < chars.count, chars[i] != "\n" { i += 1 }
-        return i
+        return gridModel.offset(forWrappedRow: targetRow, col: pos.col)
     }
 
     /// Returns the whitespace to insert after a newline: current line's
