@@ -1171,6 +1171,8 @@ final class TerminalModel: ObservableObject {
 
         if sessionManager.state == .running {
             sessionManager.sendPaneOpen(tabId: tabId, paneId: paneId, axis: axis)
+            sessionManager.sendPaneGridSize(
+                paneId: paneId, cols: spawnCols, rows: spawnRows)
         }
     }
 
@@ -1232,8 +1234,15 @@ final class TerminalModel: ObservableObject {
               tabs[idx].splitPane?.id == paneId
         else { return }
         let pane = tabs[idx].splitPane!
+        // Peer mirrors are pinned to the host's pane geometry (BUG-36):
+        // the local split layout only changes how much of them is visible.
+        guard !pane.grid.remotelySized else { return }
         pane.pty?.resize(cols: cols, rows: rows)
         pane.grid.resize(cols: cols, rows: rows, preserveTop: true)
+        if sessionManager.role == .host {
+            sessionManager.sendPaneGridSize(
+                paneId: paneId, cols: cols, rows: rows)
+        }
     }
 
     private func makeHostTab(id: UInt32,
@@ -1638,13 +1647,22 @@ final class TerminalModel: ObservableObject {
                 }
                 return
             }
-            guard let formatted = try? String(contentsOf: url, encoding: .utf8) else { return }
+            guard let formatted = try? String(contentsOf: url, encoding: .utf8) else {
+                DispatchQueue.main.async {
+                    self?.postTerminalNotice("Format failed — couldn't re-read \(url.lastPathComponent) after prettier (not UTF-8?)")
+                }
+                return
+            }
             DispatchQueue.main.async {
                 try? editor.replaceText(formatted)
                 self?.saveEditor(docId: editor.state.docId)
             }
         }
-        try? process.run()
+        do {
+            try process.run()
+        } catch {
+            postTerminalNotice("Format failed — couldn't launch prettier: \(error.localizedDescription)")
+        }
     }
 
     /// Decode the visible cells into a String (one line per row, no trailing
@@ -2425,7 +2443,18 @@ final class TerminalModel: ObservableObject {
                 tabs.remove(at: idx)
             }
             if activeTabId == tabId {
+                // Route the fallback through the normal focus path so the
+                // host learns where we landed (presence dots, shared-input
+                // participant sync) and the new tab's overlay is rebuilt —
+                // a bare assignment leaves all of that pointing at the
+                // closed tab until the user clicks another one.
                 activeTabId = tabs.first?.id
+                if let fallbackId = activeTabId {
+                    recordLocalTabFocus(
+                        fallbackId,
+                        broadcast: sessionManager.state == .running)
+                    syncGridSharedInputOverlay(tabId: fallbackId)
+                }
             }
         case .tabFocus(let tabId):
             if sessionManager.role == .host {
@@ -2497,17 +2526,31 @@ final class TerminalModel: ObservableObject {
                 markTabUnread(id: tabId)
             }
         case .cursorPos(let identity, let col, let row):
-            // Update the peer's cursor in the active tab's primary pane grid.
             guard identity != sessionManager.localIdentity,
-                  let participant = sessionManager.participants.first(where: { $0.identity == identity }),
-                  let grid = tabs.first(where: { $0.id == activeTabId })?.grid
+                  let participant = sessionManager.participants.first(where: { $0.identity == identity })
+            else { return }
+            if sessionManager.role == .host {
+                sessionManager.broadcast(.cursorPos(identity, col: col, row: row))
+            }
+            // The frame carries no tab id, so resolve the SENDER's focused
+            // tab from presence bookkeeping — applying it to whatever tab
+            // this client is viewing paints ghost cursors over unrelated
+            // content. Unknown focus (no tabViewing seen yet) drops the
+            // update rather than guessing.
+            let senderTab = tabViewers[identity]
+                ?? participantFocusedTab[identity]
+            guard let senderTabId = senderTab,
+                  let grid = tabs.first(where: { $0.id == senderTabId })?.grid
             else { return }
             grid.upsertPeerCursor(
                 id: identity.uuidValue,
                 col: col, row: row,
                 color: participant.color)
-            if sessionManager.role == .host {
-                sessionManager.broadcast(.cursorPos(identity, col: col, row: row))
+            // Nothing else removes a peer cursor from a grid, so drop this
+            // peer's cursor from every other tab — otherwise switching tabs
+            // strands a frozen ghost cursor on the one they left.
+            for tab in tabs where tab.id != senderTabId {
+                tab.grid.removePeerCursor(id: identity.uuidValue)
             }
         case .fsDelta(let delta):
             guard sessionManager.role == .peer else { return }
@@ -2591,10 +2634,23 @@ final class TerminalModel: ObservableObject {
             let cols = max(tabs[tabIdx].grid.cols / (axis == .horizontal ? 2 : 1), 20)
             let rows = max(tabs[tabIdx].grid.rows / (axis == .vertical   ? 2 : 1), 6)
             guard let grid = GridModel(cols: cols, rows: rows) else { return }
+            // Pinned to the host's geometry: the initial cols/rows above are
+            // a placeholder until the paneGridSize frame lands; the local
+            // window must never resize this grid (BUG-36).
+            grid.remotelySized = true
             let pane = SplitPaneState(id: paneId, pty: nil, grid: grid)
             splitPaneGrids[paneId] = grid
             tabs[tabIdx].splitPane = pane
             tabs[tabIdx].splitAxis = axis
+
+        case .paneGridSize(let paneId, let cols, let rows):
+            guard sessionManager.role == .peer, cols > 0, rows > 0,
+                  let grid = splitPaneGrids[paneId]
+            else { return }
+            grid.remotelySized = true
+            if grid.cols != cols || grid.rows != rows {
+                grid.resize(cols: cols, rows: rows, preserveTop: true)
+            }
 
         case .paneClose(let tabId, let paneId):
             guard sessionManager.role == .peer else { return }
@@ -3492,6 +3548,12 @@ final class TerminalModel: ObservableObject {
                 sessionManager.sendPaneOpen(
                     tabId: tab.id, paneId: pane.id, axis: tab.splitAxis,
                     toTransportPeerID: peerID)
+                // Geometry before content (BUG-36): the snapshot bytes below
+                // assume the host pane's cols/rows.
+                sessionManager.sendPaneGridSize(
+                    paneId: pane.id,
+                    cols: pane.grid.cols, rows: pane.grid.rows,
+                    toTransportPeerID: peerID)
                 let paneHistory = encodeScrollbackHistory(from: pane.grid)
                 if !paneHistory.isEmpty {
                     sessionManager.sendPanePtyOutput(
@@ -3562,6 +3624,11 @@ final class TerminalModel: ObservableObject {
             var rendered = ""
             var visibleLine = ""
             var pendingStyle = lastStyle
+            // Style in effect at the end of `visibleLine`. `pendingStyle`
+            // keeps advancing through the trailing blanks that get truncated,
+            // so carrying it into the next row would desync the emitted
+            // stream from the tracker and bleed colors across rows.
+            var visibleStyle = lastStyle
 
             for col in 0..<cols {
                 let cell = snapshot[row * cols + col]
@@ -3577,13 +3644,14 @@ final class TerminalModel: ObservableObject {
                 rendered += ch
                 if ch != " " || style != .default {
                     visibleLine = rendered
+                    visibleStyle = pendingStyle
                 }
             }
 
             guard !visibleLine.isEmpty else { continue }
             out += "\u{1B}[\(row + 1);1H"
             out += visibleLine
-            lastStyle = pendingStyle
+            lastStyle = visibleStyle
         }
 
         let cursor = grid.term.cursor()

@@ -28,13 +28,56 @@ struct SessionKey {
             .replacingOccurrences(of: "=", with: "")
     }
 
-    /// Encrypts plaintext. Returns nonce (12 B) + ciphertext + tag (16 B).
-    func encrypt(_ data: Data) throws -> Data {
-        try ChaChaPoly.seal(data, using: key).combined
+    /// Wire direction of an encrypted frame, authenticated as AAD so a
+    /// frame recorded on one leg can't be reflected back on the other.
+    enum Direction: UInt8 {
+        case hostToPeer = 1
+        case peerToHost = 2
     }
 
-    /// Decrypts a blob produced by `encrypt`.
-    func decrypt(_ data: Data) throws -> Data {
-        try ChaChaPoly.open(ChaChaPoly.SealedBox(combined: data), using: key)
+    /// Thrown when a frame authenticates but its counter is not strictly
+    /// greater than the last one seen from that sender — i.e. a replay.
+    struct ReplayError: Error {}
+
+    /// Thrown when a frame's direction byte doesn't match the leg it arrived
+    /// on — i.e. a reflection. Like ReplayError this is a relay-tampering
+    /// signal, NOT a wrong-key signal: the key is fine, so it must not feed
+    /// the decrypt-failure teardown streak.
+    struct DirectionError: Error {}
+
+    /// Encrypts plaintext. Returns direction (1 B) + counter (8 B BE) +
+    /// nonce (12 B) + ciphertext + tag (16 B). Direction and counter ride in
+    /// the clear but are bound into the AEAD as additional authenticated
+    /// data, so the relay can't alter, reflect, or replay them undetected.
+    func encrypt(_ data: Data, direction: Direction, counter: UInt64) throws -> Data {
+        var header = Data(capacity: 9)
+        header.append(direction.rawValue)
+        withUnsafeBytes(of: counter.bigEndian) { header.append(contentsOf: $0) }
+        let box = try ChaChaPoly.seal(data, using: key, authenticating: header)
+        return header + box.combined
+    }
+
+    /// Decrypts a blob produced by `encrypt`, enforcing direction and a
+    /// strictly increasing per-sender counter. Returns the plaintext and the
+    /// frame's counter (to persist as the new floor for that sender).
+    func decrypt(_ data: Data,
+                 expecting direction: Direction,
+                 lastCounter: UInt64) throws -> (plaintext: Data, counter: UInt64)
+    {
+        guard data.count > 9 else { throw CryptoKitError.authenticationFailure }
+        let header = data.prefix(9)
+        guard header[header.startIndex] == direction.rawValue else {
+            throw DirectionError()
+        }
+        var counter: UInt64 = 0
+        for b in header[(header.startIndex + 1)...] {
+            counter = (counter << 8) | UInt64(b)
+        }
+        let box = try ChaChaPoly.SealedBox(combined: data.dropFirst(9))
+        let plain = try ChaChaPoly.open(box, using: key, authenticating: header)
+        // Authenticate first, then check freshness: only a frame the key
+        // holder really produced can advance or trip the replay window.
+        guard counter > lastCounter else { throw ReplayError() }
+        return (plain, counter)
     }
 }

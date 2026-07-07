@@ -71,6 +71,18 @@ final class TermCore {
                         rowCount: Int,
                         into out: inout [ct_cell]) -> Int
     {
+        return out.withUnsafeMutableBufferPointer { p in
+            copyScrollback(startRow: startRow, rowCount: rowCount, into: p)
+        }
+    }
+
+    /// Variant writing straight into caller-owned storage (the render path's
+    /// windowed snapshot) so scrolled-back frames don't allocate a staging
+    /// array per draw.
+    func copyScrollback(startRow: Int,
+                        rowCount: Int,
+                        into out: UnsafeMutableBufferPointer<ct_cell>) -> Int
+    {
         guard let h = handle,
               startRow >= 0,
               rowCount > 0,
@@ -78,14 +90,12 @@ final class TermCore {
         else {
             return 0
         }
-        return out.withUnsafeMutableBufferPointer { p in
-            Int(ct_term_scrollback_snapshot(
-                h,
-                UInt32(min(startRow, Int(UInt32.max))),
-                UInt32(min(rowCount, Int(UInt32.max))),
-                p.baseAddress,
-                p.count))
-        }
+        return Int(ct_term_scrollback_snapshot(
+            h,
+            UInt32(min(startRow, Int(UInt32.max))),
+            UInt32(min(rowCount, Int(UInt32.max))),
+            out.baseAddress,
+            out.count))
     }
 
     func cursor() -> (x: UInt16, y: UInt16) {
@@ -153,6 +163,9 @@ final class TermCore {
     /// while feeding output. The PTY owner writes these back to the PTY.
     func takeQueryResponse() -> [UInt8] {
         guard let h = handle else { return [] }
+        // Called once per PTY chunk; almost never has anything pending, so
+        // check the length before paying for a drain buffer.
+        guard ct_term_response_len(h) > 0 else { return [] }
         var buf = [UInt8](repeating: 0, count: 64)
         let n = buf.withUnsafeMutableBufferPointer { p in
             ct_term_take_response(h, p.baseAddress, p.count)
@@ -160,9 +173,8 @@ final class TermCore {
         return Array(buf.prefix(n))
     }
 
-    /// DECSET 1006 — xterm SGR encoding. The only encoding we currently
-    /// emit; if this bit is missing the running app likely expects the
-    /// legacy X10 byte format which we don't synthesize today.
+    /// DECSET 1006 — xterm SGR encoding. Preferred when set; without it the
+    /// view falls back to the legacy X10 byte encoding (BUG-25).
     var sgrMouse: Bool { mouseModeBits & MouseMode.sgr != 0 }
 
     /// DECSET 1000 — report press/release only.
@@ -173,6 +185,10 @@ final class TermCore {
 
     /// DECSET 1003 — press/release + every motion, no button required.
     var anyMotionMouse: Bool { mouseModeBits & MouseMode.move != 0 }
+
+    /// DECSET 1015 — urxvt encoding (decimal CSI Cb;Cx;Cy M). Selected over
+    /// legacy X10 when the app set it without SGR (1006).
+    var urxvtMouse: Bool { mouseModeBits & MouseMode.urxvt != 0 }
 
     /// Returns the OSC 8 URL for the cell at (col, row), or nil if the cell
     /// carries no hyperlink or the URL is not a valid URL.

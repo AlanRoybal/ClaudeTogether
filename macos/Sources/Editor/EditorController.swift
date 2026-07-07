@@ -413,9 +413,15 @@ final class EditorController {
     /// Backspace: if there's a selection delete it, else delete the
     /// character to the left of the caret.
     private func backspace() {
+        // Capture BEFORE mutating: undo must restore the pre-delete caret
+        // and selection, and the delete paths below move/clear both.
+        let caretBefore = state.localCaret
+        let selBefore = state.localSelectionAnchor
         if state.localSelectionAnchor != nil {
             if let inverses = deleteSelection() {
-                finishMutation(inverses: inverses)
+                finishMutation(inverses: inverses,
+                               caretBefore: caretBefore,
+                               selectionBefore: selBefore)
             }
             return
         }
@@ -424,23 +430,31 @@ final class EditorController {
         let pos = caret - 1
         guard let inv = deleteOne(at: pos) else { return }
         state.localCaret = pos
-        finishMutation(inverses: [inv])
+        finishMutation(inverses: [inv],
+                       caretBefore: caretBefore,
+                       selectionBefore: selBefore)
     }
 
     /// Delete-forward: if selection delete it, else delete the
     /// character at the caret (caret stays put; the text to its right
     /// slides left).
     private func deleteForward() {
+        let caretBefore = state.localCaret
+        let selBefore = state.localSelectionAnchor
         if state.localSelectionAnchor != nil {
             if let inverses = deleteSelection() {
-                finishMutation(inverses: inverses)
+                finishMutation(inverses: inverses,
+                               caretBefore: caretBefore,
+                               selectionBefore: selBefore)
             }
             return
         }
         let caret = state.localCaret
         guard caret < scalarCount else { return }
         guard let inv = deleteOne(at: caret) else { return }
-        finishMutation(inverses: [inv])
+        finishMutation(inverses: [inv],
+                       caretBefore: caretBefore,
+                       selectionBefore: selBefore)
     }
 
     /// Delete one character at visible position `pos`. Captures the
@@ -489,14 +503,20 @@ final class EditorController {
     }
 
     /// Finish a mutation: refresh derived state, mark dirty, push undo.
-    private func finishMutation(inverses: [InverseOp]) {
+    /// `caretBefore`/`selectionBefore` are the pre-mutation values — undo
+    /// restores them along with the text (BUG: recording the post-delete
+    /// caret left undo of backspace/delete-selection collapsed at the
+    /// range start with no selection).
+    private func finishMutation(inverses: [InverseOp],
+                                caretBefore: Int,
+                                selectionBefore: Int?) {
         refreshText()
         state.dirty = true
         if !applyingInverse && !inverses.isEmpty {
             pushUndo(UndoEntry(
                 inverses: inverses,
-                caretAfter: state.localCaret,
-                selectionAnchorAfter: state.localSelectionAnchor))
+                caretAfter: caretBefore,
+                selectionAnchorAfter: selectionBefore))
             redoStack.removeAll()
         }
     }
@@ -627,9 +647,11 @@ final class EditorController {
         case .moveDown:
             state.localCaret = moveVertical(from: state.localCaret, delta: +1)
         case .moveLineStart:
-            state.localCaret = lineStart(before: state.localCaret)
+            let row = gridModel.wrappedPosition(forOffset: state.localCaret).row
+            state.localCaret = gridModel.offset(forWrappedRow: row, col: 0)
         case .moveLineEnd:
-            state.localCaret = lineEnd(atOrAfter: state.localCaret)
+            let row = gridModel.wrappedPosition(forOffset: state.localCaret).row
+            state.localCaret = gridModel.offset(endOfWrappedRow: row)
         case .moveDocStart:
             state.localCaret = 0
         case .moveDocEnd:
@@ -658,43 +680,16 @@ final class EditorController {
         return i
     }
 
-    // Column-preserving vertical motion. Returns caret clamped to doc.
+    // Column-preserving vertical motion in wrapped-grid (visual) space, so
+    // Up/Down step through soft-wrapped rows rather than whole logical
+    // lines. Returns caret clamped to doc.
     private func moveVertical(from caret: Int, delta: Int) -> Int {
-        let chars = scalarArray
-        let lineStartIdx = lineStart(before: caret)
-        let column = caret - lineStartIdx
-
-        if delta < 0 {
-            // Move to previous line.
-            if lineStartIdx == 0 { return caret }
-            // prevLineEnd is the '\n' at lineStartIdx - 1.
-            let prevLineEnd = lineStartIdx - 1
-            let prevLineStart = lineStart(before: prevLineEnd)
-            let prevLineLen = prevLineEnd - prevLineStart
-            return prevLineStart + min(column, prevLineLen)
-        } else {
-            // Move to next line.
-            let currentLineEnd = lineEnd(atOrAfter: caret)
-            if currentLineEnd >= chars.count { return caret }
-            let nextLineStart = currentLineEnd + 1
-            let nextLineEnd = lineEnd(atOrAfter: nextLineStart)
-            let nextLineLen = nextLineEnd - nextLineStart
-            return nextLineStart + min(column, nextLineLen)
+        let pos = gridModel.wrappedPosition(forOffset: caret)
+        let targetRow = pos.row + delta
+        guard targetRow >= 0, targetRow < gridModel.wrappedRowCount else {
+            return caret
         }
-    }
-
-    private func lineStart(before caret: Int) -> Int {
-        let chars = scalarArray
-        var i = caret
-        while i > 0, chars[i - 1] != "\n" { i -= 1 }
-        return i
-    }
-
-    private func lineEnd(atOrAfter caret: Int) -> Int {
-        let chars = scalarArray
-        var i = caret
-        while i < chars.count, chars[i] != "\n" { i += 1 }
-        return i
+        return gridModel.offset(forWrappedRow: targetRow, col: pos.col)
     }
 
     /// Returns the whitespace to insert after a newline: current line's

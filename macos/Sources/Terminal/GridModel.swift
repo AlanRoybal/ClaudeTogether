@@ -35,7 +35,13 @@ final class GridModel: ObservableObject {
 
     let term: TermCore
     let localCursorID = UUID()
-    private var overlay: InputOverlay?
+    private var overlay: InputOverlay? {
+        didSet { overlayPositionsCache = nil }
+    }
+    /// Cached overlayLayoutPositions result; valid while the overlay and the
+    /// column count are unchanged.
+    private var overlayPositionsCache: [Int]?
+    private var overlayPositionsCols = 0
     // Manually-managed storage so `snapshot()` can hand out a pointer that
     // stays valid until the next rebuild (escaping a pointer out of an
     // Array's withUnsafeBufferPointer is undefined behavior).
@@ -54,9 +60,26 @@ final class GridModel: ObservableObject {
     /// (BUG-36 — absolute-positioned TUI output garbles on any mismatch).
     var remotelySized = false
 
-    /// Bumped whenever the grid or cursor state changes. Currently advisory —
-    /// the renderer redraws every frame — but lets SwiftUI views bind to it.
-    @Published private(set) var epoch: UInt32 = 0
+    /// Bumped whenever the grid or cursor state changes. The renderer polls
+    /// this directly in draw() to gate re-encoding; SwiftUI observers get a
+    /// coalesced objectWillChange instead of a publish per bump — feed() runs
+    /// once per 4 KB PTY chunk, which is hundreds of times a second during
+    /// heavy output, and per-chunk publishes stall the main thread re-running
+    /// observer bodies.
+    private(set) var epoch: UInt32 = 0 {
+        didSet { scheduleCoalescedPublish() }
+    }
+    private var publishPending = false
+
+    private func scheduleCoalescedPublish() {
+        guard !publishPending else { return }
+        publishPending = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.publishPending = false
+            self.objectWillChange.send()
+        }
+    }
 
     init?(cols: UInt16, rows: UInt16) {
         guard let term = TermCore(cols: cols, rows: rows) else { return nil }
@@ -155,10 +178,8 @@ final class GridModel: ObservableObject {
         }
         if scrollOffset > 0 || rowShift > 0 {
             copyWindowedSnapshot(primary: base)
-        } else {
-            for i in 0..<base.count {
-                overlaySnapshot[i] = base[i]
-            }
+        } else if let src = base.baseAddress, let dst = overlaySnapshot.baseAddress {
+            dst.update(from: src, count: base.count)
         }
 
         guard let overlay else {
@@ -292,10 +313,15 @@ final class GridModel: ObservableObject {
         }
         next.sort { lhs, rhs in
             if lhs.isLocal != rhs.isLocal { return lhs.isLocal }
-            return lhs.id.uuidString < rhs.id.uuidString
+            return lhs.id < rhs.id
         }
-        cursors = next
-        epoch &+= 1
+        // Only bump the epoch when cursors actually moved: a peer's cursor
+        // heartbeat at an unchanged position would otherwise force the
+        // renderer to re-encode a frame with identical contents.
+        if next != cursors {
+            cursors = next
+            epoch &+= 1
+        }
     }
 
     private func syncTerminalCursors() {
@@ -314,7 +340,7 @@ final class GridModel: ObservableObject {
                 isLocal: true))
         }
         for (id, cursor) in peerTerminalCursors.sorted(by: {
-            $0.key.uuidString < $1.key.uuidString
+            $0.key < $1.key
         }) {
             guard let row = visibleRow(forPrimaryRow: Int(cursor.row)) else {
                 continue
@@ -337,7 +363,15 @@ final class GridModel: ObservableObject {
     /// layout to the start of the next row; all other scalars advance by one
     /// cell, wrapping naturally at the right edge.
     private func overlayLayoutPositions(_ overlay: InputOverlay) -> [Int] {
+        // Memoized: snapshot() resolves every overlay cell through
+        // linearIndex(forPrimaryLinear:) → windowStartRow →
+        // overlayBottomOverflow, each of which needs this layout. Without the
+        // cache that chain re-lays-out (and re-allocates) the whole overlay
+        // per cell — O(N²) per rendered frame while anyone is typing.
         let cols = max(Int(self.cols), 1)
+        if let cached = overlayPositionsCache, overlayPositionsCols == cols {
+            return cached
+        }
         var linear = Int(overlay.anchorRow) * cols + Int(overlay.anchorCol)
         var positions: [Int] = []
         positions.reserveCapacity(overlay.textScalars.count + 1)
@@ -346,6 +380,8 @@ final class GridModel: ObservableObject {
             linear = scalar == "\n" ? (linear / cols + 1) * cols : linear + 1
         }
         positions.append(linear)
+        overlayPositionsCache = positions
+        overlayPositionsCols = cols
         return positions
     }
 
@@ -409,36 +445,28 @@ final class GridModel: ObservableObject {
 
         var visibleRow = 0
         if startRow < scrollbackLength {
+            // Written straight into the head of the windowed snapshot — the
+            // core bounds-checks against the buffer's cell capacity.
             let scrollbackRows = min(rows, scrollbackLength - startRow)
-            var scrollbackCells = [ct_cell](
-                repeating: ct_cell(),
-                count: scrollbackRows * cols)
-            let copied = term.copyScrollback(
+            visibleRow = term.copyScrollback(
                 startRow: startRow,
                 rowCount: scrollbackRows,
-                into: &scrollbackCells)
-            let cellsToCopy = min(copied * cols, overlaySnapshot.count)
-            for i in 0..<cellsToCopy {
-                overlaySnapshot[i] = scrollbackCells[i]
-            }
-            visibleRow = copied
+                into: overlaySnapshot)
         }
 
         var primaryRow = max(0, startRow + visibleRow - scrollbackLength)
+        let dstBase = overlaySnapshot.baseAddress
         while visibleRow < rows {
             let dstStart = visibleRow * cols
             let srcStart = primaryRow * cols
-            guard dstStart < overlaySnapshot.count else { break }
-            if srcStart + cols <= primary.count {
-                for i in 0..<cols {
-                    overlaySnapshot[dstStart + i] = primary[srcStart + i]
-                }
+            guard dstStart + cols <= overlaySnapshot.count, let dstBase else { break }
+            let dst = dstBase + dstStart
+            if srcStart + cols <= primary.count, let srcBase = primary.baseAddress {
+                dst.update(from: srcBase + srcStart, count: cols)
             } else {
                 // Rows past the live grid (a shifted multi-line overlay draws
                 // into them) render as blank cells in the default style.
-                for i in 0..<cols {
-                    overlaySnapshot[dstStart + i] = ct_cell()
-                }
+                dst.update(repeating: ct_cell(), count: cols)
             }
             visibleRow += 1
             primaryRow += 1

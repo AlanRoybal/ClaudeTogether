@@ -117,6 +117,14 @@ final class SessionManager: ObservableObject {
     private var decryptFailureStreak = 0
     private var hasDecodedFrame = false
 
+    /// Anti-replay state: every outbound encrypted frame carries a strictly
+    /// increasing counter (authenticated as AAD together with the wire
+    /// direction), and inbound frames must beat the last counter seen from
+    /// that transport peer. Stops the untrusted relay from re-injecting or
+    /// reflecting recorded ciphertext.
+    private var sendCounter: UInt64 = 0
+    private var recvCounters: [UInt32: UInt64] = [:]
+
     private static let keepAliveInterval: TimeInterval = 15
 
     /// Peer-only auto-reconnect (#61): the host:port of the last successful
@@ -235,6 +243,8 @@ final class SessionManager: ObservableObject {
         bannedIdentities.removeAll()
         decryptFailureStreak = 0
         hasDecodedFrame = false
+        sendCounter = 0
+        recvCounters.removeAll()
         localPort = 0
         publicURL = nil
         lastError = nil
@@ -325,7 +335,11 @@ final class SessionManager: ObservableObject {
     private func encryptedWireBytes(_ plain: Data) -> Data? {
         guard let key = sessionKey else { return plain }
         do {
-            return try key.encrypt(plain)
+            sendCounter += 1
+            return try key.encrypt(
+                plain,
+                direction: role == .host ? .hostToPeer : .peerToHost,
+                counter: sendCounter)
         } catch {
             NSLog("[ct] encrypt failed, frame dropped: %@", "\(error)")
             return nil
@@ -455,6 +469,18 @@ final class SessionManager: ObservableObject {
     {
         guard role == .host, state == .running else { return }
         let frame = Frame.paneOpen(tabId: tabId, paneId: paneId, axis: axis)
+        if let peerID { send(frame, toTransportPeerID: peerID) }
+        else { broadcast(frame) }
+    }
+
+    /// Host only: pin peers' mirror of a split pane to the host's geometry
+    /// (BUG-36 for panes). Sent when the pane opens, when the host's split
+    /// layout resizes it, and to each joining peer after paneOpen.
+    func sendPaneGridSize(paneId: UInt32, cols: UInt16, rows: UInt16,
+                          toTransportPeerID peerID: UInt32? = nil)
+    {
+        guard role == .host, state == .running, cols > 0, rows > 0 else { return }
+        let frame = Frame.paneGridSize(paneId: paneId, cols: cols, rows: rows)
         if let peerID { send(frame, toTransportPeerID: peerID) }
         else { broadcast(frame) }
     }
@@ -787,7 +813,23 @@ final class SessionManager: ObservableObject {
             let plain: Data
             if let key = sessionKey {
                 do {
-                    plain = try key.decrypt(wire)
+                    let opened = try key.decrypt(
+                        wire,
+                        expecting: role == .host ? .peerToHost : .hostToPeer,
+                        lastCounter: recvCounters[peerID] ?? 0)
+                    plain = opened.plaintext
+                    recvCounters[peerID] = opened.counter
+                } catch is SessionKey.ReplayError {
+                    // Authenticated but stale — a relay replaying recorded
+                    // ciphertext. Drop it without touching the wrong-key
+                    // failure streak: the key is provably fine.
+                    NSLog("[ct] dropped replayed frame from peer=%u", peerID)
+                    continue
+                } catch is SessionKey.DirectionError {
+                    // Wrong-direction (reflected) frame — also relay tampering,
+                    // not a key problem, so it must not trip the teardown.
+                    NSLog("[ct] dropped reflected frame from peer=%u", peerID)
+                    continue
                 } catch {
                     // A decrypt/authentication failure means the key doesn't
                     // match the host (or the ciphertext was tampered with) —
@@ -814,6 +856,9 @@ final class SessionManager: ObservableObject {
                 let frame = try FrameCodec.decode(plain)
                 decryptFailureStreak = 0
                 hasDecodedFrame = true
+                // The link delivered a real frame — it's a live session, not
+                // a flapping transport, so the backoff ladder starts over.
+                reconnectAttempt = 0
                 handleFrame(frame, from: peerID)
             } catch {
                 lastError = "decode: \(error)"
@@ -833,6 +878,7 @@ final class SessionManager: ObservableObject {
 
     private func handleDisconnected(_ peerID: UInt32) {
         if role == .host {
+            recvCounters.removeValue(forKey: peerID)
             if let gone = transportToIdentity.removeValue(forKey: peerID) {
                 // A reconnecting peer may already be back on a new transport
                 // connection before the old socket's death is noticed — only
@@ -870,7 +916,10 @@ final class SessionManager: ObservableObject {
             ct_session_free(h)
             handle = nil
         }
-        reconnectAttempt = 0
+        // Deliberately keep `reconnectAttempt`: it only resets after the
+        // revived link proves itself by delivering a frame. Resetting here
+        // would let a flapping host (connect, drop, connect, …) bypass
+        // `maxReconnectAttempts` and retry forever.
         onReconnectBegan?()
         scheduleReconnect()
     }
@@ -933,7 +982,6 @@ final class SessionManager: ObservableObject {
         }
         NSLog("[ct] reconnected after %d attempt(s)", reconnectAttempt)
         handle = h
-        reconnectAttempt = 0
         state = .running
         startPolling()
         startKeepAlive()
