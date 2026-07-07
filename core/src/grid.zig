@@ -310,11 +310,40 @@ pub const Grid = struct {
     }
 
     fn internUrl(self: *Grid, url: []const u8) !u8 {
-        const id = self.url_next_id;
-        if (self.url_pool[id]) |old| self.alloc.free(old);
+        // Reuse the slot already holding this URL so repeated links (the
+        // common case) never consume new ids or trigger recycling.
+        for (self.url_pool[1..], 1..) |maybe_url, i| {
+            if (maybe_url) |existing| {
+                if (std.mem.eql(u8, existing, url)) return @intCast(i);
+            }
+        }
+        var id = self.url_next_id;
+        // Never recycle the slot the parser is still tagging cells with.
+        if (id == self.active_url_id) id = if (id == 255) 1 else id + 1;
+        if (self.url_pool[id]) |old| {
+            self.alloc.free(old);
+            self.url_pool[id] = null;
+            self.clearUrlId(id);
+        }
         self.url_pool[id] = try self.alloc.dupe(u8, url);
         self.url_next_id = if (id == 255) 1 else id + 1;
         return id;
+    }
+
+    /// Drop stale references to a recycled url id so live cells can't alias
+    /// the new URL stored in that slot. Only the primary + alt buffers are
+    /// swept: URL lookup (ct_term_cell_url) resolves exclusively against the
+    /// live grid, so scrollback url_ids are never dereferenced — sweeping the
+    /// full 10K-row ring per recycle would be pure overhead on the feed path.
+    /// (A scrolled-back stale link may briefly keep a cosmetic underline; the
+    /// click target is always the live grid, so no wrong URL can open.)
+    fn clearUrlId(self: *Grid, id: u8) void {
+        for (self.primary) |*c| {
+            if (c.url_id == id) c.url_id = 0;
+        }
+        for (self.alt) |*c| {
+            if (c.url_id == id) c.url_id = 0;
+        }
     }
 
     fn applyOsc(self: *Grid, payload: []const u8) void {
@@ -1239,4 +1268,37 @@ test "XTMODKEYS CSI > 4;2 m does not touch SGR state" {
     mod.params[1] = 2;
     g.apply(.{ .csi = mod });
     try std.testing.expectEqual(@as(u16, 0), g.sgr_attrs);
+}
+
+test "OSC 8 interning dedupes repeated URLs" {
+    var g = try Grid.init(std.testing.allocator, 10, 5);
+    defer g.deinit();
+    g.apply(.{ .osc = "8;;http://a.example" });
+    const first = g.active_url_id;
+    g.apply(.{ .osc = "8;;" });
+    g.apply(.{ .osc = "8;;http://b.example" });
+    g.apply(.{ .osc = "8;;" });
+    g.apply(.{ .osc = "8;;http://a.example" });
+    try std.testing.expectEqual(first, g.active_url_id);
+}
+
+test "OSC 8 url id recycle clears stale cell references" {
+    var g = try Grid.init(std.testing.allocator, 10, 5);
+    defer g.deinit();
+    g.apply(.{ .osc = "8;;http://first.example" });
+    g.apply(.{ .print = 'A' });
+    g.apply(.{ .osc = "8;;" });
+    const first_id = g.cells[0].url_id;
+    try std.testing.expect(first_id != 0);
+
+    // Exhaust the pool with distinct URLs until first_id gets recycled.
+    var buf: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < 256) : (i += 1) {
+        const payload = std.fmt.bufPrint(&buf, "8;;http://n{d}.example", .{i}) catch unreachable;
+        g.apply(.{ .osc = payload });
+        g.apply(.{ .osc = "8;;" });
+    }
+    // The cell printed under the first URL must no longer claim a link.
+    try std.testing.expectEqual(@as(u8, 0), g.cells[0].url_id);
 }
