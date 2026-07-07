@@ -5,11 +5,16 @@ const bore_mod = @import("bore.zig");
 const crdt = @import("crdt.zig");
 const runtime = @import("runtime.zig");
 
-// Process-wide allocator for C-ABI objects. Using the debug allocator
-// so leaks show up in Debug builds.
+// Process-wide allocator for C-ABI objects. Debug builds use the debug
+// allocator so leaks show up; release builds use the lock-free smp
+// allocator (this feeds the session reader threads' per-frame payload
+// allocations, where the debug allocator's bookkeeping is pure overhead).
 var gpa_instance: std.heap.DebugAllocator(.{}) = .init;
 fn gpa() std.mem.Allocator {
-    return gpa_instance.allocator();
+    return switch (@import("builtin").mode) {
+        .Debug => gpa_instance.allocator(),
+        else => std.heap.smp_allocator,
+    };
 }
 
 // Last-error slot so callers can read a human-readable reason after a

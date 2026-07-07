@@ -49,10 +49,16 @@ pub const Term = struct {
 };
 
 // Global allocator for the Term lifecycle. Swift owns the handle pointer.
+// Debug builds keep the safety-checking allocator; release builds use the
+// lock-free smp allocator — the debug one taxes every resize/scrollback/URL
+// allocation with metadata and canaries regardless of optimize mode.
 var gpa_state: std.heap.DebugAllocator(.{}) = .init;
 
 fn allocator() std.mem.Allocator {
-    return gpa_state.allocator();
+    return switch (@import("builtin").mode) {
+        .Debug => gpa_state.allocator(),
+        else => std.heap.smp_allocator,
+    };
 }
 
 // ----- C ABI --------------------------------------------------------------
@@ -177,6 +183,13 @@ export fn ct_term_kitty_flags(t: ?*Term) u32 {
 export fn ct_term_take_response(t: ?*Term, out: [*]u8, cap: usize) usize {
     const term = t orelse return 0;
     return term.grid.takeResponse(out[0..cap]);
+}
+
+/// Number of pending query-response bytes without draining them. Lets the
+/// per-chunk feed path skip the buffer allocation in the common no-reply case.
+export fn ct_term_response_len(t: ?*Term) usize {
+    const term = t orelse return 0;
+    return term.grid.response_len;
 }
 
 /// Retrieve the OSC 8 URL for the cell at (col, row), if any.

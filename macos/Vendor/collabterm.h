@@ -99,6 +99,9 @@ uint32_t ct_term_kitty_flags(ct_term *t);
  * Returns the number of bytes written into `out`. */
 size_t   ct_term_take_response(ct_term *t, uint8_t *out, size_t cap);
 
+/* Number of pending query-response bytes without draining them. */
+size_t   ct_term_response_len(ct_term *t);
+
 /* Retrieve the OSC 8 URL for the cell at (col, row), if any.
  * Writes up to `cap` bytes (NOT NUL-terminated) into `out`.
  * Returns the URL length, or 0 if the cell has no URL. */
