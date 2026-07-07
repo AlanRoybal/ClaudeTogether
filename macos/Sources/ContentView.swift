@@ -3604,6 +3604,11 @@ final class TerminalModel: ObservableObject {
             var rendered = ""
             var visibleLine = ""
             var pendingStyle = lastStyle
+            // Style in effect at the end of `visibleLine`. `pendingStyle`
+            // keeps advancing through the trailing blanks that get truncated,
+            // so carrying it into the next row would desync the emitted
+            // stream from the tracker and bleed colors across rows.
+            var visibleStyle = lastStyle
 
             for col in 0..<cols {
                 let cell = snapshot[row * cols + col]
@@ -3619,13 +3624,14 @@ final class TerminalModel: ObservableObject {
                 rendered += ch
                 if ch != " " || style != .default {
                     visibleLine = rendered
+                    visibleStyle = pendingStyle
                 }
             }
 
             guard !visibleLine.isEmpty else { continue }
             out += "\u{1B}[\(row + 1);1H"
             out += visibleLine
-            lastStyle = pendingStyle
+            lastStyle = visibleStyle
         }
 
         let cursor = grid.term.cursor()
