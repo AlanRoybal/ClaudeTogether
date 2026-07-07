@@ -1647,13 +1647,22 @@ final class TerminalModel: ObservableObject {
                 }
                 return
             }
-            guard let formatted = try? String(contentsOf: url, encoding: .utf8) else { return }
+            guard let formatted = try? String(contentsOf: url, encoding: .utf8) else {
+                DispatchQueue.main.async {
+                    self?.postTerminalNotice("Format failed — couldn't re-read \(url.lastPathComponent) after prettier (not UTF-8?)")
+                }
+                return
+            }
             DispatchQueue.main.async {
                 try? editor.replaceText(formatted)
                 self?.saveEditor(docId: editor.state.docId)
             }
         }
-        try? process.run()
+        do {
+            try process.run()
+        } catch {
+            postTerminalNotice("Format failed — couldn't launch prettier: \(error.localizedDescription)")
+        }
     }
 
     /// Decode the visible cells into a String (one line per row, no trailing
@@ -2434,7 +2443,18 @@ final class TerminalModel: ObservableObject {
                 tabs.remove(at: idx)
             }
             if activeTabId == tabId {
+                // Route the fallback through the normal focus path so the
+                // host learns where we landed (presence dots, shared-input
+                // participant sync) and the new tab's overlay is rebuilt —
+                // a bare assignment leaves all of that pointing at the
+                // closed tab until the user clicks another one.
                 activeTabId = tabs.first?.id
+                if let fallbackId = activeTabId {
+                    recordLocalTabFocus(
+                        fallbackId,
+                        broadcast: sessionManager.state == .running)
+                    syncGridSharedInputOverlay(tabId: fallbackId)
+                }
             }
         case .tabFocus(let tabId):
             if sessionManager.role == .host {
