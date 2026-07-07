@@ -13,7 +13,7 @@ private struct FSSyncLocalEntry: Equatable {
 
 final class FSSyncWatcher {
     /// Directory names never synced to peers, at any depth (#88). The
-    /// `.cottyignore` rules planned in #72 layer on top of these defaults.
+    /// user's `.cottyignore` rules (#72) layer on top of these defaults.
     static let defaultExcludedDirectoryNames: Set<String> = [
         "node_modules",
         ".git",
@@ -26,9 +26,14 @@ final class FSSyncWatcher {
         ".venv",
     ]
 
+    /// Name of the user-editable ignore file read from the sync root (#72).
+    static let ignoreFileName = ".cottyignore"
+
     private let rootURL: URL
     private var lastEntries: [String: FSSyncLocalEntry] = [:]
     private let fileManager = FileManager.default
+    private var cachedIgnore: CottyIgnore?
+    private var cachedIgnoreSource: String?
 
     init(rootURL: URL) {
         self.rootURL = rootURL.standardizedFileURL
@@ -48,6 +53,24 @@ final class FSSyncWatcher {
         lastEntries = current
         guard !deltas.isEmpty else { return nil }
         return FSSyncHostUpdate(deltas: deltas, snapshot: nil)
+    }
+
+    /// Reloads `.cottyignore` from the sync root, reusing the parsed rules
+    /// while the file's contents are unchanged. Returns nil when the file is
+    /// absent, unreadable, or contains no rules.
+    private func ignoreRules() -> CottyIgnore? {
+        let url = rootURL.appendingPathComponent(Self.ignoreFileName)
+        guard let source = try? String(contentsOf: url, encoding: .utf8) else {
+            cachedIgnore = nil
+            cachedIgnoreSource = nil
+            return nil
+        }
+        if source != cachedIgnoreSource {
+            cachedIgnore = CottyIgnore(source: source)
+            cachedIgnoreSource = source
+        }
+        guard let ignore = cachedIgnore, !ignore.isEmpty else { return nil }
+        return ignore
     }
 
     private func scan() -> [String: FSSyncLocalEntry] {
@@ -71,6 +94,7 @@ final class FSSyncWatcher {
             return [:]
         }
 
+        let ignore = ignoreRules()
         var entries: [String: FSSyncLocalEntry] = [:]
         for case let url as URL in enumerator {
             let standardized = url.standardizedFileURL
@@ -90,14 +114,22 @@ final class FSSyncWatcher {
                 continue
             }
 
-            if values.isDirectory == true,
+            let isDirectory = values.isDirectory == true
+            if isDirectory,
                Self.defaultExcludedDirectoryNames.contains(standardized.lastPathComponent)
             {
                 enumerator.skipDescendants()
                 continue
             }
 
-            if values.isDirectory == true {
+            if let ignore,
+               ignore.isExcluded(relativePath: relativePath, isDirectory: isDirectory)
+            {
+                if isDirectory { enumerator.skipDescendants() }
+                continue
+            }
+
+            if isDirectory {
                 entries[relativePath] = FSSyncLocalEntry(
                     kind: .directory,
                     size: 0,
