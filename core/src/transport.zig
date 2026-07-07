@@ -170,10 +170,27 @@ pub const Listener = struct {
     }
 
     pub fn accept(self: *Listener) !Connection {
-        const cfd = c.accept(self.fd, null, null);
-        if (cfd < 0) return error.ConnectFailed;
-        setNoDelay(cfd);
-        return .{ .fd = cfd };
+        while (true) {
+            const cfd = c.accept(self.fd, null, null);
+            if (cfd < 0) {
+                // Transient per-connection failures (a joiner resetting mid
+                // handshake, a signal, fd pressure) must not kill the accept
+                // loop — the session would silently stop admitting peers.
+                const err = std.c._errno().*;
+                switch (err) {
+                    c.EINTR, c.ECONNABORTED => continue,
+                    // fd exhaustion: back off so a queued backlog doesn't
+                    // turn this into a hot spin.
+                    c.EMFILE, c.ENFILE => {
+                        runtime.sleep(50 * runtime.ns_per_ms);
+                        continue;
+                    },
+                    else => return error.ConnectFailed,
+                }
+            }
+            setNoDelay(cfd);
+            return .{ .fd = cfd };
+        }
     }
 
     pub fn close(self: *Listener) void {
