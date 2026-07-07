@@ -413,9 +413,15 @@ final class EditorController {
     /// Backspace: if there's a selection delete it, else delete the
     /// character to the left of the caret.
     private func backspace() {
+        // Capture BEFORE mutating: undo must restore the pre-delete caret
+        // and selection, and the delete paths below move/clear both.
+        let caretBefore = state.localCaret
+        let selBefore = state.localSelectionAnchor
         if state.localSelectionAnchor != nil {
             if let inverses = deleteSelection() {
-                finishMutation(inverses: inverses)
+                finishMutation(inverses: inverses,
+                               caretBefore: caretBefore,
+                               selectionBefore: selBefore)
             }
             return
         }
@@ -424,23 +430,31 @@ final class EditorController {
         let pos = caret - 1
         guard let inv = deleteOne(at: pos) else { return }
         state.localCaret = pos
-        finishMutation(inverses: [inv])
+        finishMutation(inverses: [inv],
+                       caretBefore: caretBefore,
+                       selectionBefore: selBefore)
     }
 
     /// Delete-forward: if selection delete it, else delete the
     /// character at the caret (caret stays put; the text to its right
     /// slides left).
     private func deleteForward() {
+        let caretBefore = state.localCaret
+        let selBefore = state.localSelectionAnchor
         if state.localSelectionAnchor != nil {
             if let inverses = deleteSelection() {
-                finishMutation(inverses: inverses)
+                finishMutation(inverses: inverses,
+                               caretBefore: caretBefore,
+                               selectionBefore: selBefore)
             }
             return
         }
         let caret = state.localCaret
         guard caret < scalarCount else { return }
         guard let inv = deleteOne(at: caret) else { return }
-        finishMutation(inverses: [inv])
+        finishMutation(inverses: [inv],
+                       caretBefore: caretBefore,
+                       selectionBefore: selBefore)
     }
 
     /// Delete one character at visible position `pos`. Captures the
@@ -489,14 +503,20 @@ final class EditorController {
     }
 
     /// Finish a mutation: refresh derived state, mark dirty, push undo.
-    private func finishMutation(inverses: [InverseOp]) {
+    /// `caretBefore`/`selectionBefore` are the pre-mutation values — undo
+    /// restores them along with the text (BUG: recording the post-delete
+    /// caret left undo of backspace/delete-selection collapsed at the
+    /// range start with no selection).
+    private func finishMutation(inverses: [InverseOp],
+                                caretBefore: Int,
+                                selectionBefore: Int?) {
         refreshText()
         state.dirty = true
         if !applyingInverse && !inverses.isEmpty {
             pushUndo(UndoEntry(
                 inverses: inverses,
-                caretAfter: state.localCaret,
-                selectionAnchorAfter: state.localSelectionAnchor))
+                caretAfter: caretBefore,
+                selectionAnchorAfter: selectionBefore))
             redoStack.removeAll()
         }
     }
