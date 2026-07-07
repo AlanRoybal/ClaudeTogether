@@ -2506,17 +2506,31 @@ final class TerminalModel: ObservableObject {
                 markTabUnread(id: tabId)
             }
         case .cursorPos(let identity, let col, let row):
-            // Update the peer's cursor in the active tab's primary pane grid.
             guard identity != sessionManager.localIdentity,
-                  let participant = sessionManager.participants.first(where: { $0.identity == identity }),
-                  let grid = tabs.first(where: { $0.id == activeTabId })?.grid
+                  let participant = sessionManager.participants.first(where: { $0.identity == identity })
+            else { return }
+            if sessionManager.role == .host {
+                sessionManager.broadcast(.cursorPos(identity, col: col, row: row))
+            }
+            // The frame carries no tab id, so resolve the SENDER's focused
+            // tab from presence bookkeeping — applying it to whatever tab
+            // this client is viewing paints ghost cursors over unrelated
+            // content. Unknown focus (no tabViewing seen yet) drops the
+            // update rather than guessing.
+            let senderTab = tabViewers[identity]
+                ?? participantFocusedTab[identity]
+            guard let senderTabId = senderTab,
+                  let grid = tabs.first(where: { $0.id == senderTabId })?.grid
             else { return }
             grid.upsertPeerCursor(
                 id: identity.uuidValue,
                 col: col, row: row,
                 color: participant.color)
-            if sessionManager.role == .host {
-                sessionManager.broadcast(.cursorPos(identity, col: col, row: row))
+            // Nothing else removes a peer cursor from a grid, so drop this
+            // peer's cursor from every other tab — otherwise switching tabs
+            // strands a frozen ghost cursor on the one they left.
+            for tab in tabs where tab.id != senderTabId {
+                tab.grid.removePeerCursor(id: identity.uuidValue)
             }
         case .fsDelta(let delta):
             guard sessionManager.role == .peer else { return }
