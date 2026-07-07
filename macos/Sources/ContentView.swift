@@ -1171,6 +1171,8 @@ final class TerminalModel: ObservableObject {
 
         if sessionManager.state == .running {
             sessionManager.sendPaneOpen(tabId: tabId, paneId: paneId, axis: axis)
+            sessionManager.sendPaneGridSize(
+                paneId: paneId, cols: spawnCols, rows: spawnRows)
         }
     }
 
@@ -1232,8 +1234,15 @@ final class TerminalModel: ObservableObject {
               tabs[idx].splitPane?.id == paneId
         else { return }
         let pane = tabs[idx].splitPane!
+        // Peer mirrors are pinned to the host's pane geometry (BUG-36):
+        // the local split layout only changes how much of them is visible.
+        guard !pane.grid.remotelySized else { return }
         pane.pty?.resize(cols: cols, rows: rows)
         pane.grid.resize(cols: cols, rows: rows, preserveTop: true)
+        if sessionManager.role == .host {
+            sessionManager.sendPaneGridSize(
+                paneId: paneId, cols: cols, rows: rows)
+        }
     }
 
     private func makeHostTab(id: UInt32,
@@ -2591,10 +2600,23 @@ final class TerminalModel: ObservableObject {
             let cols = max(tabs[tabIdx].grid.cols / (axis == .horizontal ? 2 : 1), 20)
             let rows = max(tabs[tabIdx].grid.rows / (axis == .vertical   ? 2 : 1), 6)
             guard let grid = GridModel(cols: cols, rows: rows) else { return }
+            // Pinned to the host's geometry: the initial cols/rows above are
+            // a placeholder until the paneGridSize frame lands; the local
+            // window must never resize this grid (BUG-36).
+            grid.remotelySized = true
             let pane = SplitPaneState(id: paneId, pty: nil, grid: grid)
             splitPaneGrids[paneId] = grid
             tabs[tabIdx].splitPane = pane
             tabs[tabIdx].splitAxis = axis
+
+        case .paneGridSize(let paneId, let cols, let rows):
+            guard sessionManager.role == .peer, cols > 0, rows > 0,
+                  let grid = splitPaneGrids[paneId]
+            else { return }
+            grid.remotelySized = true
+            if grid.cols != cols || grid.rows != rows {
+                grid.resize(cols: cols, rows: rows, preserveTop: true)
+            }
 
         case .paneClose(let tabId, let paneId):
             guard sessionManager.role == .peer else { return }
@@ -3491,6 +3513,12 @@ final class TerminalModel: ObservableObject {
             if let pane = tab.splitPane {
                 sessionManager.sendPaneOpen(
                     tabId: tab.id, paneId: pane.id, axis: tab.splitAxis,
+                    toTransportPeerID: peerID)
+                // Geometry before content (BUG-36): the snapshot bytes below
+                // assume the host pane's cols/rows.
+                sessionManager.sendPaneGridSize(
+                    paneId: pane.id,
+                    cols: pane.grid.cols, rows: pane.grid.rows,
                     toTransportPeerID: peerID)
                 let paneHistory = encodeScrollbackHistory(from: pane.grid)
                 if !paneHistory.isEmpty {

@@ -473,6 +473,18 @@ final class SessionManager: ObservableObject {
         else { broadcast(frame) }
     }
 
+    /// Host only: pin peers' mirror of a split pane to the host's geometry
+    /// (BUG-36 for panes). Sent when the pane opens, when the host's split
+    /// layout resizes it, and to each joining peer after paneOpen.
+    func sendPaneGridSize(paneId: UInt32, cols: UInt16, rows: UInt16,
+                          toTransportPeerID peerID: UInt32? = nil)
+    {
+        guard role == .host, state == .running, cols > 0, rows > 0 else { return }
+        let frame = Frame.paneGridSize(paneId: paneId, cols: cols, rows: rows)
+        if let peerID { send(frame, toTransportPeerID: peerID) }
+        else { broadcast(frame) }
+    }
+
     /// Host only: announce that a split pane was closed.
     func sendPaneClose(tabId: UInt32, paneId: UInt32) {
         guard role == .host, state == .running else { return }

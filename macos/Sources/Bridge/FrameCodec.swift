@@ -59,6 +59,11 @@ enum FrameTag: UInt8 {
     // hostGridSize: cols:u16 | rows:u16. Swift-only; the zig core relays
     // it opaquely.
     case hostGridSize = 0x24
+    // Split-pane geometry (BUG-36 for panes). The host sizes each pane's
+    // PTY/grid from its own split layout; peers pin their mirror grids to
+    // that geometry or TUI output wraps at the wrong column.
+    // paneGridSize: paneId:u32 | cols:u16 | rows:u16. Swift-only.
+    case paneGridSize = 0x25
 }
 
 enum SessionRole: UInt8 {
@@ -170,6 +175,7 @@ enum Frame {
     case controlDenied(UserIdentity)
     case tabViewing(identity: UserIdentity, tabId: UInt32)
     case hostGridSize(cols: UInt16, rows: UInt16)
+    case paneGridSize(paneId: UInt32, cols: UInt16, rows: UInt16)
 }
 
 /// Which direction a split divides the terminal viewport.
@@ -342,6 +348,11 @@ enum FrameCodec {
             appendU32(&out, tabId)
         case .hostGridSize(let cols, let rows):
             out.append(FrameTag.hostGridSize.rawValue)
+            appendU16(&out, cols)
+            appendU16(&out, rows)
+        case .paneGridSize(let paneId, let cols, let rows):
+            out.append(FrameTag.paneGridSize.rawValue)
+            appendU32(&out, paneId)
             appendU16(&out, cols)
             appendU16(&out, rows)
         }
@@ -545,6 +556,11 @@ enum FrameCodec {
             let cols = try r.readU16()
             let rows = try r.readU16()
             return .hostGridSize(cols: cols, rows: rows)
+        case .paneGridSize:
+            let paneId = try r.readU32()
+            let cols = try r.readU16()
+            let rows = try r.readU16()
+            return .paneGridSize(paneId: paneId, cols: cols, rows: rows)
         }
     }
 
