@@ -160,9 +160,8 @@ final class TermCore {
         return Array(buf.prefix(n))
     }
 
-    /// DECSET 1006 — xterm SGR encoding. The only encoding we currently
-    /// emit; if this bit is missing the running app likely expects the
-    /// legacy X10 byte format which we don't synthesize today.
+    /// DECSET 1006 — xterm SGR encoding. Preferred when set; without it the
+    /// view falls back to the legacy X10 byte encoding (BUG-25).
     var sgrMouse: Bool { mouseModeBits & MouseMode.sgr != 0 }
 
     /// DECSET 1000 — report press/release only.
@@ -173,6 +172,10 @@ final class TermCore {
 
     /// DECSET 1003 — press/release + every motion, no button required.
     var anyMotionMouse: Bool { mouseModeBits & MouseMode.move != 0 }
+
+    /// DECSET 1015 — urxvt encoding (decimal CSI Cb;Cx;Cy M). Selected over
+    /// legacy X10 when the app set it without SGR (1006).
+    var urxvtMouse: Bool { mouseModeBits & MouseMode.urxvt != 0 }
 
     /// Returns the OSC 8 URL for the cell at (col, row), or nil if the cell
     /// carries no hyperlink or the URL is not a valid URL.

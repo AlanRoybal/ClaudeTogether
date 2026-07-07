@@ -262,10 +262,7 @@ final class MetalTerminalNSView: NSView {
     private var shouldReportMouse: Bool {
         guard mouseModeEnabled else { return false }
         let term = grid.term
-        guard term.x10Mouse || term.dragMouse || term.anyMotionMouse else {
-            return false
-        }
-        return term.sgrMouse
+        return term.x10Mouse || term.dragMouse || term.anyMotionMouse
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -438,7 +435,7 @@ final class MetalTerminalNSView: NSView {
         // exists to keep clicks local for text selection, and the wheel plays
         // no part in selecting.
         let term = grid.term
-        if term.isUsingAlternateScreen, term.sgrMouse,
+        if term.isUsingAlternateScreen,
            term.x10Mouse || term.dragMouse || term.anyMotionMouse
         {
             let cell = gridCell(for: event)
@@ -528,6 +525,17 @@ final class MetalTerminalNSView: NSView {
                          flags: NSEvent.ModifierFlags)
     {
         let cb = button | sgrModifierBits(flags) | (motion ? SGRButton.motionFlag : 0)
+        guard grid.term.sgrMouse else {
+            // 1015 urxvt takes precedence over legacy X10 when the app chose
+            // it: its parser expects decimal params, so X10's raw +32 bytes
+            // would desync it.
+            if grid.term.urxvtMouse {
+                emitUrxvtMouse(cb: cb, col: col, row: row, pressed: pressed)
+            } else {
+                emitLegacyMouse(cb: cb, col: col, row: row, pressed: pressed)
+            }
+            return
+        }
         let terminator: UInt8 = pressed ? 0x4D : 0x6D
         var bytes: [UInt8] = [0x1B, 0x5B, 0x3C]
         bytes.append(contentsOf: Array(String(cb).utf8))
@@ -536,6 +544,36 @@ final class MetalTerminalNSView: NSView {
         bytes.append(0x3B)
         bytes.append(contentsOf: Array(String(row + 1).utf8))
         bytes.append(terminator)
+        onKey(bytes)
+    }
+
+    /// Legacy X10/normal tracking encoding (DECSET 1000/1002/1003 without
+    /// 1006): CSI M Cb Cx Cy, each payload byte offset by 32. Releases
+    /// collapse the button bits to 3; coordinates saturate at 223 because the
+    /// encoding can't express more than 255 - 32.
+    private func emitLegacyMouse(cb: Int, col: Int, row: Int, pressed: Bool) {
+        let cbByte = pressed ? cb : ((cb & ~0b11) | 3)
+        let bytes: [UInt8] = [
+            0x1B, 0x5B, 0x4D,
+            UInt8(32 + min(cbByte, 223)),
+            UInt8(32 + min(col + 1, 223)),
+            UInt8(32 + min(row + 1, 223)),
+        ]
+        onKey(bytes)
+    }
+
+    /// urxvt encoding (DECSET 1015): CSI Cb ; Cx ; Cy M — like X10 but the
+    /// three values are decimal text (Cb still carries the +32 button offset),
+    /// so coordinates aren't capped at 223. Releases collapse to button 3.
+    private func emitUrxvtMouse(cb: Int, col: Int, row: Int, pressed: Bool) {
+        let cbByte = (pressed ? cb : ((cb & ~0b11) | 3)) + 32
+        var bytes: [UInt8] = [0x1B, 0x5B]
+        bytes.append(contentsOf: Array(String(cbByte).utf8))
+        bytes.append(0x3B)
+        bytes.append(contentsOf: Array(String(col + 1).utf8))
+        bytes.append(0x3B)
+        bytes.append(contentsOf: Array(String(row + 1).utf8))
+        bytes.append(0x4D)
         onKey(bytes)
     }
 
